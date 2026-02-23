@@ -1,0 +1,13 @@
+[package]
+name = "price-contour-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core optimisation algorithms for insurance price optimisation"
+license = "MIT"
+
+[dependencies]
+rayon = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+approx = "0.5"

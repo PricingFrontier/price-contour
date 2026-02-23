@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/price-contour-core",
+    "crates/price-contour",
+]
+resolver = "2"
+
+[workspace.dependencies]
+rayon = "1.10"
+thiserror = "2.0"
+pyo3 = { version = "0.26", features = ["extension-module"] }
+pyo3-polars = "0.25"
+polars = "0.52"

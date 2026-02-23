@@ -1,0 +1,15 @@
+[package]
+name = "price-contour"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for price-contour optimisation library"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+price-contour-core = { path = "../price-contour-core" }
+pyo3 = { workspace = true }
+pyo3-polars = { workspace = true }
+polars = { workspace = true }
