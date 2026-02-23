@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Any
+
 import polars as pl
 
 from price_contour._price_contour import ApplyResult, apply_lambdas_py
@@ -69,4 +73,51 @@ class ApplyOptimiser:
             objective=self.objective,
             constraints=self.constraints,
             chunk_size=self.chunk_size,
+        )
+
+    def save(self, path: str | Path) -> None:
+        """Save configuration to a JSON file.
+
+        Parameters
+        ----------
+        path : str | Path
+            File path to write config.json.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        config = {
+            "lambdas": self.lambdas,
+            "objective": self.objective,
+            "constraints": self.constraints,
+            "quote_id": self.quote_id,
+            "scenario_step": self.scenario_step,
+            "multiplier": self.multiplier,
+            "chunk_size": self.chunk_size,
+        }
+        path.write_text(json.dumps(config, indent=2))
+
+    @classmethod
+    def load(cls, path: str | Path) -> ApplyOptimiser:
+        """Load configuration from a JSON file.
+
+        Parameters
+        ----------
+        path : str | Path
+            File path to read config.json.
+
+        Returns
+        -------
+        ApplyOptimiser
+            Configured ApplyOptimiser instance.
+        """
+        path = Path(path)
+        config = json.loads(path.read_text())
+        return cls(
+            lambdas=config["lambdas"],
+            objective=config.get("objective", "expected_income"),
+            constraints=config.get("constraints"),
+            quote_id=config.get("quote_id", "quote_id"),
+            scenario_step=config.get("scenario_step", "scenario_step"),
+            multiplier=config.get("multiplier", "multiplier"),
+            chunk_size=config.get("chunk_size", 500_000),
         )

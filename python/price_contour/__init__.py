@@ -8,13 +8,23 @@ with Rust core and Polars DataFrame interop.
 __version__ = "0.1.0"
 
 from price_contour.apply import ApplyOptimiser
+from price_contour.builder import QuoteGrid, QuoteGridBuilder
+from price_contour.frontier import FrontierResult, frontier_summary
+from price_contour.ratebook import RatebookOptimiser, RatebookResult
 from price_contour.solver import OnlineOptimiser
-from price_contour._price_contour import ApplyResult, SolveResult
+from price_contour._price_contour import ApplyResult, GroupedSolveResult, SolveResult
 
 __all__ = [
     "__version__",
     "ApplyOptimiser",
     "ApplyResult",
+    "FrontierResult",
+    "GroupedSolveResult",
     "OnlineOptimiser",
+    "QuoteGrid",
+    "QuoteGridBuilder",
+    "RatebookOptimiser",
+    "RatebookResult",
     "SolveResult",
+    "frontier_summary",
 ]

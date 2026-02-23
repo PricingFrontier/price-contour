@@ -159,6 +159,189 @@ pub struct SolveResult {
     pub history: Option<IterationHistory>,
 }
 
+/// Builder for incrementally constructing a QuoteGrid from chunked data.
+pub struct QuoteGridBuilder {
+    n_steps: usize,
+    multipliers: Vec<f32>,
+    constraint_names: Vec<String>,
+    objective: Vec<f32>,
+    constraints: Vec<Vec<f32>>,
+    quote_ids: Vec<String>,
+    n_quotes: usize,
+    finalised: bool,
+}
+
+impl QuoteGridBuilder {
+    /// Create a new builder. `multipliers` must be sorted and have length `n_steps`.
+    pub fn new(
+        n_steps: usize,
+        multipliers: Vec<f32>,
+        constraint_names: Vec<String>,
+    ) -> Result<Self> {
+        if multipliers.len() != n_steps {
+            return Err(PriceContourError::DimensionMismatch(format!(
+                "multipliers length {} != n_steps {}",
+                multipliers.len(),
+                n_steps
+            )));
+        }
+        // Validate sorted
+        for i in 1..multipliers.len() {
+            if multipliers[i] < multipliers[i - 1] {
+                return Err(PriceContourError::InvalidValue(format!(
+                    "multipliers must be sorted, but [{i}]={} < [{}]={}",
+                    multipliers[i],
+                    i - 1,
+                    multipliers[i - 1]
+                )));
+            }
+        }
+        let n_constraints = constraint_names.len();
+        Ok(Self {
+            n_steps,
+            multipliers,
+            constraint_names,
+            objective: Vec::new(),
+            constraints: vec![Vec::new(); n_constraints],
+            quote_ids: Vec::new(),
+            n_quotes: 0,
+            finalised: false,
+        })
+    }
+
+    /// Append a chunk of quotes. `objective` and each constraint vec must have
+    /// length divisible by `n_steps`, and all the same length.
+    pub fn append(
+        &mut self,
+        quote_ids: &[String],
+        objective: &[f32],
+        constraints: &[Vec<f32>],
+    ) -> Result<()> {
+        if self.finalised {
+            return Err(PriceContourError::InvalidValue(
+                "builder already finalised".into(),
+            ));
+        }
+        let total = objective.len();
+        if total == 0 {
+            return Ok(());
+        }
+        if total % self.n_steps != 0 {
+            return Err(PriceContourError::DimensionMismatch(format!(
+                "objective length {} not divisible by n_steps {}",
+                total, self.n_steps
+            )));
+        }
+        let chunk_quotes = total / self.n_steps;
+        if quote_ids.len() != chunk_quotes {
+            return Err(PriceContourError::DimensionMismatch(format!(
+                "quote_ids length {} != chunk quotes {}",
+                quote_ids.len(),
+                chunk_quotes
+            )));
+        }
+        if constraints.len() != self.constraint_names.len() {
+            return Err(PriceContourError::DimensionMismatch(format!(
+                "constraints count {} != expected {}",
+                constraints.len(),
+                self.constraint_names.len()
+            )));
+        }
+        for (k, con) in constraints.iter().enumerate() {
+            if con.len() != total {
+                return Err(PriceContourError::DimensionMismatch(format!(
+                    "constraint '{}' length {} != objective length {}",
+                    self.constraint_names[k],
+                    con.len(),
+                    total
+                )));
+            }
+        }
+
+        self.objective.extend_from_slice(objective);
+        for (k, con) in constraints.iter().enumerate() {
+            self.constraints[k].extend_from_slice(con);
+        }
+        self.quote_ids.extend_from_slice(quote_ids);
+        self.n_quotes += chunk_quotes;
+        Ok(())
+    }
+
+    /// Consume the builder and return a validated QuoteGrid.
+    pub fn build(mut self) -> Result<QuoteGrid> {
+        self.finalised = true;
+        if self.n_quotes == 0 {
+            return Err(PriceContourError::DataValidation(
+                "no quotes appended to builder".into(),
+            ));
+        }
+        let grid = QuoteGrid {
+            n_quotes: self.n_quotes,
+            n_steps: self.n_steps,
+            multipliers: self.multipliers,
+            objective: self.objective,
+            constraints: self.constraints,
+            constraint_names: self.constraint_names,
+            quote_ids: self.quote_ids,
+        };
+        grid.validate()?;
+        Ok(grid)
+    }
+
+    pub fn n_quotes(&self) -> usize {
+        self.n_quotes
+    }
+}
+
+/// Mapping from quote index to group index, for grouped optimisation.
+pub struct GroupMapping {
+    pub group_of: Vec<u32>,
+    pub n_groups: usize,
+    pub group_labels: Vec<String>,
+}
+
+/// Build a GroupMapping from per-quote string labels.
+pub fn build_group_mapping(labels: &[String]) -> GroupMapping {
+    use std::collections::HashMap;
+    let mut label_to_idx: HashMap<&str, u32> = HashMap::new();
+    let mut group_labels: Vec<String> = Vec::new();
+    let mut group_of = Vec::with_capacity(labels.len());
+
+    for label in labels {
+        let idx = if let Some(&idx) = label_to_idx.get(label.as_str()) {
+            idx
+        } else {
+            let idx = group_labels.len() as u32;
+            group_labels.push(label.clone());
+            label_to_idx.insert(label, idx);
+            idx
+        };
+        group_of.push(idx);
+    }
+
+    let n_groups = group_labels.len();
+    GroupMapping {
+        group_of,
+        n_groups,
+        group_labels,
+    }
+}
+
+/// Result of grouped optimisation (per-group factor selection with remapping).
+pub struct GroupedSolveResult {
+    pub optimal_factor_values: Vec<f32>,
+    pub optimal_steps_per_quote: Vec<u32>,
+    pub lambdas: Vec<f64>,
+    pub iterations: usize,
+    pub converged: bool,
+    pub total_objective: f64,
+    pub total_constraints: Vec<f64>,
+    pub baseline_objective: f64,
+    pub baseline_constraints: Vec<f64>,
+    pub clamp_rate: f32,
+    pub history: Option<IterationHistory>,
+}
+
 /// Result of applying fixed lambdas (single forward pass, no iteration).
 pub struct ApplyResult {
     pub optimal_steps: Vec<u32>,

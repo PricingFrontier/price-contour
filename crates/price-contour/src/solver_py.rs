@@ -9,6 +9,8 @@ use price_contour_core::{
     ConstraintDirection, ConstraintSpec, QuoteGrid, SolveResult, SolverConfig, solve_online,
 };
 
+use crate::grid_py::PyQuoteGrid;
+
 /// Ingest a PyDataFrame, validate columns, sort, and build a QuoteGrid.
 pub(crate) fn ingest_dataframe(
     df: &DataFrame,
@@ -413,6 +415,69 @@ pub fn solve_online_py(
     Ok(PySolveResult {
         inner: result,
         grid,
+        constraint_names,
+        result_df: None,
+    })
+}
+
+/// Solve from a pre-built QuoteGrid (skips DataFrame ingestion).
+#[pyfunction]
+#[pyo3(signature = (
+    grid,
+    constraints = None,
+    max_iter = 50,
+    chunk_size = 500_000,
+    tolerance = 1e-6,
+    lambdas = None,
+    record_history = false,
+))]
+pub fn solve_from_grid_py(
+    grid: &mut PyQuoteGrid,
+    constraints: Option<HashMap<String, HashMap<String, f64>>>,
+    max_iter: usize,
+    chunk_size: usize,
+    tolerance: f64,
+    lambdas: Option<HashMap<String, f64>>,
+    record_history: bool,
+) -> PyResult<PySolveResult> {
+    let constraints = constraints.unwrap_or_default();
+
+    let specs = parse_constraints(constraints, &grid.inner)?;
+
+    let config = SolverConfig {
+        max_iter,
+        chunk_size,
+        tolerance,
+        record_history,
+        ..Default::default()
+    };
+
+    let initial_lambdas: Option<Vec<f64>> = lambdas.map(|lam_dict| {
+        specs
+            .iter()
+            .map(|spec| *lam_dict.get(&spec.name).unwrap_or(&0.0))
+            .collect()
+    });
+
+    let result = solve_online(&grid.inner, &specs, &config, initial_lambdas.as_deref())
+        .map_err(|e| PyValueError::new_err(format!("Solver error: {e}")))?;
+
+    let constraint_names = specs.iter().map(|s| s.name.clone()).collect();
+
+    // We need to clone the grid for the result since PySolveResult owns it
+    let grid_clone = QuoteGrid {
+        n_quotes: grid.inner.n_quotes,
+        n_steps: grid.inner.n_steps,
+        multipliers: grid.inner.multipliers.clone(),
+        objective: grid.inner.objective.clone(),
+        constraints: grid.inner.constraints.clone(),
+        constraint_names: grid.inner.constraint_names.clone(),
+        quote_ids: grid.inner.quote_ids.clone(),
+    };
+
+    Ok(PySolveResult {
+        inner: result,
+        grid: grid_clone,
         constraint_names,
         result_df: None,
     })

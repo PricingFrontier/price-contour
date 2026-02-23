@@ -711,21 +711,54 @@ Clip the multiplier range per quote (e.g. max 10% price change per individual ri
 
 ## Artifact Serialization
 
-Solver artifacts (for live scoring via `OptimiserApply`) are saved/loaded as:
+Two distinct solver modes produce different production artifacts. Both use JSON for human-readability and diffability. Metrics are **not** stored in production artifacts — they live in MLflow's metric store.
 
-- **Lambdas + config** (scalars): JSON. Human-readable, easy to inspect and version.
-- **Spline coefficients** (per-quote arrays, when spline mode is used): Parquet. Columnar, compressed, fast to load.
+### Online Solver
+
+A single `config.json` with lambdas and constraint config, loaded by `ApplyOptimiser`:
+
+```
+artifacts/online_v1/
+  config.json      # lambdas, objective, constraints, column names
+```
 
 ```python
 # Save
-result.save("artifacts/optimiser_v1")
-# Creates:
-#   artifacts/optimiser_v1/config.json    (lambdas, multiplier grid, constraint names)
-#   artifacts/optimiser_v1/splines.parquet (optional, only if spline=True)
+applier = pc.ApplyOptimiser(lambdas=result.lambdas, objective="expected_income",
+                            constraints={"volume": {"min": 0.90}})
+applier.save("artifacts/online_v1/config.json")
 
-# Load
-applier = pc.OptimiserApply.load("artifacts/optimiser_v1")
+# Load (in live pipeline)
+applier = pc.ApplyOptimiser.load("artifacts/online_v1/config.json")
+apply_result = applier.apply(new_scored_df)
 ```
+
+### Ratebook Solver
+
+A **parameters folder** with one JSON per rating factor plus a config file, loaded by `RatebookApplier`:
+
+```
+parameters/ratebook_v1/
+  config.json          # objective, constraints, lambdas, factor order
+  region.json          # per-level lookup table
+  age_band.json
+  vehicle_type.json
+```
+
+Each factor JSON is a self-describing lookup table (`{"columns": ["region"], "table": {"London": 0.8653, ...}}`). Interaction factors use compound keys (`"London:17-25"`).
+
+```python
+# Save
+result = ratebook_solver.solve(scored_df, factors_df)
+result.save("parameters/ratebook_v1/")
+
+# Load and apply (in live pipeline)
+applier = pc.RatebookApplier.load("parameters/ratebook_v1/")
+adjustments = applier.apply(new_factors_df)
+# → per-quote multiplicative adjustment (product of all factor lookups)
+```
+
+The ratebook apply path is a pure lookup+multiply — no solver, no scored grid needed.
 
 ---
 
@@ -734,7 +767,7 @@ applier = pc.OptimiserApply.load("artifacts/optimiser_v1")
 | Decision | Resolution |
 |---|---|
 | Prep/expansion | Handled by haute, not this library |
-| Artifact format | JSON for scalars, Parquet for arrays |
+| Artifact format | Online: single config.json (lambdas + constraints). Ratebook: parameters folder with one JSON per factor + config.json. Metrics in MLflow only. |
 | Baseline thresholds | Library computes baseline from data; supports both relative and absolute thresholds |
 | Ratebook input | Scored DF (same as online) + separate quote-level factors DF; price_contour derives factor_level and joins by quote_id |
 | Ratebook structure | Auto discovery (default) or explicit factor_columns; price_contour owns the full loop |

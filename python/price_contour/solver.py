@@ -7,7 +7,15 @@ from typing import Any
 
 import polars as pl
 
-from price_contour._price_contour import SolveResult, solve_online_py
+from price_contour._price_contour import (
+    FrontierResult,
+    QuoteGrid,
+    QuoteGridBuilder,
+    SolveResult,
+    solve_from_grid_py,
+    solve_online_py,
+    sweep_frontier_py,
+)
 
 
 class OnlineOptimiser:
@@ -62,7 +70,7 @@ class OnlineOptimiser:
 
     def solve(
         self,
-        df: pl.DataFrame,
+        df_or_grid: pl.DataFrame | QuoteGrid,
         *,
         lambdas: dict[str, float] | None = None,
     ) -> SolveResult:
@@ -70,8 +78,8 @@ class OnlineOptimiser:
 
         Parameters
         ----------
-        df : pl.DataFrame
-            Long-format scored DataFrame.
+        df_or_grid : pl.DataFrame | QuoteGrid
+            Long-format scored DataFrame, or a pre-built QuoteGrid.
         lambdas : dict[str, float], optional
             Initial lambda values for warm-start.
 
@@ -81,8 +89,18 @@ class OnlineOptimiser:
             Result object with .lambdas, .converged, .iterations,
             .total_objective, .total_constraints, .dataframe properties.
         """
+        if isinstance(df_or_grid, QuoteGrid):
+            return solve_from_grid_py(
+                df_or_grid,
+                constraints=self.constraints,
+                max_iter=self.max_iter,
+                chunk_size=self.chunk_size,
+                tolerance=self.tolerance,
+                lambdas=lambdas,
+                record_history=self.record_history,
+            )
         return solve_online_py(
-            df,
+            df_or_grid,
             quote_id=self.quote_id,
             scenario_step=self.scenario_step,
             multiplier=self.multiplier,
@@ -93,6 +111,53 @@ class OnlineOptimiser:
             tolerance=self.tolerance,
             lambdas=lambdas,
             record_history=self.record_history,
+        )
+
+    def frontier(
+        self,
+        df_or_grid: pl.DataFrame | QuoteGrid,
+        *,
+        threshold_ranges: dict[str, tuple[float, float]],
+        n_points_per_dim: int = 10,
+    ) -> FrontierResult:
+        """Sweep the efficient frontier over constraint threshold ranges.
+
+        Parameters
+        ----------
+        df_or_grid : pl.DataFrame | QuoteGrid
+            Scored data or pre-built QuoteGrid.
+        threshold_ranges : dict[str, tuple[float, float]]
+            Per-constraint (lo, hi) range for the threshold sweep.
+            For relative constraints (min/max), these are fractions of baseline.
+        n_points_per_dim : int
+            Number of points per constraint dimension.
+
+        Returns
+        -------
+        FrontierResult
+            Result with .points (DataFrame) and .n_points.
+        """
+        if isinstance(df_or_grid, pl.DataFrame):
+            builder = QuoteGridBuilder(
+                list(self.constraints.keys()),
+                quote_id=self.quote_id,
+                scenario_step=self.scenario_step,
+                multiplier_col=self.multiplier,
+                objective=self.objective,
+            )
+            builder.append(df_or_grid)
+            grid = builder.build()
+        else:
+            grid = df_or_grid
+
+        return sweep_frontier_py(
+            grid,
+            constraints=self.constraints,
+            threshold_ranges=threshold_ranges,
+            n_points_per_dim=n_points_per_dim,
+            max_iter=self.max_iter,
+            chunk_size=self.chunk_size,
+            tolerance=self.tolerance,
         )
 
     def config_dict(self) -> dict[str, Any]:
