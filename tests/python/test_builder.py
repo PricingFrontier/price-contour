@@ -23,8 +23,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
             rows.append(
                 {
                     "quote_id": f"Q{q:04d}",
-                    "scenario_step": j,
-                    "multiplier": mult,
+                    "scenario_index": j,
+                    "scenario_value": mult,
                     "expected_income": base * mult * conversion,
                     "volume": conversion,
                     "loss_ratio": 0.6 / mult * (1.0 + 0.1 * (mult - 1.0)),
@@ -34,8 +34,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
         rows,
         schema={
             "quote_id": pl.Utf8,
-            "scenario_step": pl.Int32,
-            "multiplier": pl.Float32,
+            "scenario_index": pl.Int32,
+            "scenario_value": pl.Float32,
             "expected_income": pl.Float32,
             "volume": pl.Float32,
             "loss_ratio": pl.Float32,
@@ -139,8 +139,8 @@ class TestQuoteGridBuilder:
 
         assert grid.n_quotes == 20
         assert grid.n_steps == 5
-        assert len(grid.multipliers) == 5
-        assert abs(grid.multipliers[0] - 0.8) < 0.01
+        assert len(grid.scenario_values) == 5
+        assert abs(grid.scenario_values[0] - 0.8) < 0.01
         assert grid.constraint_names == ["volume"]
 
     def test_grid_repr(self):

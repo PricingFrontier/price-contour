@@ -4,21 +4,23 @@
 
 A standalone Python library (`price-contour`) that implements insurance price optimisation. Two modes of operation: **online optimisation** (per-risk optimal pricing via Lagrangian dual decomposition) and **ratebook optimisation** (optimal rating factor levels via coordinate descent with Lagrangian inner loop). Designed to run on CPU across millions of risks, with strict memory efficiency requirements.
 
-Haute wraps this library via pipeline nodes: **ScenarioExpander** (expand multiplier grid), user-defined transforms and model scoring nodes (recompute features + score), **Optimiser** (batch solve), and **OptimiserApply** (live scoring, to be built). The library accepts Polars DataFrames via its Python API and handles the Polars → internal grid conversion internally.
+Haute wraps this library via pipeline nodes: **ScenarioExpander** (expand scenario value grid), user-defined transforms and model scoring nodes (recompute features + score), **Optimiser** (batch solve), and **OptimiserApply** (live scoring, to be built). The library accepts Polars DataFrames via its Python API and handles the Polars → internal grid conversion internally.
 
 ---
 
 ## Architecture
 
 ```
-haute pipeline nodes (Polars in/out, config, UI)
-    ↓
-price-contour Python API (Polars DataFrames in, SolveResult out)
-    ↓
+haute pipeline nodes (Polars LazyFrame graph)
+    ↓  sink_parquet (streaming — Python never holds the full DataFrame)
+temp Parquet file on disk
+    ↓  build_grid_from_parquet (Rust reads Parquet directly)
 price-contour Rust core (QuoteGrid, chunked solver)
+    ↓  SolveResult / QuoteGrid (Arc-shared, compact)
+haute API response
 ```
 
-The library is independently installable, testable, and usable outside haute. Haute's optimiser nodes are thin wrappers that handle pipeline integration and UI. The Polars → internal conversion (via `QuoteGridBuilder`) happens inside the library, not in haute.
+The library is independently installable, testable, and usable outside haute. Haute's optimiser nodes are thin wrappers that handle pipeline integration and UI. The pipeline stays lazy until the optimiser route, which sinks the scored columns to a temporary Parquet file. Rust reads the Parquet file directly via `build_grid_from_parquet` and constructs the `QuoteGrid` — Python never materialises the full scored DataFrame.
 
 ---
 
@@ -26,24 +28,24 @@ The library is independently installable, testable, and usable outside haute. Ha
 
 ### Decision Variable
 
-The decision variable is a **multiplier** applied to the technical price, not the price itself. Typical range: 0.8–1.2 (configurable per use case). This means the optimisation grid is uniform across all risks — every risk is evaluated over the same multiplier steps, even though the underlying technical prices differ.
+The decision variable is a **scenario value** (price multiplier) applied to the technical price, not the price itself. Typical range: 0.8–1.2 (configurable per use case). This means the optimisation grid is uniform across all risks — every risk is evaluated over the same scenario value steps, even though the underlying technical prices differ.
 
 ### Inputs
 
-The optimiser receives pre-computed values from upstream models (GLMs, CatBoost, etc.). It does not fit any models itself. The inputs are a Polars DataFrame in **long format** with one row per (risk, multiplier step):
+The optimiser receives pre-computed values from upstream models (GLMs, CatBoost, etc.). It does not fit any models itself. The inputs are a Polars DataFrame in **long format** with one row per (risk, scenario value step):
 
-- **Columns**: `quote_id` (identifies the risk), `scenario_step` (index into multiplier grid), `multiplier` (the multiplier value), plus one column per objective/constraint metric (e.g. `expected_income`, `volume`).
-- **Shape**: `N × M` rows total, where `N` = number of risks, `M` = number of multiplier steps.
-- **Multiplier grid**: uniform across all risks — every risk is evaluated over the same steps (e.g. `[0.80, 0.81, ..., 1.20]`).
+- **Columns**: `quote_id` (identifies the risk), `scenario_index` (index into scenario value grid), `scenario_value` (the scenario value), plus one column per objective/constraint metric (e.g. `expected_income`, `volume`).
+- **Shape**: `N × M` rows total, where `N` = number of risks, `M` = number of scenario value steps.
+- **Scenario value grid**: uniform across all risks — every risk is evaluated over the same steps (e.g. `[0.80, 0.81, ..., 1.20]`).
 - **Constraint thresholds**: one scalar per constraint (e.g. "total volume must be ≥ 90% of baseline").
 
 The library's `QuoteGridBuilder` internally converts this long-format DataFrame into the `(N, M)` shaped arrays needed for vectorised computation. This conversion is transparent to haute.
 
 ### Curve Fitting
 
-The upstream pipeline evaluates predictions at M discrete multiplier steps. The solver may optionally fit **cubic splines** through these points for each risk, for both the objective and each constraint, to produce smooth, differentiable curves.
+The upstream pipeline evaluates predictions at M discrete scenario value steps. The solver may optionally fit **cubic splines** through these points for each risk, for both the objective and each constraint, to produce smooth, differentiable curves.
 
-Key property: because the multiplier grid is uniform across all risks (same knot positions), the spline fitting is a **batched matrix operation** — not a per-risk loop. The spline basis matrix is computed once and applied to all risks simultaneously.
+Key property: because the scenario value grid is uniform across all risks (same knot positions), the spline fitting is a **batched matrix operation** — not a per-risk loop. The spline basis matrix is computed once and applied to all risks simultaneously.
 
 Spline fitting happens inside the Rust solver core if enabled. Spline coefficients are not currently exposed to Python or saved as artifacts — this is a future improvement for live scoring (the Apply node would store spline coefficients alongside lambdas).
 
@@ -51,7 +53,7 @@ Spline fitting happens inside the Rust solver core if enabled. Spline coefficien
 
 **Online optimisation:**
 - Lambda values: one scalar per constraint (Lagrange multipliers / shadow prices)
-- Optimal multiplier per risk: the best step from the grid for each quote
+- Optimal scenario value per risk: the best step from the grid for each quote
 - Baseline vs optimised portfolio totals for objective and constraints
 - These artifacts (primarily lambdas) are what the Apply node needs for live scoring
 
@@ -74,9 +76,9 @@ The optimisation workflow uses pipeline nodes that the user wires together in th
 
 The prep stage is **not a single dedicated node**. Instead, the user builds it from standard pipeline nodes:
 
-1. **ScenarioExpander** — expands each risk row by the multiplier grid via cross-join, producing `N × M` rows with `quote_id`, `scenario_step`, and `multiplier` columns. This is a built-in node type with configurable range and steps.
+1. **ScenarioExpander** — expands each risk row by the scenario value grid via cross-join, producing `N × M` rows with `quote_id`, `scenario_index`, and `scenario_value` columns. This is a built-in node type with configurable range and steps.
 
-2. **User-defined transform nodes** — the user adds standard Polars transform nodes downstream of the expander to compute price-derived features (e.g. `candidate_price = technical_price × multiplier`, `distance_to_competitor`, `price_ratio`). This is regular pipeline code — no special decorator needed.
+2. **User-defined transform nodes** — the user adds standard Polars transform nodes downstream of the expander to compute price-derived features (e.g. `candidate_price = technical_price × scenario_value`, `distance_to_competitor`, `price_ratio`). This is regular pipeline code — no special decorator needed.
 
 3. **Model scoring nodes** — existing `modelScore` nodes score prediction models (income, conversion, etc.) on the expanded data. The same models used elsewhere in the pipeline.
 
@@ -86,25 +88,25 @@ This approach means the prep logic is fully visible in the pipeline graph, uses 
 
 Currently the scenario expander does a full cross-join in one shot. For large portfolios (1M+ risks × 20 steps = 20M rows), this duplicates every risk factor column M times and can exhaust memory.
 
-The solution avoids the cross-join entirely by iterating over multiplier steps one at a time and feeding results directly into a `QuoteGridBuilder`:
+The solution avoids the cross-join entirely by iterating over scenario value steps one at a time and feeding results directly into a `QuoteGridBuilder`:
 
 ```
-Input: base DataFrame (N rows), multiplier grid (M values)
+Input: base DataFrame (N rows), scenario value grid (M values)
 Output: QuoteGrid (compact N×M arrays of objective + constraints only)
 
 builder = QuoteGridBuilder(constraint_columns=[...], objective="predicted_income")
 
 for step_idx, multiplier_value in enumerate(multiplier_grid):
-    # 1. Add multiplier + step columns to the original N-row DataFrame
+    # 1. Add scenario_value + index columns to the original N-row DataFrame
     step_df = base_df.with_columns(
-        pl.lit(multiplier_value).alias("multiplier"),
-        pl.lit(step_idx).cast(pl.Int32).alias("scenario_step"),
+        pl.lit(multiplier_value).alias("scenario_value"),
+        pl.lit(step_idx).cast(pl.Int32).alias("scenario_index"),
     )
     # 2. Run downstream transforms + model scoring (still N rows)
     scored_df = execute_subgraph(step_df, expander_to_optimiser_path)
     # 3. Feed only the columns the solver needs into the builder
-    builder.append(scored_df.select("quote_id", "scenario_step",
-                                     "multiplier", "predicted_income",
+    builder.append(scored_df.select("quote_id", "scenario_index",
+                                     "scenario_value", "predicted_income",
                                      "predicted_volume").to_pandas())
     # 4. scored_df is discarded — no accumulation
 
@@ -114,7 +116,7 @@ solver.solve(grid)
 
 Peak memory is **O(N)** — one copy of the base data plus one step's scored output at a time. The `QuoteGridBuilder` accumulates only the lean numeric columns it needs: `N × M × (2 + C)` float32 values where C is the constraint count. For 1M risks × 21 steps × 2 metrics this is ~160 MB, vs ~15-20 GB for the full cross-join.
 
-This requires the solve endpoint to orchestrate the step-wise loop rather than calling `_execute_eager_core` once. The ScenarioExpander node needs a "single-step mode" where it adds the multiplier column for a specific step instead of cross-joining with all steps.
+This requires the solve endpoint to orchestrate the step-wise loop rather than calling `_execute_eager_core` once. The ScenarioExpander node needs a "single-step mode" where it adds the scenario_value column for a specific step instead of cross-joining with all steps.
 
 ### Optimiser Node
 
@@ -135,7 +137,7 @@ def optimise_prices(df: pl.LazyFrame) -> pl.LazyFrame:
     return df
 ```
 
-**Inputs**: Long-format Polars DataFrame with `quote_id`, `scenario_step`, `multiplier`, plus objective/constraint columns.
+**Inputs**: Long-format Polars DataFrame with `quote_id`, `scenario_index`, `scenario_value`, plus objective/constraint columns.
 **Outputs**:
 - Solved lambdas and convergence info (via API response)
 - Factor tables (ratebook mode)
@@ -145,7 +147,7 @@ def optimise_prices(df: pl.LazyFrame) -> pl.LazyFrame:
 
 **Purpose**: Apply optimisation results to produce an optimised price for new quotes. Uses stored lambdas from a previous batch solve.
 
-**Batch + live** — works in both modes. This is critical for the live scoring pipeline: a single quote arrives, gets expanded to M multiplier steps, scored by the upstream models, and the stored lambdas determine the optimal multiplier.
+**Batch + live** — works in both modes. This is critical for the live scoring pipeline: a single quote arrives, gets expanded to M scenario value steps, scored by the upstream models, and the stored lambdas determine the optimal scenario value.
 
 **Live scoring flow**:
 1. Single quote arrives via API input
@@ -177,15 +179,15 @@ def apply_optimised_price(df: pl.LazyFrame) -> pl.LazyFrame:
 ```
 [upstream pipeline] → [technical_price, features]
                             ↓
-                    [ScenarioExpander] → cross-join with multiplier grid (N × M rows)
+                    [ScenarioExpander] → cross-join with scenario value grid (N × M rows)
                             ↓
-                    [Transform nodes]  → candidate_price = tech_price × multiplier
+                    [Transform nodes]  → candidate_price = tech_price × scenario_value
                             ↓              recompute price-derived features
                     [Model scoring]    → score income, conversion models
                             ↓
                     [Optimiser]        → Lagrangian solve via API,
                             ↓              extract lambdas, generate frontier
-                    solved artifacts + optimised multipliers
+                    solved artifacts + optimised scenario values
 ```
 
 **Live (scoring a quote) — planned:**
@@ -222,7 +224,7 @@ Subject to Σ_i constraint_k_i(m_i) ≥ threshold_k   for each constraint k
            m_i ∈ [m_min, m_max]                      for each risk i
 ```
 
-Where `m_i` is the multiplier for risk `i`, and `objective_i(m)` and `constraint_k_i(m)` are the fitted spline functions.
+Where `m_i` is the scenario value for risk `i`, and `objective_i(m)` and `constraint_k_i(m)` are the fitted spline functions.
 
 **Lagrangian relaxation:**
 
@@ -236,14 +238,14 @@ For fixed λ, this decomposes into N independent subproblems:
 For each risk i: maximise objective_i(m) + Σ_k λ_k × constraint_k_i(m)
 ```
 
-Each subproblem is a 1D maximisation over the multiplier range — trivially solved by evaluating the lagrangian at the M grid points and taking the argmax (or analytically via the spline derivative).
+Each subproblem is a 1D maximisation over the scenario value range — trivially solved by evaluating the lagrangian at the M grid points and taking the argmax (or analytically via the spline derivative).
 
 ### Algorithm — Step by Step
 
 ```
 Input:
   scored_df:    Polars DataFrame in long format (N×M rows)
-                columns: quote_id, scenario_step, multiplier, objective, constraint_1, ..., constraint_K
+                columns: quote_id, scenario_index, scenario_value, objective, constraint_1, ..., constraint_K
   thresholds:   (K,) float64 — constraint thresholds (expressed as ratios, e.g. 0.9 = 90%)
   max_iter:     int — max outer iterations (default 50)
   chunk_size:   int — number of risks per memory chunk (default 500_000)
@@ -284,7 +286,7 @@ Outer loop (repeat until convergence or max_iter):
 
 Output:
   λ values (K,)
-  optimal_step per risk (N,) — index into multiplier grid
+  optimal_step per risk (N,) — index into scenario value grid
   total_objective, total_constraints — portfolio-level summaries
 ```
 
@@ -308,39 +310,25 @@ Recommendation: start with subgradient (simpler), add bisection as an option if 
 
 **Inside the solver** (price-contour): chunked processing controls peak memory during the Lagrangian iteration. The solver processes risks in chunks of `chunk_size` (default 500K). The lagrangian matrix is only allocated at chunk size, not full portfolio size. Streaming aggregation accumulates portfolio totals across chunks.
 
-**Outside the solver** (haute pipeline — current problem): the scored DataFrame is fully materialized in memory before reaching the solver. For large portfolios this is the bottleneck:
+**Outside the solver** (haute pipeline): the pipeline stays lazy (Polars `LazyFrame`) throughout the graph. The optimiser route sinks only the solver-relevant columns to a temporary Parquet file via `sink_parquet()`, then Rust reads the Parquet file directly via `build_grid_from_parquet` to construct the `QuoteGrid`. Python never materialises the full scored DataFrame.
 
-| Stage | 1M risks × 20 steps | Peak memory |
+**Current approach — sink_parquet + Rust Parquet reader:**
+
+| Stage | 1M risks × 20 steps | Peak Python memory |
 |---|---|---|
-| ScenarioExpander cross-join | 20M rows | ~5-10 GB |
-| Model scoring on expanded data | 20M rows | ~5-10 GB |
-| Solver receives full DataFrame | 20M rows | ~5-10 GB |
-| Solver internal (chunked) | 500K chunk | ~100 MB |
-| **Peak (during pipeline execution)** | | **~15-20 GB** |
+| Pipeline graph (lazy) | plan only | ~0 |
+| `sink_parquet()` (streaming) | 20M rows to disk | ~0 (streamed) |
+| `build_grid_from_parquet` (Rust) | reads Parquet → QuoteGrid | ~0 (Rust heap only) |
+| Rust: DataFrame + QuoteGrid (transient) | 20M rows + grid | Rust heap (~1-2 GB) |
+| Rust: QuoteGrid only (after DataFrame drop) | (N, M) arrays | Rust heap (~160 MB) |
+| Solver internal (chunked) | 500K chunk | ~100 MB Rust |
+| **Peak Python memory** | | **near zero** |
 
-**Solution — step-wise scoring into QuoteGridBuilder** (see Preparation section above): instead of cross-joining all rows then scoring, iterate over each multiplier step, score N rows at a time, and feed only the objective/constraint columns into `QuoteGridBuilder.append()`. The builder accumulates compact f32 arrays in Rust memory. No cross-join ever occurs.
+The Parquet round-trip adds ~1-2s I/O for large files, but this is negligible compared to the memory savings. The temp file is cleaned up in a `finally` block.
 
-Memory breakdown after step-wise expansion, 5M risks, 50 steps, 3 constraints:
+**Future improvement — step-wise scoring into QuoteGridBuilder** (see Preparation section above): for portfolios too large to cross-join even lazily, iterate over scenario value steps one at a time, scoring N rows per step and feeding into `QuoteGridBuilder.append()`. This avoids the cross-join entirely. Currently TODO.
 
-| Array | Shape | Size |
-|---|---|---|
-| Base DataFrame (held once) | 5M rows × all columns | depends on column count |
-| One step's scored output | 5M rows × ~5 columns | ~100 MB |
-| QuoteGridBuilder accumulator | objective (5M×50) + 3 constraints (5M×50 each) | 4 GB float32 |
-| Solver lagrangian buffer | (500K, 50) | 100 MB |
-| **Peak** | | **~4.2 GB + base data** |
-
-For more typical portfolios (1M risks, 21 steps, 1 constraint):
-
-| Array | Shape | Size |
-|---|---|---|
-| Base DataFrame | 1M rows | ~500 MB |
-| One step's scored output | 1M rows × ~5 cols | ~20 MB |
-| QuoteGridBuilder accumulator | 1M × 21 × 2 metrics | ~160 MB |
-| Solver lagrangian buffer | (500K, 21) | 42 MB |
-| **Peak** | | **~720 MB** |
-
-This is a 20× reduction compared to the current full cross-join approach (~15-20 GB).
+For typical portfolios (1M risks, 21 steps, 1 constraint) the current sink_parquet approach works well — the Parquet file is ~80 MB (Float32, narrow column selection), and the QuoteGrid settles to ~160 MB in Rust memory.
 
 ### Performance Estimate
 
@@ -361,14 +349,14 @@ At quote time, the OptimiserApply node (not yet built in haute):
 
 1. The upstream pipeline handles expansion and scoring: ScenarioExpander expands the single quote to `(1, M)` rows, transform nodes recompute price-derived features, model scoring nodes evaluate at each price point
 2. OptimiserApply loads stored lambda values from the optimiser artifact
-3. Evaluates the Lagrangian at each multiplier step:
+3. Evaluates the Lagrangian at each scenario value step:
 
 ```
-For each multiplier step j:
+For each scenario value step j:
   L(j) = objective(j) + Σ_k λ_k × constraint_k(j)
 optimal_step = argmax L
-optimal_multiplier = grid[optimal_step]
-optimised_price = technical_price × optimal_multiplier
+optimal_scenario_value = grid[optimal_step]
+optimised_price = technical_price × optimal_scenario_value
 ```
 
 The Lagrangian evaluation is trivial — microseconds. The cost is dominated by the M model evaluations in the upstream pipeline (e.g. 20 model scores for a single quote). For CatBoost models this is still sub-millisecond per evaluation, so total live scoring overhead is low.
@@ -436,7 +424,7 @@ Outer loop (cycle through factors until convergence):
 
 For factor `f` with `L` levels, and `N_l` risks at each level:
 
-- Generate candidate values for each level (e.g. current value × multiplier grid)
+- Generate candidate values for each level (e.g. current value × scenario value grid)
 - For each candidate, compute the resulting prices for all risks at that level
 - Evaluate objective and constraints
 - Use the Lagrangian to find optimal values subject to portfolio constraints
@@ -507,7 +495,7 @@ The optimiser config panel (`OptimiserConfig.tsx`) provides:
 - Summary statistics: mean change, % of risks with increase/decrease, max change
 
 **Curve Tab** (online mode):
-- Per-risk spline visualisation: select a risk, see its objective/constraint curves as a function of multiplier
+- Per-risk spline visualisation: select a risk, see its objective/constraint curves as a function of scenario value
 - Overlay the optimal point (where the Lagrangian is maximised)
 - Useful for understanding why a specific risk got a specific price
 - Requires: spline coefficient export from Rust solver
@@ -526,7 +514,7 @@ The optimiser config panel (`OptimiserConfig.tsx`) provides:
 
 ### Frontier Interaction Flow (Planned)
 
-1. User configures objective, constraints, multiplier range
+1. User configures objective, constraints, scenario value range
 2. Clicks "Optimise" → batch solve runs, frontier generated
 3. Frontier chart appears. User drags along the curve.
 4. Each position updates the impact tab in real-time (re-solve at that threshold)
@@ -539,7 +527,12 @@ The optimiser config panel (`OptimiserConfig.tsx`) provides:
 
 ```python
 import polars as pl
-from price_contour import OnlineOptimiser, RatebookOptimiser, ApplyOptimiser
+from price_contour import (
+    OnlineOptimiser,
+    RatebookOptimiser,
+    ApplyOptimiser,
+    build_grid_from_parquet,
+)
 
 # --- Online Optimisation ---
 
@@ -547,8 +540,8 @@ optimiser = OnlineOptimiser(
     objective="predicted_income",
     constraints={"predicted_volume": {"min": 0.9}},
     quote_id="quote_id",
-    scenario_step="scenario_step",
-    multiplier="multiplier",
+    scenario_index="scenario_index",
+    scenario_value="scenario_value",
     max_iter=50,
     chunk_size=500_000,
     tolerance=1e-6,
@@ -556,13 +549,13 @@ optimiser = OnlineOptimiser(
 )
 
 # scored_df: Polars DataFrame in long format
-# columns: quote_id, scenario_step, multiplier, predicted_income, predicted_volume
+# columns: quote_id, scenario_index, scenario_value, predicted_income, predicted_volume
 result = optimiser.solve(scored_df)
 
 result.lambdas            # dict[str, float] — Lagrange multipliers per constraint
 result.total_objective    # float — portfolio objective at optimum
 result.total_constraints  # dict[str, float] — portfolio constraint values at optimum
-result.baseline_objective # float — portfolio objective at baseline (multiplier=1)
+result.baseline_objective # float — portfolio objective at baseline (scenario_value=1)
 result.baseline_constraints # dict[str, float] — baseline constraint values
 result.converged          # bool
 result.iterations         # int
@@ -576,6 +569,23 @@ frontier = optimiser.frontier(
     threshold_ranges={"predicted_volume": (0.85, 0.98)},
     n_points_per_dim=20,
 )
+
+# --- Parquet Grid Pipeline (zero Python memory) ---
+# For large portfolios: sink lazy pipeline to Parquet, build grid in Rust directly.
+# Python never materialises the scored DataFrame.
+
+scored_lf = ...  # Polars LazyFrame from pipeline
+scored_lf.select(solver_cols).sink_parquet("/tmp/scored.parquet")
+
+grid = build_grid_from_parquet(
+    "/tmp/scored.parquet",
+    constraint_names=["predicted_volume"],
+    quote_id="quote_id",
+    scenario_index="scenario_index",
+    scenario_value_col="scenario_value",
+    objective="predicted_income",
+)
+result = optimiser.solve(grid)  # solver accepts QuoteGrid directly
 
 # Live scoring (via ApplyOptimiser)
 applier = ApplyOptimiser(...)
@@ -624,7 +634,7 @@ The library accepts Polars DataFrames at the Python API boundary. Internal compu
 
 ## Key Design Decisions
 
-1. **Multiplier grid, not price grid**: uniform across all risks, simplifies memory layout and solver internals.
+1. **Scenario value grid, not price grid**: uniform across all risks, simplifies memory layout and solver internals.
 2. **float32 throughout**: sufficient precision for insurance pricing (prices to nearest penny). Halves memory vs float64.
 3. **Chunked processing inside the solver**: the solver processes risks in chunks of `chunk_size` (default 500K). The lagrangian matrix is only allocated at chunk size, not full portfolio size. Streaming aggregation accumulates portfolio totals across chunks.
 4. **Lagrangian dual for both modes**: online uses it directly, ratebook uses it as the inner loop of coordinate descent. One core algorithm, two interfaces.
@@ -632,6 +642,7 @@ The library accepts Polars DataFrames at the Python API boundary. Internal compu
 6. **Library has no haute dependency**: price-contour is independently installable, testable, and usable outside haute.
 7. **Prep is user-built from standard nodes**: instead of a dedicated OptimiserPrep node, the user wires ScenarioExpander + transform + model scoring nodes. This keeps the prep logic visible in the pipeline graph and avoids a special-purpose node for what is really standard pipeline work (expand, compute features, score models).
 8. **Solver runs via API, not inline**: the Optimiser node is a passthrough in the pipeline executor. The actual solving happens via `/api/optimiser/solve` in a background thread, with status polling. This avoids blocking the pipeline executor on a long-running computation.
+9. **Parquet bridge for zero-copy Python memory**: the pipeline stays lazy until the optimiser route, which sinks scored columns to a temp Parquet file via `sink_parquet()`. Rust reads the Parquet directly via `build_grid_from_parquet` and constructs the `QuoteGrid` — Python never materialises the full scored DataFrame. Adds ~1-2s I/O but eliminates multi-GB Python peak memory. See `docs/PARQUET_GRID_PIPELINE.md` in haute for details.
 
 ---
 
@@ -639,14 +650,15 @@ The library accepts Polars DataFrames at the Python API boundary. Internal compu
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| ScenarioExpander node | Built | Full cross-join; step-wise QuoteGridBuilder approach TODO |
+| ScenarioExpander node | Built | Full cross-join via lazy Polars; step-wise QuoteGridBuilder approach TODO for very large portfolios |
 | Optimiser node (online) | Built | Solve via API endpoint, background thread |
 | Optimiser node (ratebook) | Built | Coordinate descent with Lagrangian inner loop |
+| Parquet grid pipeline | Built | `sink_parquet` + `build_grid_from_parquet` — zero Python memory for grid construction |
 | OptimiserApply node | TODO | `ApplyOptimiser` exists in library, not wired into haute |
 | Efficient frontier computation | Library done | `solver.frontier()` works; API endpoint + UI TODO |
 | Frontier UI (interactive Pareto curve) | TODO | Config fields exist (`frontier_enabled`, etc.) |
 | Spline coefficient export | TODO | Splines fitted internally; not exposed to Python |
-| Step-wise expansion via QuoteGridBuilder | TODO | Strategy decided (step-wise scoring, no cross-join); implementation pending |
+| Step-wise expansion via QuoteGridBuilder | TODO | Strategy decided (step-wise scoring, no cross-join); implementation pending. Lower priority now that sink_parquet handles typical portfolios. |
 | Artifact save/load for live scoring | Partial | Lambdas saved as JSON; `ApplyOptimiser.save/load` not used |
 | Impact analysis UI | TODO | Before/after distributions, per-segment breakdown |
 
@@ -662,8 +674,8 @@ The library accepts Polars DataFrames at the Python API boundary. Internal compu
 
 4. **Multiple objectives**: the current design is single-objective with constraints. Should we support multi-objective (Pareto across two objectives)? This changes the frontier from a curve to a surface.
 
-5. **Constraint types**: currently only portfolio-level sum constraints (Σ ≥ threshold). Should we support per-risk constraints (e.g. max rate change per individual risk)? These are trivially handled by clipping the multiplier range per risk.
+5. **Constraint types**: currently only portfolio-level sum constraints (Σ ≥ threshold). Should we support per-risk constraints (e.g. max rate change per individual risk)? These are trivially handled by clipping the scenario value range per risk.
 
 6. **Ratebook factor interactions**: coordinate descent optimises one factor at a time. Should we support optimising pairs of factors jointly (handles interactions but combinatorial cost grows)?
 
-7. **Chunked expansion strategy**: ~~the scenario expander currently does a full cross-join~~ — resolved. Step-wise scoring into `QuoteGridBuilder` avoids the cross-join entirely. Each multiplier step is scored on the full N-row base DataFrame (no row duplication), and only the lean objective/constraint columns are fed to the builder. See the Preparation section for details. Implementation is TODO.
+7. **Chunked expansion strategy**: the scenario expander does a full cross-join via lazy Polars, then the optimiser route sinks the scored columns to Parquet and Rust builds the grid directly (`build_grid_from_parquet`). Python peak memory is near zero. For portfolios too large to cross-join even lazily, step-wise scoring into `QuoteGridBuilder` (one scenario value step at a time, no cross-join) is the planned fallback — see the Preparation section. Lower priority now that the Parquet pipeline handles typical portfolio sizes.

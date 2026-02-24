@@ -1,7 +1,7 @@
 """Generate synthetic insurance pricing dataset for testing price_contour.
 
 Produces a long-format Polars DataFrame matching the schema in architecture.md:
-  quote_id, scenario_step, multiplier, expected_income, volume, loss_ratio
+  quote_id, scenario_index, scenario_value, expected_income, volume, loss_ratio
 
 Usage:
     python scripts/generate_test_data.py
@@ -23,9 +23,9 @@ import polars as pl
 
 parser = argparse.ArgumentParser(description="Generate synthetic test quotes")
 parser.add_argument("--n-quotes", type=int, default=1_000_000, help="Number of quotes")
-parser.add_argument("--n-steps", type=int, default=21, help="Number of multiplier steps")
-parser.add_argument("--mult-lo", type=float, default=0.80, help="Lowest multiplier")
-parser.add_argument("--mult-hi", type=float, default=1.20, help="Highest multiplier")
+parser.add_argument("--n-steps", type=int, default=21, help="Number of scenario value steps")
+parser.add_argument("--mult-lo", type=float, default=0.80, help="Lowest scenario value")
+parser.add_argument("--mult-hi", type=float, default=1.20, help="Highest scenario value")
 parser.add_argument("--seed", type=int, default=12345, help="Random seed")
 parser.add_argument(
     "--output",
@@ -46,10 +46,10 @@ print(f"Generating {N:,} quotes × {M} steps = {N * M:,} rows …")
 t0 = time.perf_counter()
 
 # ---------------------------------------------------------------------------
-# 1.  Multiplier grid (shared across all quotes)
+# 1.  Scenario value grid (shared across all quotes)
 # ---------------------------------------------------------------------------
 
-multipliers = np.linspace(args.mult_lo, args.mult_hi, M, dtype=np.float32)
+scenario_values = np.linspace(args.mult_lo, args.mult_hi, M, dtype=np.float32)
 
 # ---------------------------------------------------------------------------
 # 2.  Per-quote random characteristics  (N,)
@@ -64,8 +64,8 @@ midpoint = rng.normal(1.0, 0.03, size=N).astype(np.float32)
 # 3.  Expand to (N, M) via broadcasting and compute derived columns
 # ---------------------------------------------------------------------------
 
-# shapes: base_premium[:, None] → (N,1);  multipliers[None, :] → (1,M)
-m = multipliers[None, :]  # (1, M)
+# shapes: base_premium[:, None] → (N,1);  scenario_values[None, :] → (1,M)
+m = scenario_values[None, :]  # (1, M)
 
 bp = base_premium[:, None]      # (N, 1)
 blc = base_loss_cost[:, None]   # (N, 1)
@@ -79,13 +79,13 @@ conversion = (1.0 / (1.0 + np.exp(el * (m - mp)))).astype(np.float32)
 noise_income = rng.normal(1.0, 0.005, size=(N, M)).astype(np.float32)
 noise_lr = rng.normal(1.0, 0.005, size=(N, M)).astype(np.float32)
 
-# Expected income = base_premium × multiplier × conversion_prob
+# Expected income = base_premium × scenario_value × conversion_prob
 expected_income = (bp * m * conversion * noise_income).astype(np.float32)
 
 # Volume = conversion probability (the retention/conversion metric)
 volume = conversion  # already f32
 
-# Loss ratio = (base_loss_cost / (base_premium × multiplier)) × adverse selection factor
+# Loss ratio = (base_loss_cost / (base_premium × scenario_value)) × adverse selection factor
 # Adverse selection: as price rises, good risks leave, pushing loss ratio up
 adverse_selection = (1.0 + 0.1 * (m - 1.0)).astype(np.float32)
 loss_ratio = ((blc / (bp * m)) * adverse_selection * noise_lr).astype(np.float32)
@@ -105,11 +105,11 @@ quote_id_col = np.repeat(quote_ids, M)
 # Format as strings
 quote_id_str = [f"Q{qid:07d}" for qid in quote_id_col]
 
-# Scenario steps: tile [0..M-1] N times
-scenario_step_col = np.tile(np.arange(M, dtype=np.int32), N)
+# Scenario indices: tile [0..M-1] N times
+scenario_index_col = np.tile(np.arange(M, dtype=np.int32), N)
 
-# Multiplier: tile the grid N times
-multiplier_col = np.tile(multipliers, N)
+# Scenario value: tile the grid N times
+scenario_value_col = np.tile(scenario_values, N)
 
 # Flatten row-major (quote-major): each quote's M steps are contiguous
 expected_income_col = expected_income.ravel()
@@ -123,16 +123,16 @@ t2 = time.perf_counter()
 df = pl.DataFrame(
     {
         "quote_id": quote_id_str,
-        "scenario_step": scenario_step_col,
-        "multiplier": multiplier_col,
+        "scenario_index": scenario_index_col,
+        "scenario_value": scenario_value_col,
         "expected_income": expected_income_col,
         "volume": volume_col,
         "loss_ratio": loss_ratio_col,
     },
     schema={
         "quote_id": pl.Utf8,
-        "scenario_step": pl.Int32,
-        "multiplier": pl.Float32,
+        "scenario_index": pl.Int32,
+        "scenario_value": pl.Float32,
         "expected_income": pl.Float32,
         "volume": pl.Float32,
         "loss_ratio": pl.Float32,
@@ -170,7 +170,7 @@ print(q1)
 # Check peaked shape: expected_income should rise then fall
 incomes = q1["expected_income"].to_list()
 peak_idx = incomes.index(max(incomes))
-print(f"  Peak expected_income at step {peak_idx} (multiplier={q1['multiplier'][peak_idx]:.2f})")
+print(f"  Peak expected_income at step {peak_idx} (scenario_value={q1['scenario_value'][peak_idx]:.2f})")
 if peak_idx > 0 and peak_idx < M - 1:
     print("  ✓ Income has interior peak (not monotonic)")
 else:
@@ -184,10 +184,10 @@ if mono_violations == 0:
 else:
     print(f"  ⚠ Volume has {mono_violations} monotonicity violations > 0.01")
 
-# Portfolio-level summary at multiplier ≈ 1.0
-baseline_step = int(np.argmin(np.abs(multipliers - 1.0)))
-baseline = df.filter(pl.col("scenario_step") == baseline_step)
-print(f"\n--- Portfolio summary at step {baseline_step} (multiplier={multipliers[baseline_step]:.2f}) ---")
+# Portfolio-level summary at scenario_value ≈ 1.0
+baseline_step = int(np.argmin(np.abs(scenario_values - 1.0)))
+baseline = df.filter(pl.col("scenario_index") == baseline_step)
+print(f"\n--- Portfolio summary at step {baseline_step} (scenario_value={scenario_values[baseline_step]:.2f}) ---")
 print(f"  Mean expected_income: {baseline['expected_income'].mean():.1f}")
 print(f"  Mean volume:          {baseline['volume'].mean():.4f}")
 print(f"  Mean loss_ratio:      {baseline['loss_ratio'].mean():.4f}")

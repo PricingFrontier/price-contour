@@ -25,7 +25,7 @@ class ApplyOptimiser:
         Objective column name.
     constraints : dict[str, dict[str, float]]
         Constraint specifications (same format as OnlineOptimiser).
-    quote_id, scenario_step, multiplier : str
+    quote_id, scenario_index, scenario_value : str
         Column name overrides.
     chunk_size : int
         Quotes per parallel chunk.
@@ -38,16 +38,16 @@ class ApplyOptimiser:
         constraints: dict[str, dict[str, float]] | None = None,
         *,
         quote_id: str = "quote_id",
-        scenario_step: str = "scenario_step",
-        multiplier: str = "multiplier",
+        scenario_index: str = "scenario_index",
+        scenario_value: str = "scenario_value",
         chunk_size: int = 500_000,
     ) -> None:
         self.lambdas = lambdas
         self.objective = objective
         self.constraints = constraints or {}
         self.quote_id = quote_id
-        self.scenario_step = scenario_step
-        self.multiplier = multiplier
+        self.scenario_index = scenario_index
+        self.scenario_value = scenario_value
         self.chunk_size = chunk_size
 
     def apply(self, df: pl.DataFrame) -> ApplyResult:
@@ -68,8 +68,8 @@ class ApplyOptimiser:
             df,
             lambdas=self.lambdas,
             quote_id=self.quote_id,
-            scenario_step=self.scenario_step,
-            multiplier=self.multiplier,
+            scenario_index=self.scenario_index,
+            scenario_value=self.scenario_value,
             objective=self.objective,
             constraints=self.constraints,
             chunk_size=self.chunk_size,
@@ -90,8 +90,8 @@ class ApplyOptimiser:
             "objective": self.objective,
             "constraints": self.constraints,
             "quote_id": self.quote_id,
-            "scenario_step": self.scenario_step,
-            "multiplier": self.multiplier,
+            "scenario_index": self.scenario_index,
+            "scenario_value": self.scenario_value,
             "chunk_size": self.chunk_size,
         }
         path.write_text(json.dumps(config, indent=2))
@@ -117,7 +117,7 @@ class ApplyOptimiser:
             objective=config.get("objective", "expected_income"),
             constraints=config.get("constraints"),
             quote_id=config.get("quote_id", "quote_id"),
-            scenario_step=config.get("scenario_step", "scenario_step"),
-            multiplier=config.get("multiplier", "multiplier"),
+            scenario_index=config.get("scenario_index", "scenario_index"),
+            scenario_value=config.get("scenario_value", "scenario_value"),
             chunk_size=config.get("chunk_size", 500_000),
         )

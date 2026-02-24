@@ -287,7 +287,7 @@ mod tests {
         let grid = QuoteGrid {
             n_quotes: 3,
             n_steps: 4,
-            multipliers: vec![0.9, 0.95, 1.0, 1.05],
+            scenario_values: vec![0.9, 0.95, 1.0, 1.05],
             objective: vec![
                 1.0, 3.0, 2.0, 0.5, // quote 0: best at step 1
                 5.0, 4.0, 3.0, 2.0, // quote 1: best at step 0
@@ -332,7 +332,7 @@ mod tests {
         let grid = QuoteGrid {
             n_quotes: n,
             n_steps: m,
-            multipliers: vec![0.8, 0.9, 1.0, 1.1, 1.2],
+            scenario_values: vec![0.8, 0.9, 1.0, 1.1, 1.2],
             objective: obj,
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
@@ -354,7 +354,7 @@ mod tests {
         };
         let result = solve_online(&grid, &specs, &config, None).unwrap();
 
-        // With heterogeneous quotes, some shift to lower multipliers while others
+        // With heterogeneous quotes, some shift to lower scenario values while others
         // stay high — total volume should approximately satisfy the constraint.
         assert!(
             result.total_constraints[0] >= threshold * 0.98,
@@ -389,7 +389,7 @@ mod tests {
         let grid = QuoteGrid {
             n_quotes: n,
             n_steps: m,
-            multipliers: vec![0.8, 0.9, 1.0, 1.1, 1.2],
+            scenario_values: vec![0.8, 0.9, 1.0, 1.1, 1.2],
             objective: obj,
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
@@ -424,7 +424,7 @@ mod tests {
         let grid = QuoteGrid {
             n_quotes: 3,
             n_steps: 4,
-            multipliers: vec![0.9, 0.95, 1.0, 1.05],
+            scenario_values: vec![0.9, 0.95, 1.0, 1.05],
             objective: vec![
                 1.0, 3.0, 2.0, 0.5,
                 5.0, 4.0, 3.0, 2.0,
@@ -460,7 +460,7 @@ mod tests {
         let grid = QuoteGrid {
             n_quotes: 3,
             n_steps: 4,
-            multipliers: vec![0.9, 0.95, 1.0, 1.05],
+            scenario_values: vec![0.9, 0.95, 1.0, 1.05],
             objective: vec![
                 1.0, 3.0, 2.0, 0.5,
                 5.0, 4.0, 3.0, 2.0,
@@ -484,7 +484,7 @@ mod tests {
         let grid = QuoteGrid {
             n_quotes: 2,
             n_steps: 3,
-            multipliers: vec![0.9, 1.0, 1.1],
+            scenario_values: vec![0.9, 1.0, 1.1],
             objective: vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
             constraints: vec![],
             constraint_names: vec![],

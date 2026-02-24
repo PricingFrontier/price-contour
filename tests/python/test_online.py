@@ -34,8 +34,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
             rows.append(
                 {
                     "quote_id": f"Q{q:04d}",
-                    "scenario_step": j,
-                    "multiplier": mult,
+                    "scenario_index": j,
+                    "scenario_value": mult,
                     "expected_income": base * mult * conversion,
                     "volume": conversion,
                     "loss_ratio": 0.6 / mult * (1.0 + 0.1 * (mult - 1.0)),
@@ -45,8 +45,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
         rows,
         schema={
             "quote_id": pl.Utf8,
-            "scenario_step": pl.Int32,
-            "multiplier": pl.Float32,
+            "scenario_index": pl.Int32,
+            "scenario_value": pl.Float32,
             "expected_income": pl.Float32,
             "volume": pl.Float32,
             "loss_ratio": pl.Float32,
@@ -66,7 +66,7 @@ class TestBasicSolve:
         assert out.shape[0] == 20
         assert "quote_id" in out.columns
         assert "optimal_step" in out.columns
-        assert "optimal_multiplier" in out.columns
+        assert "optimal_scenario_value" in out.columns
         assert "optimal_objective" in out.columns
 
     def test_unconstrained_picks_best_step(self):
@@ -92,7 +92,7 @@ class TestBasicSolve:
         result = solver.solve(df)
 
         # Compute baseline volume
-        baseline = df.filter(pl.col("scenario_step") == 2)  # mult=1.0
+        baseline = df.filter(pl.col("scenario_index") == 2)  # mult=1.0
         baseline_vol = baseline["volume"].sum()
         threshold = baseline_vol * 0.90
 
@@ -109,7 +109,7 @@ class TestBasicSolve:
         )
         result = solver.solve(df)
 
-        baseline = df.filter(pl.col("scenario_step") == 2)
+        baseline = df.filter(pl.col("scenario_index") == 2)
         baseline_lr = baseline["loss_ratio"].sum()
         threshold = baseline_lr * 1.05
 

@@ -6,23 +6,23 @@ use crate::data::{
 use crate::error::Result;
 use crate::solver::lambda::update_lambdas_subgradient;
 
-/// Find the step index whose multiplier is nearest to `target`.
+/// Find the step index whose scenario_value is nearest to `target`.
 /// Returns (step_index, was_clamped).
-fn nearest_step(multipliers: &[f32], target: f32) -> (usize, bool) {
-    let n = multipliers.len();
-    if target <= multipliers[0] {
-        return (0, target < multipliers[0]);
+fn nearest_step(scenario_values: &[f32], target: f32) -> (usize, bool) {
+    let n = scenario_values.len();
+    if target <= scenario_values[0] {
+        return (0, target < scenario_values[0]);
     }
-    if target >= multipliers[n - 1] {
-        return (n - 1, target > multipliers[n - 1]);
+    if target >= scenario_values[n - 1] {
+        return (n - 1, target > scenario_values[n - 1]);
     }
     // Binary search for nearest
-    match multipliers.binary_search_by(|m| m.partial_cmp(&target).unwrap()) {
+    match scenario_values.binary_search_by(|m| m.partial_cmp(&target).unwrap()) {
         Ok(i) => (i, false),
         Err(i) => {
             // i is insertion point; compare i-1 and i
-            let below = multipliers[i - 1];
-            let above = multipliers[i];
+            let below = scenario_values[i - 1];
+            let above = scenario_values[i];
             if (target - below).abs() <= (above - target).abs() {
                 (i - 1, false)
             } else {
@@ -115,7 +115,7 @@ pub fn solve_grouped(
 
             for (j, &cand) in candidates.iter().enumerate() {
                 let target = residuals[i] * cand;
-                let (k, clamped) = nearest_step(&grid.multipliers, target);
+                let (k, clamped) = nearest_step(&grid.scenario_values, target);
                 if clamped {
                     clamp_count += 1;
                 }
@@ -151,7 +151,7 @@ pub fn solve_grouped(
             let g = group_mapping.group_of[i] as usize;
             let cand = candidates[group_best_candidate[g]];
             let target = residuals[i] * cand;
-            let (k, _) = nearest_step(&grid.multipliers, target);
+            let (k, _) = nearest_step(&grid.scenario_values, target);
             optimal_steps[i] = k as u32;
 
             let idx = i * n_steps + k;
@@ -233,7 +233,7 @@ pub fn solve_grouped(
             let base = i * n_steps;
             for (j, &cand) in candidates.iter().enumerate() {
                 let target = residuals[i] * cand;
-                let (k, _) = nearest_step(&grid.multipliers, target);
+                let (k, _) = nearest_step(&grid.scenario_values, target);
                 let idx = base + k;
                 let mut l = grid.objective[idx] as f64;
                 for (c, &sign_lam) in lambda_signs.iter().enumerate() {
@@ -261,7 +261,7 @@ pub fn solve_grouped(
             let g = group_mapping.group_of[i] as usize;
             let cand = candidates[group_best_candidate[g]];
             let target = residuals[i] * cand;
-            let (k, _) = nearest_step(&grid.multipliers, target);
+            let (k, _) = nearest_step(&grid.scenario_values, target);
             optimal_steps[i] = k as u32;
             let idx = i * n_steps + k;
             total_objective += grid.objective[idx] as f64;
@@ -333,7 +333,7 @@ mod tests {
         QuoteGrid {
             n_quotes: n,
             n_steps: m,
-            multipliers: mults,
+            scenario_values: mults,
             objective: obj,
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_all_distinct_groups_matches_online() {
-        // Each quote in its own group with residual=1.0 and candidates=multipliers
+        // Each quote in its own group with residual=1.0 and candidates=scenario_values
         // should behave like the online solver (identity remap).
         let n = 50;
         let m = 5;
@@ -365,7 +365,7 @@ mod tests {
         let labels: Vec<String> = (0..n).map(|i| format!("G{i}")).collect();
         let group_mapping = build_group_mapping(&labels);
         let residuals = vec![1.0f32; n];
-        let candidates = grid.multipliers.clone();
+        let candidates = grid.scenario_values.clone();
 
         let (_, bc) = grid.baseline_totals();
         let specs = vec![ConstraintSpec {

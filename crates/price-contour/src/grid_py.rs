@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 
 use price_contour_core::QuoteGrid;
@@ -5,7 +7,14 @@ use price_contour_core::QuoteGrid;
 /// Python-visible opaque handle to a QuoteGrid.
 #[pyclass(name = "QuoteGrid")]
 pub struct PyQuoteGrid {
-    pub(crate) inner: QuoteGrid,
+    pub(crate) inner: Arc<QuoteGrid>,
+}
+
+impl PyQuoteGrid {
+    /// Create a new PyQuoteGrid wrapping a QuoteGrid in Arc.
+    pub fn new(grid: QuoteGrid) -> Self {
+        Self { inner: Arc::new(grid) }
+    }
 }
 
 #[pymethods]
@@ -21,13 +30,18 @@ impl PyQuoteGrid {
     }
 
     #[getter]
-    fn multipliers(&self) -> Vec<f32> {
-        self.inner.multipliers.clone()
+    fn scenario_values(&self) -> Vec<f32> {
+        self.inner.scenario_values.clone()
     }
 
     #[getter]
     fn constraint_names(&self) -> Vec<String> {
         self.inner.constraint_names.clone()
+    }
+
+    #[getter]
+    fn quote_ids(&self) -> Vec<String> {
+        self.inner.quote_ids.clone()
     }
 
     fn __repr__(&self) -> String {

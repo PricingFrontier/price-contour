@@ -25,10 +25,10 @@ class OnlineOptimiser:
     ----------
     quote_id : str
         Column name for quote identifiers.
-    scenario_step : str
+    scenario_index : str
         Column name for step indices.
-    multiplier : str
-        Column name for price multipliers.
+    scenario_value : str
+        Column name for scenario values.
     objective : str
         Column name for the objective function (e.g. expected income).
     constraints : dict[str, dict[str, float]]
@@ -51,16 +51,16 @@ class OnlineOptimiser:
         constraints: dict[str, dict[str, float]] | None = None,
         *,
         quote_id: str = "quote_id",
-        scenario_step: str = "scenario_step",
-        multiplier: str = "multiplier",
+        scenario_index: str = "scenario_index",
+        scenario_value: str = "scenario_value",
         max_iter: int = 50,
         chunk_size: int = 500_000,
         tolerance: float = 1e-6,
         record_history: bool = False,
     ) -> None:
         self.quote_id = quote_id
-        self.scenario_step = scenario_step
-        self.multiplier = multiplier
+        self.scenario_index = scenario_index
+        self.scenario_value = scenario_value
         self.objective = objective
         self.constraints = constraints or {}
         self.max_iter = max_iter
@@ -102,8 +102,8 @@ class OnlineOptimiser:
         return solve_online_py(
             df_or_grid,
             quote_id=self.quote_id,
-            scenario_step=self.scenario_step,
-            multiplier=self.multiplier,
+            scenario_index=self.scenario_index,
+            scenario_value=self.scenario_value,
             objective=self.objective,
             constraints=self.constraints,
             max_iter=self.max_iter,
@@ -141,8 +141,8 @@ class OnlineOptimiser:
             builder = QuoteGridBuilder(
                 list(self.constraints.keys()),
                 quote_id=self.quote_id,
-                scenario_step=self.scenario_step,
-                multiplier_col=self.multiplier,
+                scenario_index=self.scenario_index,
+                scenario_value_col=self.scenario_value,
                 objective=self.objective,
             )
             builder.append(df_or_grid)
@@ -166,8 +166,8 @@ class OnlineOptimiser:
             "objective": self.objective,
             "constraints": self.constraints,
             "quote_id": self.quote_id,
-            "scenario_step": self.scenario_step,
-            "multiplier": self.multiplier,
+            "scenario_index": self.scenario_index,
+            "scenario_value": self.scenario_value,
             "max_iter": self.max_iter,
             "chunk_size": self.chunk_size,
             "tolerance": self.tolerance,
@@ -199,7 +199,7 @@ class OnlineOptimiser:
         config = self.config_dict()
         baseline_obj = result.baseline_objective
         out_df = result.dataframe
-        opt_mults = out_df["optimal_multiplier"]
+        opt_mults = out_df["optimal_scenario_value"]
 
         # --- params (flat, all scalars) ---
         params: dict[str, Any] = {
@@ -212,10 +212,10 @@ class OnlineOptimiser:
         }
         if config["constraints"]:
             params["constraints"] = json.dumps(config["constraints"])
-        mults = result.multipliers
+        mults = result.scenario_values
         if mults:
-            params["multiplier_min"] = round(float(min(mults)), 4)
-            params["multiplier_max"] = round(float(max(mults)), 4)
+            params["scenario_value_min"] = round(float(min(mults)), 4)
+            params["scenario_value_max"] = round(float(max(mults)), 4)
 
         # --- metrics (flat, all floats) ---
         metrics: dict[str, float] = {
@@ -240,10 +240,10 @@ class OnlineOptimiser:
         for name, lam in result.lambdas.items():
             metrics[f"lambda_{name}"] = lam
 
-        metrics["multiplier_mean"] = float(opt_mults.mean())
-        metrics["multiplier_std"] = float(opt_mults.std())
+        metrics["scenario_value_mean"] = float(opt_mults.mean())
+        metrics["scenario_value_std"] = float(opt_mults.std())
         for pct in (5, 25, 50, 75, 95):
-            metrics[f"multiplier_p{pct}"] = float(
+            metrics[f"scenario_value_p{pct}"] = float(
                 opt_mults.quantile(pct / 100)
             )
 
@@ -260,14 +260,14 @@ class OnlineOptimiser:
             "baseline_objective": baseline_obj,
             "lambdas": result.lambdas,
             "constraints": {},
-            "multiplier_distribution": {
-                "mean": metrics["multiplier_mean"],
-                "std": metrics["multiplier_std"],
-                "p5": metrics["multiplier_p5"],
-                "p25": metrics["multiplier_p25"],
-                "p50": metrics["multiplier_p50"],
-                "p75": metrics["multiplier_p75"],
-                "p95": metrics["multiplier_p95"],
+            "scenario_value_distribution": {
+                "mean": metrics["scenario_value_mean"],
+                "std": metrics["scenario_value_std"],
+                "p5": metrics["scenario_value_p5"],
+                "p25": metrics["scenario_value_p25"],
+                "p50": metrics["scenario_value_p50"],
+                "p75": metrics["scenario_value_p75"],
+                "p95": metrics["scenario_value_p95"],
             },
             "config": config,
         }

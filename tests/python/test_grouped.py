@@ -27,8 +27,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
             rows.append(
                 {
                     "quote_id": f"Q{q:04d}",
-                    "scenario_step": j,
-                    "multiplier": mult,
+                    "scenario_index": j,
+                    "scenario_value": mult,
                     "expected_income": base * mult * conversion,
                     "volume": conversion,
                     "loss_ratio": 0.6 / mult * (1.0 + 0.1 * (mult - 1.0)),
@@ -38,8 +38,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
         rows,
         schema={
             "quote_id": pl.Utf8,
-            "scenario_step": pl.Int32,
-            "multiplier": pl.Float32,
+            "scenario_index": pl.Int32,
+            "scenario_value": pl.Float32,
             "expected_income": pl.Float32,
             "volume": pl.Float32,
             "loss_ratio": pl.Float32,
@@ -55,7 +55,7 @@ def _build_grid(df: pl.DataFrame) -> QuoteGrid:
 
 class TestGroupedSolver:
     def test_all_distinct_groups_matches_online(self):
-        """N groups with residuals=1.0 and candidates=multipliers ~ online result."""
+        """N groups with residuals=1.0 and candidates=scenario_values ~ online result."""
         n = 50
         df = _make_small_df(n_quotes=n, n_steps=5)
         grid = _build_grid(df)
@@ -63,7 +63,7 @@ class TestGroupedSolver:
         # Each quote is its own group
         group_labels = [f"G{i}" for i in range(n)]
         residuals = [1.0] * n
-        candidates = list(grid.multipliers)
+        candidates = list(grid.scenario_values)
 
         result = solve_grouped_py(
             grid,
@@ -122,7 +122,7 @@ class TestGroupedSolver:
         # Group 0: quotes 0,1; Group 1: quote 2
         group_labels = ["A", "A", "B"]
         residuals = [1.0, 1.0, 1.0]
-        candidates = list(grid.multipliers)
+        candidates = list(grid.scenario_values)
 
         result = solve_grouped_py(
             grid,
@@ -185,7 +185,7 @@ class TestGroupedSolver:
 
         group_labels = ["A"] * 10 + ["B"] * 10
         residuals = [1.0] * n
-        candidates = list(grid.multipliers)
+        candidates = list(grid.scenario_values)
 
         result = solve_grouped_py(
             grid,

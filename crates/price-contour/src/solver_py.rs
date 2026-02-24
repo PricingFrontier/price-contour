@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use polars::prelude::*;
 use pyo3::exceptions::PyValueError;
@@ -15,27 +16,30 @@ use crate::grid_py::PyQuoteGrid;
 pub(crate) fn ingest_dataframe(
     df: &DataFrame,
     quote_id_col: &str,
-    scenario_step_col: &str,
-    multiplier_col: &str,
+    scenario_index_col: &str,
+    scenario_value_col: &str,
     objective_col: &str,
     constraint_cols: &[String],
 ) -> PyResult<QuoteGrid> {
-    // Sort by (quote_id, scenario_step)
+    // Sort by (quote_id, scenario_index)
     let df = df
         .sort(
-            [quote_id_col, scenario_step_col],
+            [quote_id_col, scenario_index_col],
             SortMultipleOptions::default(),
         )
         .map_err(|e| PyValueError::new_err(format!("Sort failed: {e}")))?;
 
-    // Extract multiplier grid from first quote's steps
+    // Extract scenario_value grid from first quote's steps
     let n_rows = df.height();
+    if n_rows == 0 {
+        return Err(PyValueError::new_err("Empty DataFrame"));
+    }
     let step_series = df
-        .column(scenario_step_col)
-        .map_err(|_| PyValueError::new_err(format!("Missing column: {scenario_step_col}")))?;
+        .column(scenario_index_col)
+        .map_err(|_| PyValueError::new_err(format!("Missing column: {scenario_index_col}")))?;
     let steps_ca = step_series
         .i32()
-        .map_err(|_| PyValueError::new_err(format!("{scenario_step_col} must be Int32")))?;
+        .map_err(|_| PyValueError::new_err(format!("{scenario_index_col} must be Int32")))?;
 
     // Count unique quotes and determine n_steps
     let qid_series = df
@@ -67,16 +71,20 @@ pub(crate) fn ingest_dataframe(
     }
     let n_quotes = n_rows / n_steps;
 
-    // Extract multiplier grid (from first quote's rows)
+    // Extract scenario_value grid (from first quote's rows)
     let mult_series = df
-        .column(multiplier_col)
-        .map_err(|_| PyValueError::new_err(format!("Missing column: {multiplier_col}")))?;
+        .column(scenario_value_col)
+        .map_err(|_| PyValueError::new_err(format!("Missing column: {scenario_value_col}")))?;
     let mult_ca = mult_series
         .f32()
-        .map_err(|_| PyValueError::new_err(format!("{multiplier_col} must be Float32")))?;
-    let multipliers: Vec<f32> = (0..n_steps)
-        .map(|i| mult_ca.get(i).unwrap_or(0.0))
-        .collect();
+        .map_err(|_| PyValueError::new_err(format!("{scenario_value_col} must be Float32")))?;
+    let scenario_values: Vec<f32> = (0..n_steps)
+        .map(|i| {
+            mult_ca.get(i).ok_or_else(|| {
+                PyValueError::new_err(format!("Null {scenario_value_col} at row {i}"))
+            })
+        })
+        .collect::<PyResult<Vec<f32>>>()?;
 
     // Extract objective as flat Vec<f32>
     let obj_series = df
@@ -102,21 +110,24 @@ pub(crate) fn ingest_dataframe(
     // Extract quote_ids (one per quote — take every n_steps-th)
     let quote_ids: Vec<String> = (0..n_quotes)
         .map(|q| {
+            let row = q * n_steps;
             qid_ca
-                .get(q * n_steps)
-                .unwrap_or("")
-                .to_string()
+                .get(row)
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("Null {quote_id_col} at row {row}"))
+                })
         })
-        .collect();
+        .collect::<PyResult<Vec<String>>>()?;
 
-    // Validate step sequence for each quote
+    // Validate step sequence (first 10 quotes only, for performance on large grids)
     for q in 0..n_quotes.min(10) {
         for j in 0..n_steps {
             let idx = q * n_steps + j;
             let step_val = steps_ca.get(idx).unwrap_or(-1);
             if step_val != j as i32 {
                 return Err(PyValueError::new_err(format!(
-                    "Quote {} step {} has scenario_step={}, expected {}",
+                    "Quote {} step {} has scenario_index={}, expected {}",
                     quote_ids[q], j, step_val, j
                 )));
             }
@@ -126,7 +137,7 @@ pub(crate) fn ingest_dataframe(
     Ok(QuoteGrid {
         n_quotes,
         n_steps,
-        multipliers,
+        scenario_values,
         objective,
         constraints,
         constraint_names: constraint_cols.to_vec(),
@@ -135,19 +146,24 @@ pub(crate) fn ingest_dataframe(
 }
 
 /// Build result DataFrame from optimal_steps + QuoteGrid.
-pub(crate) fn build_result_dataframe(result: &SolveResult, grid: &QuoteGrid) -> PyResult<DataFrame> {
+///
+/// Shared by both `PySolveResult.dataframe` and `PyApplyResult.dataframe`.
+pub(crate) fn build_result_dataframe(
+    optimal_steps: &[u32],
+    grid: &QuoteGrid,
+) -> PyResult<DataFrame> {
     let n = grid.n_quotes;
     let m = grid.n_steps;
 
-    let mut opt_multipliers = Vec::with_capacity(n);
+    let mut opt_scenario_values = Vec::with_capacity(n);
     let mut opt_objectives = Vec::with_capacity(n);
     let mut opt_constraint_vals: Vec<Vec<f32>> =
         vec![Vec::with_capacity(n); grid.constraint_names.len()];
 
     for q in 0..n {
-        let step = result.optimal_steps[q] as usize;
+        let step = optimal_steps[q] as usize;
         let idx = q * m + step;
-        opt_multipliers.push(grid.multipliers[step]);
+        opt_scenario_values.push(grid.scenario_values[step]);
         opt_objectives.push(grid.objective[idx]);
         for (k, con) in grid.constraints.iter().enumerate() {
             opt_constraint_vals[k].push(con[idx]);
@@ -158,13 +174,12 @@ pub(crate) fn build_result_dataframe(result: &SolveResult, grid: &QuoteGrid) -> 
         Column::new("quote_id".into(), &grid.quote_ids),
         Column::new(
             "optimal_step".into(),
-            result
-                .optimal_steps
+            optimal_steps
                 .iter()
                 .map(|&s| s as i32)
                 .collect::<Vec<i32>>(),
         ),
-        Column::new("optimal_multiplier".into(), &opt_multipliers),
+        Column::new("optimal_scenario_value".into(), &opt_scenario_values),
         Column::new("optimal_objective".into(), &opt_objectives),
     ];
 
@@ -182,7 +197,7 @@ pub(crate) fn build_result_dataframe(result: &SolveResult, grid: &QuoteGrid) -> 
 #[pyclass(name = "SolveResult")]
 pub struct PySolveResult {
     inner: SolveResult,
-    grid: QuoteGrid,
+    grid: Arc<QuoteGrid>,
     constraint_names: Vec<String>,
     result_df: Option<Py<PyAny>>,
 }
@@ -227,7 +242,7 @@ impl PySolveResult {
         if let Some(ref cached) = self.result_df {
             return Ok(cached.clone_ref(py));
         }
-        let df = build_result_dataframe(&self.inner, &self.grid)?;
+        let df = build_result_dataframe(&self.inner.optimal_steps, &self.grid)?;
         let py_df = PyDataFrame(df).into_pyobject(py)?.into();
         self.result_df = Some(py_df);
         Ok(self.result_df.as_ref().unwrap().clone_ref(py))
@@ -280,8 +295,8 @@ impl PySolveResult {
     }
 
     #[getter]
-    fn multipliers(&self) -> Vec<f32> {
-        self.grid.multipliers.clone()
+    fn scenario_values(&self) -> Vec<f32> {
+        self.grid.scenario_values.clone()
     }
 
     #[getter]
@@ -292,6 +307,12 @@ impl PySolveResult {
     #[getter]
     fn n_steps(&self) -> usize {
         self.grid.n_steps
+    }
+
+    /// Return the underlying QuoteGrid (Arc-shared, zero-copy).
+    #[getter]
+    fn grid(&self) -> PyQuoteGrid {
+        PyQuoteGrid { inner: Arc::clone(&self.grid) }
     }
 }
 
@@ -353,8 +374,8 @@ pub(crate) fn parse_constraints(
 #[pyo3(signature = (
     df,
     quote_id = "quote_id",
-    scenario_step = "scenario_step",
-    multiplier = "multiplier",
+    scenario_index = "scenario_index",
+    scenario_value = "scenario_value",
     objective = "expected_income",
     constraints = None,
     max_iter = 50,
@@ -366,8 +387,8 @@ pub(crate) fn parse_constraints(
 pub fn solve_online_py(
     df: PyDataFrame,
     quote_id: &str,
-    scenario_step: &str,
-    multiplier: &str,
+    scenario_index: &str,
+    scenario_value: &str,
     objective: &str,
     constraints: Option<HashMap<String, HashMap<String, f64>>>,
     max_iter: usize,
@@ -380,14 +401,14 @@ pub fn solve_online_py(
 
     let constraint_cols: Vec<String> = constraints.keys().cloned().collect();
 
-    let grid = ingest_dataframe(
+    let grid = Arc::new(ingest_dataframe(
         &df.0,
         quote_id,
-        scenario_step,
-        multiplier,
+        scenario_index,
+        scenario_value,
         objective,
         &constraint_cols,
-    )?;
+    )?);
 
     let specs = parse_constraints(constraints, &grid)?;
 
@@ -464,20 +485,9 @@ pub fn solve_from_grid_py(
 
     let constraint_names = specs.iter().map(|s| s.name.clone()).collect();
 
-    // We need to clone the grid for the result since PySolveResult owns it
-    let grid_clone = QuoteGrid {
-        n_quotes: grid.inner.n_quotes,
-        n_steps: grid.inner.n_steps,
-        multipliers: grid.inner.multipliers.clone(),
-        objective: grid.inner.objective.clone(),
-        constraints: grid.inner.constraints.clone(),
-        constraint_names: grid.inner.constraint_names.clone(),
-        quote_ids: grid.inner.quote_ids.clone(),
-    };
-
     Ok(PySolveResult {
         inner: result,
-        grid: grid_clone,
+        grid: Arc::clone(&grid.inner),
         constraint_names,
         result_df: None,
     })

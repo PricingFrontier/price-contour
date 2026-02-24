@@ -15,7 +15,7 @@
 
 ---
 
-Price Contour finds optimal price multipliers across a portfolio of insurance risks subject to business constraints. Give it a scored dataset with objective and constraint values at discrete price points, and it returns the multiplier per quote that maximises your objective while respecting every constraint.
+Price Contour finds optimal price scenario values across a portfolio of insurance risks subject to business constraints. Give it a scored dataset with objective and constraint values at discrete price points, and it returns the scenario value per quote that maximises your objective while respecting every constraint.
 
 The core algorithm is Lagrangian dual decomposition, implemented in Rust for speed and exposed to Python via zero-copy Polars DataFrames. A portfolio of 1M+ risks solves in seconds.
 
@@ -39,8 +39,8 @@ optimiser = pc.OnlineOptimiser(
     objective="income",
     constraints={"volume": {"min": 0.90}},  # retain at least 90% of baseline volume
     quote_id="quote_id",
-    scenario_step="scenario_step",
-    multiplier="multiplier",
+    scenario_index="scenario_index",
+    scenario_value="scenario_value",
 )
 
 result = optimiser.solve(df)
@@ -50,11 +50,11 @@ print(result.iterations)       # 23
 print(result.lambdas)          # {'volume': 0.147}
 print(result.total_objective)  # 1_284_302.5
 
-# Per-quote optimal multipliers as a Polars DataFrame
+# Per-quote optimal scenario values as a Polars DataFrame
 out = result.dataframe
 print(out.head())
 # ┌──────────┬──────────────┬────────────────────┬─────────────────────┬──────────────────┐
-# │ quote_id │ optimal_step │ optimal_multiplier │ optimal_income      │ optimal_volume   │
+# │ quote_id │ optimal_step │ optimal_scenario_value │ optimal_income      │ optimal_volume   │
 # ╞══════════╪══════════════╪════════════════════╪═════════════════════╪══════════════════╡
 # │ Q001     │ 14           │ 1.07               │ 42.30               │ 0.82             │
 # │ Q002     │ 11           │ 0.98               │ 18.55               │ 0.91             │
@@ -65,19 +65,19 @@ print(out.head())
 
 ## What it does
 
-Price Contour operates on **pre-computed scenario data**. It does not fit models or generate demand curves. Upstream, your pricing pipeline scores every quote at a grid of price multipliers (e.g. 0.8, 0.85, 0.9, ..., 1.2) and computes what the expected income, volume, loss ratio, etc. would be at each point. Price Contour then selects the optimal multiplier per quote across the portfolio.
+Price Contour operates on **pre-computed scenario data**. It does not fit models or generate demand curves. Upstream, your pricing pipeline scores every quote at a grid of price scenario values (e.g. 0.8, 0.85, 0.9, ..., 1.2) and computes what the expected income, volume, loss ratio, etc. would be at each point. Price Contour then selects the optimal scenario value per quote across the portfolio.
 
 The input is a long-format Polars DataFrame:
 
-| quote_id | scenario_step | multiplier | income | volume | loss_ratio |
-|----------|---------------|------------|--------|--------|------------|
+| quote_id | scenario_index | scenario_value | income | volume | loss_ratio |
+|----------|----------------|----------------|--------|--------|------------|
 | Q001     | 0             | 0.80       | 85.2   | 0.95   | 0.62       |
 | Q001     | 1             | 0.90       | 92.1   | 0.88   | 0.59       |
 | Q001     | 2             | 1.00       | 100.0  | 0.80   | 0.60       |
 | Q002     | 0             | 0.80       | 42.0   | 0.97   | 0.58       |
 | ...      | ...           | ...        | ...    | ...    | ...        |
 
-The output is one optimal multiplier per quote, chosen to maximise portfolio-level income while keeping portfolio-level volume above 90% of baseline (or whatever constraints you set).
+The output is one optimal scenario value per quote, chosen to maximise portfolio-level income while keeping portfolio-level volume above 90% of baseline (or whatever constraints you set).
 
 ---
 
@@ -85,7 +85,7 @@ The output is one optimal multiplier per quote, chosen to maximise portfolio-lev
 
 ### Online optimisation
 
-Find the optimal multiplier per individual quote. Each quote independently picks its best price point, coordinated by shared Lagrange multipliers that enforce portfolio-level constraints.
+Find the optimal scenario value per individual quote. Each quote independently picks its best price point, coordinated by shared Lagrange multipliers that enforce portfolio-level constraints.
 
 ```python
 optimiser = pc.OnlineOptimiser(
@@ -97,7 +97,7 @@ result = optimiser.solve(df)
 
 ### Ratebook optimisation
 
-Find optimal rating factors across rating dimensions. Instead of individual multipliers, find the best factor value for each level of each rating factor (e.g. age band, region, vehicle power), applied uniformly to all quotes sharing that level.
+Find optimal rating factors across rating dimensions. Instead of individual scenario values, find the best factor value for each level of each rating factor (e.g. age band, region, vehicle power), applied uniformly to all quotes sharing that level.
 
 ```python
 optimiser = pc.RatebookOptimiser(
@@ -140,7 +140,7 @@ applier.save("config/applier.json")
 # Later, in production:
 applier = pc.ApplyOptimiser.load("config/applier.json")
 live_result = applier.apply(df_single_quote)
-optimal_multiplier = live_result.dataframe["optimal_multiplier"][0]
+optimal_scenario_value = live_result.dataframe["optimal_scenario_value"][0]
 ```
 
 ---
@@ -173,7 +173,7 @@ Adjacent points are warm-started from each other (nearest-neighbour traversal of
 
 ## Constraint format
 
-Constraints are specified as a dictionary. Keys are column names in your DataFrame, values specify the direction and threshold relative to the baseline (the portfolio totals at multiplier = 1.0):
+Constraints are specified as a dictionary. Keys are column names in your DataFrame, values specify the direction and threshold relative to the baseline (the portfolio totals at scenario_value = 1.0):
 
 ```python
 constraints = {
@@ -193,8 +193,8 @@ For large datasets that don't fit in memory at once, build the internal grid inc
 builder = pc.QuoteGridBuilder(
     ["volume", "loss_ratio"],
     quote_id="quote_id",
-    scenario_step="scenario_step",
-    multiplier_col="multiplier",
+    scenario_index="scenario_index",
+    scenario_value_col="scenario_value",
     objective="income",
 )
 
@@ -231,12 +231,12 @@ mlflow.log_dict(summary["artifacts"]["config"], "config.json")
 Price Contour solves the constrained optimisation problem:
 
 ```
-Maximise    sum_i  objective(quote_i, multiplier_i)
-Subject to  sum_i  constraint_k(quote_i, multiplier_i) >= threshold_k   for all k
-            multiplier_i in {discrete grid}
+Maximise    sum_i  objective(quote_i, scenario_value_i)
+Subject to  sum_i  constraint_k(quote_i, scenario_value_i) >= threshold_k   for all k
+            scenario_value_i in {discrete grid}
 ```
 
-This is a combinatorial problem (each quote picks from M discrete multipliers). Lagrangian dual decomposition relaxes the coupling constraints into the objective using dual variables (lambdas), decomposing it into N independent per-quote subproblems:
+This is a combinatorial problem (each quote picks from M discrete scenario values). Lagrangian dual decomposition relaxes the coupling constraints into the objective using dual variables (lambdas), decomposing it into N independent per-quote subproblems:
 
 ```
 For fixed lambdas:
@@ -259,7 +259,7 @@ The Rust core uses:
 
 ### Ratebook mode
 
-For ratebook optimisation, coordinate descent iterates over rating factors. For each factor, a grouped Lagrangian solve finds the best discrete factor value per group (e.g. per age band), with the individual quote multiplier computed as the product of all factor values times a per-quote residual. The inner grouped solve uses the same Lagrangian machinery with remapping to the nearest grid point.
+For ratebook optimisation, coordinate descent iterates over rating factors. For each factor, a grouped Lagrangian solve finds the best discrete factor value per group (e.g. per age band), with the individual quote scenario value computed as the product of all factor values times a per-quote residual. The inner grouped solve uses the same Lagrangian machinery with remapping to the nearest grid point.
 
 ---
 
@@ -366,16 +366,16 @@ maturin develop
 |---|---|---|
 | `converged` | `bool` | Whether the solver converged. |
 | `iterations` | `int` | Number of iterations taken. |
-| `lambdas` | `dict[str, float]` | Final Lagrange multipliers per constraint. |
+| `lambdas` | `dict[str, float]` | Final Lagrange multipliers (shadow prices) per constraint. |
 | `total_objective` | `float` | Portfolio-level objective at optimal solution. |
 | `total_constraints` | `dict[str, float]` | Portfolio-level constraint totals. |
-| `baseline_objective` | `float` | Objective at multiplier = 1.0. |
-| `baseline_constraints` | `dict[str, float]` | Constraints at multiplier = 1.0. |
-| `dataframe` | `pl.DataFrame` | Per-quote results with optimal multipliers. |
+| `baseline_objective` | `float` | Objective at scenario_value = 1.0. |
+| `baseline_constraints` | `dict[str, float]` | Constraints at scenario_value = 1.0. |
+| `dataframe` | `pl.DataFrame` | Per-quote results with optimal scenario values. |
 | `history` | `list[dict] \| None` | Per-iteration convergence records (if `record_history=True`). |
 | `n_quotes` | `int` | Number of quotes in the grid. |
-| `n_steps` | `int` | Number of multiplier steps. |
-| `multipliers` | `list[float]` | The multiplier grid. |
+| `n_steps` | `int` | Number of scenario value steps. |
+| `scenario_values` | `list[float]` | The scenario value grid. |
 
 ### RatebookResult
 

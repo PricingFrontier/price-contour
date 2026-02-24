@@ -12,7 +12,12 @@ from price_contour.builder import QuoteGrid, QuoteGridBuilder
 from price_contour.frontier import FrontierResult, frontier_summary
 from price_contour.ratebook import RatebookOptimiser, RatebookResult
 from price_contour.solver import OnlineOptimiser
-from price_contour._price_contour import ApplyResult, GroupedSolveResult, SolveResult
+from price_contour._price_contour import (
+    ApplyResult,
+    GroupedSolveResult,
+    SolveResult,
+    build_grid_from_parquet_py as build_grid_from_parquet,
+)
 
 __all__ = [
     "__version__",
@@ -26,5 +31,6 @@ __all__ = [
     "RatebookOptimiser",
     "RatebookResult",
     "SolveResult",
+    "build_grid_from_parquet",
     "frontier_summary",
 ]

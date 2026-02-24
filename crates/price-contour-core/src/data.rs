@@ -7,7 +7,7 @@ use crate::error::{PriceContourError, Result};
 pub struct QuoteGrid {
     pub n_quotes: usize,
     pub n_steps: usize,
-    pub multipliers: Vec<f32>,
+    pub scenario_values: Vec<f32>,
     pub objective: Vec<f32>,
     pub constraints: Vec<Vec<f32>>,
     pub constraint_names: Vec<String>,
@@ -19,10 +19,10 @@ impl QuoteGrid {
     pub fn validate(&self) -> Result<()> {
         let expected_len = self.n_quotes * self.n_steps;
 
-        if self.multipliers.len() != self.n_steps {
+        if self.scenario_values.len() != self.n_steps {
             return Err(PriceContourError::DimensionMismatch(format!(
-                "multipliers length {} != n_steps {}",
-                self.multipliers.len(),
+                "scenario_values length {} != n_steps {}",
+                self.scenario_values.len(),
                 self.n_steps
             )));
         }
@@ -60,11 +60,11 @@ impl QuoteGrid {
         Ok(())
     }
 
-    /// Find the step index closest to multiplier=1.0 and compute baseline totals.
+    /// Find the step index closest to scenario_value=1.0 and compute baseline totals.
     /// Returns (baseline_objective_total, baseline_constraint_totals) as f64.
     pub fn baseline_totals(&self) -> (f64, Vec<f64>) {
         let baseline_step = self
-            .multipliers
+            .scenario_values
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
@@ -162,7 +162,7 @@ pub struct SolveResult {
 /// Builder for incrementally constructing a QuoteGrid from chunked data.
 pub struct QuoteGridBuilder {
     n_steps: usize,
-    multipliers: Vec<f32>,
+    scenario_values: Vec<f32>,
     constraint_names: Vec<String>,
     objective: Vec<f32>,
     constraints: Vec<Vec<f32>>,
@@ -172,34 +172,34 @@ pub struct QuoteGridBuilder {
 }
 
 impl QuoteGridBuilder {
-    /// Create a new builder. `multipliers` must be sorted and have length `n_steps`.
+    /// Create a new builder. `scenario_values` must be sorted and have length `n_steps`.
     pub fn new(
         n_steps: usize,
-        multipliers: Vec<f32>,
+        scenario_values: Vec<f32>,
         constraint_names: Vec<String>,
     ) -> Result<Self> {
-        if multipliers.len() != n_steps {
+        if scenario_values.len() != n_steps {
             return Err(PriceContourError::DimensionMismatch(format!(
-                "multipliers length {} != n_steps {}",
-                multipliers.len(),
+                "scenario_values length {} != n_steps {}",
+                scenario_values.len(),
                 n_steps
             )));
         }
         // Validate sorted
-        for i in 1..multipliers.len() {
-            if multipliers[i] < multipliers[i - 1] {
+        for i in 1..scenario_values.len() {
+            if scenario_values[i] < scenario_values[i - 1] {
                 return Err(PriceContourError::InvalidValue(format!(
-                    "multipliers must be sorted, but [{i}]={} < [{}]={}",
-                    multipliers[i],
+                    "scenario_values must be sorted, but [{i}]={} < [{}]={}",
+                    scenario_values[i],
                     i - 1,
-                    multipliers[i - 1]
+                    scenario_values[i - 1]
                 )));
             }
         }
         let n_constraints = constraint_names.len();
         Ok(Self {
             n_steps,
-            multipliers,
+            scenario_values,
             constraint_names,
             objective: Vec::new(),
             constraints: vec![Vec::new(); n_constraints],
@@ -278,7 +278,7 @@ impl QuoteGridBuilder {
         let grid = QuoteGrid {
             n_quotes: self.n_quotes,
             n_steps: self.n_steps,
-            multipliers: self.multipliers,
+            scenario_values: self.scenario_values,
             objective: self.objective,
             constraints: self.constraints,
             constraint_names: self.constraint_names,
@@ -360,7 +360,7 @@ mod tests {
         QuoteGrid {
             n_quotes,
             n_steps,
-            multipliers: vec![0.9, 1.0, 1.1][..n_steps].to_vec(),
+            scenario_values: vec![0.9, 1.0, 1.1][..n_steps].to_vec(),
             objective: vec![1.0; n_quotes * n_steps],
             constraints: vec![vec![1.0; n_quotes * n_steps]],
             constraint_names: vec!["volume".to_string()],
@@ -390,12 +390,12 @@ mod tests {
 
     #[test]
     fn test_baseline_totals() {
-        // 2 quotes, 3 steps. Multipliers [0.9, 1.0, 1.1].
-        // Baseline step = 1 (multiplier closest to 1.0).
+        // 2 quotes, 3 steps. scenario_values [0.9, 1.0, 1.1].
+        // Baseline step = 1 (scenario_value closest to 1.0).
         let grid = QuoteGrid {
             n_quotes: 2,
             n_steps: 3,
-            multipliers: vec![0.9, 1.0, 1.1],
+            scenario_values: vec![0.9, 1.0, 1.1],
             objective: vec![
                 10.0, 20.0, 30.0, // quote 0
                 40.0, 50.0, 60.0, // quote 1

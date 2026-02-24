@@ -98,44 +98,44 @@ price-contour/
 
 ## Input Format
 
-The library accepts a **long-format Polars DataFrame** — one row per quote per scenario step:
+The library accepts a **long-format Polars DataFrame** — one row per quote per scenario index:
 
 | Column | Type | Description |
 |---|---|---|
 | `quote_id` | str/int | Identifies each quote/risk. Column name is configurable. |
-| `scenario_step` | int | Step index (0, 1, 2, ..., M-1). Column name is configurable. |
-| `multiplier` | f32 | The price multiplier at this step (e.g. 0.80, 0.81, ..., 1.20). |
-| `objective` | f32 | Objective function value at this step (e.g. expected income). Column name is configurable. |
+| `scenario_index` | int | Index into the scenario value grid (0, 1, 2, ..., M-1). Column name is configurable. |
+| `scenario_value` | f32 | The price scenario value at this index (e.g. 0.80, 0.81, ..., 1.20). |
+| `objective` | f32 | Objective function value at this index (e.g. expected income). Column name is configurable. |
 | `constraint_*` | f32 | One column per constraint (e.g. `volume`, `loss_ratio`). Names are configurable. |
 
 ### Example
 
 ```
-┌──────────┬───────────────┬────────────┬───────────┬────────┐
-│ quote_id │ scenario_step │ multiplier │ objective │ volume │
-│ str      │ i32           │ f32        │ f32       │ f32    │
-╞══════════╪═══════════════╪════════════╪═══════════╪════════╡
-│ Q001     │ 0             │ 0.80       │ 85.2      │ 0.95   │
-│ Q001     │ 1             │ 0.90       │ 92.1      │ 0.88   │
-│ Q001     │ 2             │ 1.00       │ 100.0     │ 0.80   │
-│ Q001     │ 3             │ 1.10       │ 105.3     │ 0.70   │
-│ Q001     │ 4             │ 1.20       │ 108.1     │ 0.58   │
-│ Q002     │ 0             │ 0.80       │ 42.0      │ 0.97   │
-│ Q002     │ 1             │ 0.90       │ 45.8      │ 0.91   │
-│ ...      │ ...           │ ...        │ ...       │ ...    │
-└──────────┴───────────────┴────────────┴───────────┴────────┘
+┌──────────┬────────────────┬────────────────┬───────────┬────────┐
+│ quote_id │ scenario_index │ scenario_value │ objective │ volume │
+│ str      │ i32            │ f32            │ f32       │ f32    │
+╞══════════╪════════════════╪════════════════╪═══════════╪════════╡
+│ Q001     │ 0              │ 0.80           │ 85.2      │ 0.95   │
+│ Q001     │ 1              │ 0.90           │ 92.1      │ 0.88   │
+│ Q001     │ 2              │ 1.00           │ 100.0     │ 0.80   │
+│ Q001     │ 3              │ 1.10           │ 105.3     │ 0.70   │
+│ Q001     │ 4              │ 1.20           │ 108.1     │ 0.58   │
+│ Q002     │ 0              │ 0.80           │ 42.0      │ 0.97   │
+│ Q002     │ 1              │ 0.90           │ 45.8      │ 0.91   │
+│ ...      │ ...            │ ...            │ ...       │ ...    │
+└──────────┴────────────────┴────────────────┴───────────┴────────┘
 ```
 
 ### Why long format?
 
-- Natural output of the prep/expansion step (cross-join quote × multiplier grid)
+- Natural output of the prep/expansion step (cross-join quote × scenario value grid)
 - Works directly with Polars groupby/sort operations
 - No column-name encoding of step indices
 - Easy to add more steps or constraints without schema changes
 
 ### Internal representation
 
-On ingestion, the library validates, sorts by `(quote_id, scenario_step)`, and builds a contiguous `QuoteGrid` — a struct-of-arrays layout optimised for the solver's access patterns:
+On ingestion, the library validates, sorts by `(quote_id, scenario_index)`, and builds a contiguous `QuoteGrid` — a struct-of-arrays layout optimised for the solver's access patterns:
 
 ```rust
 /// Contiguous memory layout for solver operations.
@@ -144,7 +144,7 @@ On ingestion, the library validates, sorts by `(quote_id, scenario_step)`, and b
 pub struct QuoteGrid {
     pub n_quotes: usize,            // N
     pub n_steps: usize,             // M
-    pub multipliers: Vec<f32>,      // (M,) — shared multiplier grid
+    pub scenario_values: Vec<f32>,  // (M,) — shared scenario value grid
     pub objective: Vec<f32>,        // (N*M,) — contiguous, quote-major
     pub constraints: Vec<Vec<f32>>, // K × (N*M,) — one flat vec per constraint
     pub quote_ids: Vec<String>,     // (N,) — original quote IDs, in order
@@ -162,7 +162,7 @@ Quote-major layout means each quote's M steps are contiguous in memory. This is 
 ```
 Maximise   Σ_i objective_i(m_i)
 Subject to Σ_i constraint_k_i(m_i) ≥ threshold_k   for each constraint k
-           m_i ∈ {multiplier grid}                    for each quote i
+           m_i ∈ {scenario value grid}                 for each quote i
 ```
 
 ### Lagrangian Dual Decomposition
@@ -232,7 +232,7 @@ Two strategies, selectable by the user:
 
 The ratebook solver is structurally the same as the online solver, but with a **group constraint**: all quotes sharing the same factor level must pick the same candidate value.
 
-In the online solver, each quote independently picks its best step. In the ratebook solver, all quotes at (say) `vehicle_age=3` must share the same multiplier — we do a **per-level argmax** instead of a per-quote argmax. The Lagrangian for a level is the sum of Lagrangians across all quotes at that level.
+In the online solver, each quote independently picks its best step. In the ratebook solver, all quotes at (say) `vehicle_age=3` must share the same scenario value — we do a **per-level argmax** instead of a per-quote argmax. The Lagrangian for a level is the sum of Lagrangians across all quotes at that level.
 
 This means the core Lagrangian engine is shared between online and ratebook modes. The only difference is the grouping.
 
@@ -246,15 +246,15 @@ This keeps ratebook logic centralised in one library rather than split across tw
 
 Two DataFrames:
 
-**Scored DataFrame** — same long format as online (one row per quote per scenario step):
+**Scored DataFrame** — same long format as online (one row per quote per scenario index):
 
 | Column | Type | Description |
 |---|---|---|
 | `quote_id` | str/int | Identifies each quote |
-| `scenario_step` | int | Step index (0, 1, ..., M-1) |
-| `multiplier` | f32 | Price multiplier at this step |
-| `objective` | f32 | Objective value at this step |
-| `constraint_*` | f32 | Constraint values at this step |
+| `scenario_index` | int | Index into the scenario value grid (0, 1, ..., M-1) |
+| `scenario_value` | f32 | Price scenario value at this index |
+| `objective` | f32 | Objective value at this index |
+| `constraint_*` | f32 | Constraint values at this index |
 
 **Factors DataFrame** — quote-level factor assignments (one row per quote):
 
@@ -280,7 +280,7 @@ Factor attributes are quote-level, not step-level — storing them separately av
    For each column in factors:
      Solve ratebook grouped by that column
      Record objective lift over baseline
-     Record level distinctness (variance of optimal multipliers)
+     Record level distinctness (variance of optimal scenario values)
    Rank by lift, keep factors above threshold
 
 3. Screen interactions (reduced iterations):
@@ -294,7 +294,7 @@ Factor attributes are quote-level, not step-level — storing them separately av
 4. Coordinate descent with selected structure
 ```
 
-Screening solves use fewer iterations (e.g. 10 instead of 50) since we're ranking relative lift, not finding exact multipliers. Screening solves are independent and parallelise trivially.
+Screening solves use fewer iterations (e.g. 10 instead of 50) since we're ranking relative lift, not finding exact scenario values. Screening solves are independent and parallelise trivially.
 
 For a typical insurance portfolio (10–20 candidate factors), screening adds ~30–50% overhead vs an explicit structure solve.
 
@@ -308,7 +308,7 @@ For each CD iteration:
     1. Derive factor_level from the factor column(s) in the factors DataFrame
     2. Join factor_level onto the scored DataFrame by quote_id
     3. Solve the grouped Lagrangian (same algorithm as below)
-    4. Update the factor table with optimal multipliers per level
+    4. Update the factor table with optimal scenario values per level
 
   Request re-scoring from haute via callback (factor table changed)
   Check CD convergence → stop if factor table stable
@@ -353,14 +353,14 @@ When enabled, cubic splines are fitted through the discrete price points before 
 
 ```rust
 pub struct SplineFitter {
-    knots: Vec<f32>,    // The M multiplier values as knot positions
+    knots: Vec<f32>,    // The M scenario values as knot positions
     degree: usize,      // Default: 3 (cubic)
 }
 
 impl SplineFitter {
     /// Fit splines for all quotes in a batch.
     /// Because the knot positions are the same for all quotes
-    /// (the shared multiplier grid), the spline basis matrix is
+    /// (the shared scenario value grid), the spline basis matrix is
     /// computed once and applied to all quotes via a matrix multiply.
     pub fn fit_batch(&self, grid: &QuoteGrid) -> SplineCoefficients { ... }
 }
@@ -370,7 +370,7 @@ The key insight: uniform knot positions across all quotes means the spline basis
 
 **When to use splines:**
 - Many steps (M > 20): splines smooth out noise
-- Live scoring: store spline coefficients as artifacts, evaluate at any multiplier (not just grid points)
+- Live scoring: store spline coefficients as artifacts, evaluate at any scenario value (not just grid points)
 
 **When to skip:**
 - Few steps (M ≤ 10): discrete grid is fine
@@ -384,10 +384,10 @@ Given stored lambdas from a batch solve and a single quote's objective/constrain
 
 ```rust
 pub fn apply(
-    objective: &[f32],        // (M,) — single quote's objective at each step
-    constraints: &[&[f32]],   // K × (M,) — single quote's constraints
-    lambdas: &[f32],          // (K,) — stored from batch solve
-    multipliers: &[f32],      // (M,) — multiplier grid
+    objective: &[f32],          // (M,) — single quote's objective at each step
+    constraints: &[&[f32]],     // K × (M,) — single quote's constraints
+    lambdas: &[f32],            // (K,) — stored from batch solve
+    scenario_values: &[f32],    // (M,) — scenario value grid
 ) -> ApplyResult {
     // Evaluate Lagrangian at each step
     // L(j) = objective(j) + Σ_k λ_k × constraint_k(j)
@@ -429,15 +429,15 @@ Returns a Polars DataFrame:
 | Column | Type | Description |
 |---|---|---|
 | `quote_id` | str/int | Original quote ID |
-| `optimal_step` | i32 | Index of the optimal scenario step |
-| `optimal_multiplier` | f32 | Multiplier value at optimal step |
+| `optimal_step` | i32 | Index of the optimal scenario index |
+| `optimal_scenario_value` | f32 | Scenario value at optimal step |
 | `optimal_objective` | f32 | Objective value at optimal step |
 | `optimal_{constraint}` | f32 | Each constraint's value at optimal step |
 
 Plus a `SolveResult` metadata object:
 
 ```python
-result.lambdas          # dict[str, float] — Lagrange multipliers per constraint
+result.lambdas          # dict[str, float] — Lagrange multipliers (shadow prices) per constraint
 result.iterations       # int — number of outer iterations
 result.converged        # bool
 result.total_objective  # float — portfolio-level objective at optimum
@@ -455,8 +455,8 @@ frontier.n_points       # int
 ### Apply Output
 
 ```python
-apply_result.optimal_multiplier   # float
-apply_result.optimal_step         # int
+apply_result.optimal_scenario_value  # float
+apply_result.optimal_step            # int
 apply_result.lagrangian_values    # list[float] — L(j) at each step (for diagnostics)
 ```
 
@@ -471,12 +471,12 @@ import price_contour as pc
 # --- Online Optimisation ---
 
 df = pl.read_parquet("scored_quotes.parquet")
-# Columns: quote_id, scenario_step, multiplier, expected_income, volume, loss_ratio
+# Columns: quote_id, scenario_index, scenario_value, expected_income, volume, loss_ratio
 
 solver = pc.OnlineOptimiser(
     quote_id="quote_id",
-    scenario_step="scenario_step",
-    multiplier="multiplier",
+    scenario_index="scenario_index",
+    scenario_value="scenario_value",
     objective="expected_income",
     constraints={
         "volume": {"min": 0.90},          # portfolio volume ≥ 90% of baseline
@@ -495,7 +495,7 @@ result2 = solver.solve(df, lambdas=result.lambdas)
 
 result.lambdas              # {"volume": 0.42, "loss_ratio": 1.13}
 result.converged            # True
-result.dataframe            # pl.DataFrame with optimal_step, optimal_multiplier, ...
+result.dataframe            # pl.DataFrame with optimal_step, optimal_scenario_value, ...
 
 # --- Efficient Frontier ---
 
@@ -512,23 +512,23 @@ frontier.points    # pl.DataFrame: threshold_volume, total_objective, total_volu
 
 applier = pc.OptimiserApply(
     lambdas=result.lambdas,
-    multipliers=result.multipliers,     # the grid used in the solve
+    scenario_values=result.scenario_values,  # the grid used in the solve
     objective="expected_income",
     constraints=["volume", "loss_ratio"],
 )
 
 # Single quote — pass a 1-row-per-step DataFrame
 quote_df = pl.DataFrame({
-    "scenario_step": [0, 1, 2, 3, 4],
-    "multiplier": [0.80, 0.90, 1.00, 1.10, 1.20],
+    "scenario_index": [0, 1, 2, 3, 4],
+    "scenario_value": [0.80, 0.90, 1.00, 1.10, 1.20],
     "expected_income": [85.2, 92.1, 100.0, 105.3, 108.1],
     "volume": [0.95, 0.88, 0.80, 0.70, 0.58],
     "loss_ratio": [0.58, 0.60, 0.63, 0.66, 0.70],
 })
 
 score = applier.score(quote_df)
-score.optimal_multiplier    # 1.05
-score.optimal_step          # 2
+score.optimal_scenario_value  # 1.05
+score.optimal_step            # 2
 
 # Batch apply — pass many quotes
 batch_scores = applier.score_batch(large_df)  # returns pl.DataFrame
@@ -540,8 +540,8 @@ batch_scores = applier.score_batch(large_df)  # returns pl.DataFrame
 
 ratebook_solver = pc.RatebookOptimiser(
     quote_id="quote_id",
-    scenario_step="scenario_step",
-    multiplier="multiplier",
+    scenario_index="scenario_index",
+    scenario_value="scenario_value",
     objective="expected_income",
     constraints={
         "volume": {"min": 0.90},
@@ -574,7 +574,7 @@ result = ratebook_solver.solve(
 
 result.selected_structure   # [["vehicle_age"], ["region"], ["vehicle_age", "region"]]
 result.structure_report     # pl.DataFrame: factor, lift, n_levels, min_cell_volume, distinctness
-result.level_results        # pl.DataFrame: factor, factor_level, optimal_multiplier
+result.level_results        # pl.DataFrame: factor, factor_level, optimal_scenario_value
 result.lambdas              # constraint shadow prices
 result.converged            # bool
 
@@ -667,7 +667,7 @@ The primary constraint type. The constraint is on the portfolio aggregate:
 
 ### Threshold modes
 
-**Relative (default)**: The threshold is a fraction of the baseline value (portfolio total at multiplier=1.0, or the nearest step). The library computes the baseline from the input data automatically.
+**Relative (default)**: The threshold is a fraction of the baseline value (portfolio total at scenario_value=1.0, or the nearest step). The library computes the baseline from the input data automatically.
 
 ```python
 constraints={
@@ -685,11 +685,11 @@ constraints={
 }
 ```
 
-The library identifies the baseline by finding the step closest to `multiplier=1.0` for each quote and summing the constraint column across all quotes at that step.
+The library identifies the baseline by finding the step closest to `scenario_value=1.0` for each quote and summing the constraint column across all quotes at that step.
 
 ### Per-quote constraints (future)
 
-Clip the multiplier range per quote (e.g. max 10% price change per individual risk). Handled by restricting the feasible set per quote, not by adding Lagrange multipliers.
+Clip the scenario value range per quote (e.g. max 10% price change per individual risk). Handled by restricting the feasible set per quote, not by adding Lagrange multipliers.
 
 ---
 
@@ -703,7 +703,7 @@ Clip the multiplier range per quote (e.g. max 10% price change per individual ri
 6. **Chunk + Rayon parallelism**: chunks bound memory, Rayon parallelises within chunks.
 7. **Splines optional**: discrete grid is the default; splines available when the user needs smooth curves or live scoring artifacts.
 8. **Two-crate workspace**: pure Rust core (testable, no Python deps) + thin PyO3 bindings layer. Follows the rustystats pattern.
-9. **Config-driven column names**: quote_id, scenario_step, objective, constraint names are all configurable — no hardcoded column assumptions.
+9. **Config-driven column names**: quote_id, scenario_index, objective, constraint names are all configurable — no hardcoded column assumptions.
 10. **Price_contour owns ratebook fully**: coordinate descent, structure selection (auto and explicit), and the grouped Lagrangian solve all live in price_contour. Haute provides scored DataFrames via a callback — it doesn't need to know about factors or CD iteration.
 11. **Separate factors DataFrame**: factor assignments are quote-level, passed as a separate DataFrame rather than duplicated across every step row in the scored data.
 

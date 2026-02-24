@@ -22,7 +22,7 @@ Add a `QuoteGridBuilder` that accepts data incrementally, chunk by chunk. Each c
 // Rust core
 pub struct QuoteGridBuilder {
     n_steps: usize,
-    multipliers: Vec<f32>,
+    scenario_values: Vec<f32>,
     objective: Vec<f32>,
     constraints: Vec<Vec<f32>>,
     constraint_names: Vec<String>,
@@ -31,7 +31,7 @@ pub struct QuoteGridBuilder {
 }
 
 impl QuoteGridBuilder {
-    pub fn new(n_steps: usize, multipliers: Vec<f32>, constraint_names: Vec<String>) -> Self;
+    pub fn new(n_steps: usize, scenario_values: Vec<f32>, constraint_names: Vec<String>) -> Self;
     pub fn append(&mut self, /* chunk arrays */) -> Result<()>;
     pub fn build(self) -> Result<QuoteGrid>;
 }
@@ -41,8 +41,8 @@ impl QuoteGridBuilder {
 # Python API
 builder = pc.QuoteGridBuilder(
     quote_id="quote_id",
-    scenario_step="scenario_step",
-    multiplier="multiplier",
+    scenario_index="scenario_index",
+    scenario_value="scenario_value",
     objective="expected_income",
     constraints=["volume", "loss_ratio"],
 )
@@ -73,7 +73,7 @@ The solver needs random access to the full grid during each iteration — every 
 ### Problem
 
 Ratebook optimisation needs two pieces of information per quote:
-1. **Objective/constraint values at each multiplier step** — the scored long-format DataFrame (N×M rows), same as online mode.
+1. **Objective/constraint values at each scenario value step** — the scored long-format DataFrame (N×M rows), same as online mode.
 2. **Risk factor assignments** — which factor level each quote belongs to (e.g. `age_band="25-34"`, `region="South East"`). These are quote-level, not step-level.
 
 The original design considered extracting factor columns from the scored DataFrame. This was rejected because:
@@ -117,28 +117,28 @@ The factors DataFrame is small (N rows × F string columns). It's held in Rust a
 
 ### Problem
 
-Online optimisation does per-quote argmax — each quote independently picks its best multiplier step. Ratebook optimisation requires that all quotes sharing the same factor level receive the **same factor adjustment** — that's what makes it a rating table. The question is how to express this as a solver primitive.
+Online optimisation does per-quote argmax — each quote independently picks its best scenario value step. Ratebook optimisation requires that all quotes sharing the same factor level receive the **same factor adjustment** — that's what makes it a rating table. The question is how to express this as a solver primitive.
 
 ### Important Distinction: Factor Value vs Overall Multiplier
 
-A rating table assigns each factor level a single value (e.g. `age_factor["25-34"] = 1.05`). But two quotes at the same age band have different overall multipliers because their other factors differ:
+A rating table assigns each factor level a single value (e.g. `age_factor["25-34"] = 1.05`). But two quotes at the same age band have different overall scenario values because their other factors differ:
 
 ```
 Quote A: age 25-34, London     → overall = 1.05 × 1.12 × ... = 1.18
 Quote B: age 25-34, rural      → overall = 1.05 × 0.88 × ... = 0.92
 ```
 
-The grouped solver must find the best **factor value** per group, not the best **overall multiplier** per group. These are different things because each quote's residual (product of all other factors) translates the same factor value to a different position in the scored grid.
+The grouped solver must find the best **factor value** per group, not the best **overall scenario value** per group. These are different things because each quote's residual (product of all other factors) translates the same factor value to a different position in the scored grid.
 
 ### Decision
 
-Implement a `solve_grouped()` function with a **remapping step**. For each (quote, candidate factor value), compute the target overall multiplier (`residual × candidate`), find the nearest step in the scored grid, and look up the pre-computed objective/constraint values. The grouped argmax then selects the best candidate factor value per group.
+Implement a `solve_grouped()` function with a **remapping step**. For each (quote, candidate factor value), compute the target overall scenario value (`residual × candidate`), find the nearest step in the scored grid, and look up the pre-computed objective/constraint values. The grouped argmax then selects the best candidate factor value per group.
 
 ### Algorithm
 
 ```
 Input:
-  grid: QuoteGrid (scored at overall multiplier steps)
+  grid: QuoteGrid (scored at overall scenario value steps)
   group_mapping: GroupMapping (N,) — maps quote → group index
   residuals: Vec<f32> (N,) — per-quote residual (product of other factors)
   candidates: Vec<f32> (P,) — candidate factor values to try
@@ -160,7 +160,7 @@ Outer loop (max_iter):
       For each candidate factor step j:
 
         1. Remap: target_overall = residuals[i] × candidates[j]
-           k = nearest step in grid.multipliers to target_overall
+           k = nearest step in grid.scenario_values to target_overall
 
         2. Look up pre-computed values:
            idx = i * M + k
@@ -182,7 +182,7 @@ Outer loop (max_iter):
   For each quote i:
     g = group_of[i]
     target_overall = residuals[i] × optimal_factor_value[g]
-    k = nearest step in grid.multipliers
+    k = nearest step in grid.scenario_values
     total_obj += grid.objective[i * M + k]
     total_con[c] += grid.constraints[c][i * M + k]
 
@@ -196,9 +196,9 @@ Output: optimal_factor_value per group (G,), λ values (K,)
 
 - **Fused remap + Lagrangian + accumulate.** Steps 1–4 fuse into a single pass per quote with **O(1) extra memory per quote**. No materialised remapped grid. The only persistent allocation is `group_L` (G × P), which is tiny.
 - **Fully chunkable.** Each chunk of quotes contributes to the `group_L` accumulators. After all chunks, the argmax is taken per group. Same chunking pattern as `solve_online()`.
-- **Nearest-step lookup.** Binary search in the sorted multiplier grid: O(log M) per lookup. Since M is typically 20–100, this is ~6 comparisons — negligible vs the Lagrangian arithmetic.
+- **Nearest-step lookup.** Binary search in the sorted scenario value grid: O(log M) per lookup. Since M is typically 20–100, this is ~6 comparisons — negligible vs the Lagrangian arithmetic.
 - **G is small.** For a typical factor, G = 5–50 levels. The `group_L` matrix is tiny (e.g. 50 groups × 50 candidates × 8 bytes = 20 KB).
-- **Quantisation error is small.** For M=50 steps over [0.80, 1.20], grid spacing = 0.008. Max error from nearest-step = 0.004 (0.4% of multiplier). Negligible for insurance pricing.
+- **Quantisation error is small.** For M=50 steps over [0.80, 1.20], grid spacing = 0.008. Max error from nearest-step = 0.004 (0.4% of scenario value). Negligible for insurance pricing.
 
 ### Out-of-Range Handling
 
@@ -232,7 +232,7 @@ pub struct GroupedSolveResult {
 
 ### Relationship to Online Solver
 
-The online solver is the degenerate case: every quote is its own group, residuals are all 1.0, and candidates = grid multipliers. In that case, `residual × candidate = candidate = grid step`, so the remapping is an identity operation and the algorithm reduces to per-quote argmax.
+The online solver is the degenerate case: every quote is its own group, residuals are all 1.0, and candidates = grid scenario values. In that case, `residual × candidate = candidate = grid step`, so the remapping is an identity operation and the algorithm reduces to per-quote argmax.
 
 We keep the online solver as a separate code path because:
 - No remapping overhead (identity is free)
@@ -351,9 +351,9 @@ The same frontier machinery works with the grouped solver. Each grid point runs 
 
 ### Problem
 
-A ratebook has multiple rating factors (e.g. age band, region, vehicle group). Each factor has levels with associated multipliers. The optimiser must find the optimal multiplier for every level of every factor, subject to portfolio-level constraints.
+A ratebook has multiple rating factors (e.g. age band, region, vehicle group). Each factor has levels with associated values. The optimiser must find the optimal value for every level of every factor, subject to portfolio-level constraints.
 
-The key challenge: when optimising one factor, each quote's other factors create a different **residual** (product of all other factor values). The same age_band factor value maps to different overall multiplier positions for different quotes. The solver must handle this correctly while remaining chunkable and fast.
+The key challenge: when optimising one factor, each quote's other factors create a different **residual** (product of all other factor values). The same age_band factor value maps to different overall scenario value positions for different quotes. The solver must handle this correctly while remaining chunkable and fast.
 
 ### Decision
 
@@ -361,7 +361,7 @@ Use coordinate descent (CD): optimise one factor at a time using the grouped Lag
 
 ### Why No Re-Scoring?
 
-The scored grid contains pre-computed objective/constraint values at M overall multiplier steps. When CD adjusts a factor value, the grouped solver uses the **remapping** step to translate `residual × candidate_factor_value` to the nearest scored grid position. The pre-computed values are looked up directly — no model re-evaluation needed.
+The scored grid contains pre-computed objective/constraint values at M overall scenario value steps. When CD adjusts a factor value, the grouped solver uses the **remapping** step to translate `residual × candidate_factor_value` to the nearest scored grid position. The pre-computed values are looked up directly — no model re-evaluation needed.
 
 The cost per CD factor iteration is dominated by the grouped Lagrangian solve, which is the same complexity as an online solve pass: O(N × P) where P is the number of candidate factor values. For 5M quotes × 50 candidates, this is ~250M lookups + Lagrangian arithmetic — sub-second on modern hardware.
 
@@ -369,7 +369,7 @@ The cost per CD factor iteration is dominated by the grouped Lagrangian solve, w
 
 ```
 Input:
-  grid: QuoteGrid (N×M scored at overall multiplier steps)
+  grid: QuoteGrid (N×M scored at overall scenario value steps)
   factors: FactorsFrame (N rows, F factor columns)
   factor_columns: list of factor specs (main effects + interactions)
   candidates: Vec<f32> (P,) — candidate factor values (e.g. [0.70, 0.72, ..., 1.40])
@@ -405,7 +405,7 @@ CD outer loop (max_cd_iterations):
          new_value = result.optimal_factor_values[g]
          factor_table[f][label_of(g)] = new_value
 
-    5. Update overall multipliers (chunkable, O(N)):
+    5. Update overall scenario values (chunkable, O(N)):
        For each quote i:
          g = group_of[i]
          overall_mult[i] *= new_value[g] / old_value[g]
@@ -439,7 +439,7 @@ The `overall_mult` and `group_of` arrays (N f32 and N u32 respectively) persist 
 |---|---|---|
 | QuoteGrid (obj + 3 constraints) | ~4.0 GB | Permanent |
 | Factor level indices (10 factors × N u32) | ~200 MB | Permanent |
-| Overall multipliers (N f32) | ~20 MB | Permanent |
+| Overall scenario values (N f32) | ~20 MB | Permanent |
 | Residuals (N f32) | ~20 MB | Per-factor, recomputed |
 | group_L accumulators (G × P f64) | ~20 KB | Per-factor, reset |
 | **Total** | **~4.25 GB** | |
@@ -448,7 +448,7 @@ Essentially the same as online, plus ~220 MB for the factor metadata.
 
 ### Wider Scored Grid for Ratebook
 
-Because CD combines factor values with residuals (`residual × candidate`), the target overall multiplier can fall outside the original scored grid range. For example:
+Because CD combines factor values with residuals (`residual × candidate`), the target overall scenario value can fall outside the original scored grid range. For example:
 - Residual = 1.15 (other factors are net-positive)
 - Candidate factor value = 1.15
 - Target overall = 1.32, but scored grid max = 1.20
@@ -533,7 +533,7 @@ price-contour discovers the best structure:
 Phase 1 — Screen main effects (reduced iterations, e.g. 10):
   For each factor column in factors_df:
     Build GroupMapping, run grouped solve
-    Record: objective lift over baseline, level distinctness (variance of optimal multipliers)
+    Record: objective lift over baseline, level distinctness (variance of optimal scenario values)
   Rank by lift, keep factors above threshold (or top-N)
 
 Phase 2 — Screen interactions (reduced iterations):
@@ -548,7 +548,7 @@ Phase 3 — Full CD with selected structure
 
 ### Key Properties
 
-- **Screening is cheap.** Each screening solve uses 10 iterations (not 50) because we only need relative ranking, not exact multipliers.
+- **Screening is cheap.** Each screening solve uses 10 iterations (not 50) because we only need relative ranking, not exact scenario values.
 - **Screening solves are independent.** They can run in parallel (across factors) with Rayon.
 - **Cell volume checks prevent overfitting.** If a composite level (e.g. age 18-24 × rural Scotland) has too few quotes, the interaction term isn't credible.
 - **The user can override.** Auto-selected structure is presented for review; the user can add or remove factors before the final CD run.
@@ -575,7 +575,7 @@ The optimiser node in haute extracts available factor columns from upstream band
 ```
 [Banding Node]  →  factors_df (N rows: quote_id, age_band, region, ...)
                         ↓
-[Model Score + Pipeline]  →  scored_df (N×M rows: quote_id, scenario_step, multiplier, objective, constraints)
+[Model Score + Pipeline]  →  scored_df (N×M rows: quote_id, scenario_index, scenario_value, objective, constraints)
                         ↓
 [Optimiser Node]  ←  both DataFrames
     │
@@ -676,8 +676,8 @@ artifacts/online_v1/
   "objective": "expected_income",
   "constraints": {"volume": {"min": 0.90}, "loss_ratio": {"max": 1.05}},
   "quote_id": "quote_id",
-  "scenario_step": "scenario_step",
-  "multiplier": "multiplier",
+  "scenario_index": "scenario_index",
+  "scenario_value": "scenario_value",
   "chunk_size": 500000
 }
 ```
@@ -768,7 +768,7 @@ adjustments = applier.apply(new_factors_df)
 1. Load config.json to know factor order
 2. For each quote, look up its factor value from each factor JSON
 3. Overall adjustment = product of all factor lookups
-4. Return per-quote adjustment multiplier
+4. Return per-quote adjustment value
 
 No solver, no scored grid, no lambdas needed. The factor tables ARE the production artifact.
 
@@ -848,8 +848,8 @@ Populated from `upstreamColumns` (discovered from the scored data input edge). D
 | Parameter | UI Element | Filter | Default | Required |
 |---|---|---|---|---|
 | Quote ID column | Dropdown | String/Utf8 columns | `"quote_id"` | Yes |
-| Scenario step column | Dropdown | Int32 columns | `"scenario_step"` | Yes |
-| Multiplier column | Dropdown | Float32 columns | `"multiplier"` | Yes |
+| Scenario index column | Dropdown | Int32 columns | `"scenario_index"` | Yes |
+| Scenario value column | Dropdown | Float32 columns | `"scenario_value"` | Yes |
 | Objective column | Dropdown | Float32 columns | `"expected_income"` | Yes |
 
 ### Section 3: Constraints
@@ -928,7 +928,7 @@ When Auto-discover is selected, additional controls appear:
 
 Maps to: `candidates = linspace(0.70, 1.40, 50)`
 
-**Wider scored grid note:** When ratebook mode is selected, the price scenario node upstream should use a wider multiplier range (e.g. [0.60, 1.50]) than online mode ([0.80, 1.20]). The optimiser UI should display a warning if the scored grid range looks too narrow relative to the factor value range — specifically, if `min(grid) > factor_min × 0.7` or `max(grid) < factor_max × 1.3`.
+**Wider scored grid note:** When ratebook mode is selected, the price scenario node upstream should use a wider scenario value range (e.g. [0.60, 1.50]) than online mode ([0.80, 1.20]). The optimiser UI should display a warning if the scored grid range looks too narrow relative to the factor value range — specifically, if `min(grid) > factor_min × 0.7` or `max(grid) < factor_max × 1.3`.
 
 ### Section 7: MLflow Logging (Collapsible)
 
@@ -955,9 +955,9 @@ After the solve completes, the results panel shows multiple tabs (same pattern a
 |---|---|---|
 | **Summary** | Converged/iterations, total objective, baseline objective, uplift %, constraint totals vs thresholds, lambdas | Yes |
 | **Frontier** | Interactive Pareto chart. User clicks/drags to select a point. Updates summary + impact tabs. | Yes |
-| **Impact** | Before/after multiplier distribution (histogram). Per-segment breakdown if segments available. Mean/median/p5/p95 of optimal multipliers. | Yes |
+| **Impact** | Before/after scenario value distribution (histogram). Per-segment breakdown if segments available. Mean/median/p5/p95 of optimal scenario values. | Yes |
 | **Constraints** | Per-constraint: total vs threshold, slack, shadow price (lambda). Binding vs non-binding indicators. | Yes |
-| **Factors** | Per-factor level table showing optimal multiplier values. Heatmap for 2-way interactions. Before/after comparison if re-running. | Ratebook only |
+| **Factors** | Per-factor level table showing optimal scenario values. Heatmap for 2-way interactions. Before/after comparison if re-running. | Ratebook only |
 | **Convergence** | Line charts: objective per iteration, lambda trajectories, constraint totals per iteration. Only if `record_history=True`. | Yes |
 | **Log to MLflow** | Button + experiment/model name fields. Logs params, metrics, artifacts. | Yes |
 
@@ -970,8 +970,8 @@ class OptimiserConfig(TypedDict, total=False):
 
     # Column mappings
     quote_id: str
-    scenario_step: str
-    multiplier: str
+    scenario_index: str
+    scenario_value: str
     objective: str
 
     # Constraints
@@ -1024,11 +1024,11 @@ class OptimiserConfig(TypedDict, total=False):
 
 - `GroupMapping` struct and builder
 - `solve_grouped()` in Rust core with remapping — fused remap + Lagrangian + group accumulate inner loop
-- Nearest-step binary search in sorted multiplier grid
+- Nearest-step binary search in sorted scenario value grid
 - Clamp-rate tracking for out-of-range diagnostics
 - `GroupedSolveResult` struct
 - PyO3 bindings (accepts residuals + candidates + group mapping)
-- Tests: grouped with residuals=1.0 and candidates=grid.multipliers = online solve; single group = portfolio-wide argmax; known remapping cases
+- Tests: grouped with residuals=1.0 and candidates=grid.scenario_values = online solve; single group = portfolio-wide argmax; known remapping cases
 
 ### Phase 3: Multi-Dimensional Frontier
 
@@ -1070,11 +1070,11 @@ class OptimiserConfig(TypedDict, total=False):
 |---|---|---|
 | 1 | **GridBuilder for chunked ingestion** | haute's pipeline executor produces data in chunks. GridBuilder lets each chunk be ingested and freed, keeping peak Python memory low while accumulating compact f32 arrays in Rust. |
 | 2 | **Two separate DataFrames for ratebook** | Factor columns are string-typed, quote-level. Duplicating them across M step rows wastes memory and pollutes the numeric grid. Passing them separately is cleaner. |
-| 3 | **Grouped Lagrangian with remapping** | The grouped solver finds the best *factor value* per group, not the best *overall multiplier*. A remapping step translates `residual × candidate` to the nearest scored grid position per quote. This fuses into the inner loop with O(1) extra memory per quote. Lambda update code is shared with online. |
-| 4 | **Fast CD without re-scoring** | The scored grid contains pre-computed values at overall multiplier steps. CD uses remapping to look up values at `residual × candidate_factor_value` — no model re-evaluation needed. Quantisation error from nearest-step lookup is ~0.4% (negligible). Wider scored grid recommended for ratebook. |
+| 3 | **Grouped Lagrangian with remapping** | The grouped solver finds the best *factor value* per group, not the best *overall scenario value*. A remapping step translates `residual × candidate` to the nearest scored grid position per quote. This fuses into the inner loop with O(1) extra memory per quote. Lambda update code is shared with online. |
+| 4 | **Fast CD without re-scoring** | The scored grid contains pre-computed values at overall scenario value steps. CD uses remapping to look up values at `residual × candidate_factor_value` — no model re-evaluation needed. Quantisation error from nearest-step lookup is ~0.4% (negligible). Wider scored grid recommended for ratebook. |
 | 5 | **Multi-dimensional frontier with warm-start ordering** | Insurance problems typically have 2-3 constraints. Nearest-neighbour ordering through the threshold grid ensures each solve warm-starts from a nearby solution, reducing per-point iterations from ~50 to ~3-5. |
 | 6 | **Banding integration via factors DataFrame** | Haute's banding nodes define factor levels. The factors DataFrame is built from banding outputs. price-contour treats factor columns as opaque strings — the banding integration is purely a haute concern. |
-| 7 | **Output in rating step entries format** | `to_rating_entries()` produces DataFrames that slot directly into haute's rating step nodes as lookup tables. This closes the loop: banding defines levels → optimiser finds multipliers → rating step applies them. |
+| 7 | **Output in rating step entries format** | `to_rating_entries()` produces DataFrames that slot directly into haute's rating step nodes as lookup tables. This closes the loop: banding defines levels → optimiser finds scenario values → rating step applies them. |
 | 8 | **Structure selection as optional screening** | Auto-discovery adds ~30-50% overhead but saves the user from guessing which factors matter. Screening uses reduced iterations (10 vs 50) since only relative ranking matters. |
 | 9 | **CD loop in Python, grouped solve in Rust** | The CD loop is simple orchestration (iterate over factors, call solver, check convergence). Putting it in Python keeps it readable and flexible. The expensive inner solve (grouped Lagrangian) runs in Rust. |
 | 10 | **price-contour owns the full ratebook solve** | Coordinate descent, structure selection, and the grouped Lagrangian all live in price-contour. Haute provides DataFrames and consumes results — it doesn't need to understand the optimisation algorithm. |

@@ -25,8 +25,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
             rows.append(
                 {
                     "quote_id": f"Q{q:04d}",
-                    "scenario_step": j,
-                    "multiplier": mult,
+                    "scenario_index": j,
+                    "scenario_value": mult,
                     "expected_income": base * mult * conversion,
                     "volume": conversion,
                     "loss_ratio": 0.6 / mult * (1.0 + 0.1 * (mult - 1.0)),
@@ -36,8 +36,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
         rows,
         schema={
             "quote_id": pl.Utf8,
-            "scenario_step": pl.Int32,
-            "multiplier": pl.Float32,
+            "scenario_index": pl.Int32,
+            "scenario_value": pl.Float32,
             "expected_income": pl.Float32,
             "volume": pl.Float32,
             "loss_ratio": pl.Float32,
@@ -85,8 +85,8 @@ class TestApplySerialisation:
             objective="my_obj",
             constraints={"volume": {"min": 0.9}, "loss_ratio": {"max": 1.05}},
             quote_id="qid",
-            scenario_step="step",
-            multiplier="mult",
+            scenario_index="step",
+            scenario_value="mult",
             chunk_size=100_000,
         )
 
@@ -102,8 +102,8 @@ class TestApplySerialisation:
             "loss_ratio": {"max": 1.05},
         }
         assert loaded.quote_id == "qid"
-        assert loaded.scenario_step == "step"
-        assert loaded.multiplier == "mult"
+        assert loaded.scenario_index == "step"
+        assert loaded.scenario_value == "mult"
         assert loaded.chunk_size == 100_000
 
 

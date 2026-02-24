@@ -1,19 +1,19 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use polars::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
-use price_contour_core::{apply_lambdas, ApplyResult};
+use price_contour_core::{apply_lambdas, ApplyResult, QuoteGrid};
 
-use crate::solver_py::{ingest_dataframe, parse_constraints};
+use crate::solver_py::{build_result_dataframe, ingest_dataframe, parse_constraints};
 
 /// Python-visible apply result.
 #[pyclass(name = "ApplyResult")]
 pub struct PyApplyResult {
     inner: ApplyResult,
-    grid: price_contour_core::QuoteGrid,
+    grid: Arc<QuoteGrid>,
     constraint_names: Vec<String>,
     result_df: Option<Py<PyAny>>,
 }
@@ -62,59 +62,11 @@ impl PyApplyResult {
         if let Some(ref cached) = self.result_df {
             return Ok(cached.clone_ref(py));
         }
-        let df = build_apply_result_dataframe(&self.inner, &self.grid)?;
+        let df = build_result_dataframe(&self.inner.optimal_steps, &self.grid)?;
         let py_df = PyDataFrame(df).into_pyobject(py)?.into();
         self.result_df = Some(py_df);
         Ok(self.result_df.as_ref().unwrap().clone_ref(py))
     }
-}
-
-/// Build result DataFrame from ApplyResult + QuoteGrid.
-fn build_apply_result_dataframe(
-    result: &ApplyResult,
-    grid: &price_contour_core::QuoteGrid,
-) -> PyResult<DataFrame> {
-    let n = grid.n_quotes;
-    let m = grid.n_steps;
-
-    let mut opt_multipliers = Vec::with_capacity(n);
-    let mut opt_objectives = Vec::with_capacity(n);
-    let mut opt_constraint_vals: Vec<Vec<f32>> =
-        vec![Vec::with_capacity(n); grid.constraint_names.len()];
-
-    for q in 0..n {
-        let step = result.optimal_steps[q] as usize;
-        let idx = q * m + step;
-        opt_multipliers.push(grid.multipliers[step]);
-        opt_objectives.push(grid.objective[idx]);
-        for (k, con) in grid.constraints.iter().enumerate() {
-            opt_constraint_vals[k].push(con[idx]);
-        }
-    }
-
-    let mut columns: Vec<Column> = vec![
-        Column::new("quote_id".into(), &grid.quote_ids),
-        Column::new(
-            "optimal_step".into(),
-            result
-                .optimal_steps
-                .iter()
-                .map(|&s| s as i32)
-                .collect::<Vec<i32>>(),
-        ),
-        Column::new("optimal_multiplier".into(), &opt_multipliers),
-        Column::new("optimal_objective".into(), &opt_objectives),
-    ];
-
-    for (k, name) in grid.constraint_names.iter().enumerate() {
-        columns.push(Column::new(
-            format!("optimal_{name}").into(),
-            &opt_constraint_vals[k],
-        ));
-    }
-
-    DataFrame::new(columns)
-        .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))
 }
 
 #[pyfunction]
@@ -122,8 +74,8 @@ fn build_apply_result_dataframe(
     df,
     lambdas,
     quote_id = "quote_id",
-    scenario_step = "scenario_step",
-    multiplier = "multiplier",
+    scenario_index = "scenario_index",
+    scenario_value = "scenario_value",
     objective = "expected_income",
     constraints = None,
     chunk_size = 500_000,
@@ -132,8 +84,8 @@ pub fn apply_lambdas_py(
     df: PyDataFrame,
     lambdas: HashMap<String, f64>,
     quote_id: &str,
-    scenario_step: &str,
-    multiplier: &str,
+    scenario_index: &str,
+    scenario_value: &str,
     objective: &str,
     constraints: Option<HashMap<String, HashMap<String, f64>>>,
     chunk_size: usize,
@@ -141,14 +93,14 @@ pub fn apply_lambdas_py(
     let constraints = constraints.unwrap_or_default();
     let constraint_cols: Vec<String> = constraints.keys().cloned().collect();
 
-    let grid = ingest_dataframe(
+    let grid = Arc::new(ingest_dataframe(
         &df.0,
         quote_id,
-        scenario_step,
-        multiplier,
+        scenario_index,
+        scenario_value,
         objective,
         &constraint_cols,
-    )?;
+    )?);
 
     let specs = parse_constraints(constraints, &grid)?;
 

@@ -22,8 +22,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
             rows.append(
                 {
                     "quote_id": f"Q{q:04d}",
-                    "scenario_step": j,
-                    "multiplier": mult,
+                    "scenario_index": j,
+                    "scenario_value": mult,
                     "expected_income": base * mult * conversion,
                     "volume": conversion,
                     "loss_ratio": 0.6 / mult * (1.0 + 0.1 * (mult - 1.0)),
@@ -33,8 +33,8 @@ def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
         rows,
         schema={
             "quote_id": pl.Utf8,
-            "scenario_step": pl.Int32,
-            "multiplier": pl.Float32,
+            "scenario_index": pl.Int32,
+            "scenario_value": pl.Float32,
             "expected_income": pl.Float32,
             "volume": pl.Float32,
             "loss_ratio": pl.Float32,
@@ -90,7 +90,7 @@ class TestApply:
         assert out.shape[0] == n_quotes
         assert "quote_id" in out.columns
         assert "optimal_step" in out.columns
-        assert "optimal_multiplier" in out.columns
+        assert "optimal_scenario_value" in out.columns
         assert "optimal_objective" in out.columns
         assert "optimal_volume" in out.columns
 
@@ -162,12 +162,12 @@ class TestSolveResultNewGetters:
         assert isinstance(result.baseline_constraints, dict)
         assert "volume" in result.baseline_constraints
 
-    def test_multipliers(self):
+    def test_scenario_values(self):
         df = _make_small_df(n_quotes=20, n_steps=5)
         solver = pc.OnlineOptimiser(objective="expected_income")
         result = solver.solve(df)
-        assert len(result.multipliers) == 5
-        assert abs(result.multipliers[0] - 0.8) < 0.01
+        assert len(result.scenario_values) == 5
+        assert abs(result.scenario_values[0] - 0.8) < 0.01
 
     def test_n_quotes_n_steps(self):
         df = _make_small_df(n_quotes=20, n_steps=5)
@@ -255,8 +255,8 @@ class TestSummary:
         assert "constraint_volume_baseline" in metrics
         assert "constraint_volume_ratio" in metrics
         assert "lambda_volume" in metrics
-        assert "multiplier_mean" in metrics
-        assert "multiplier_p50" in metrics
+        assert "scenario_value_mean" in metrics
+        assert "scenario_value_p50" in metrics
 
     def test_artifacts_structure(self):
         df = _make_small_df(n_quotes=50, n_steps=5)

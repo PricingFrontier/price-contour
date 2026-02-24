@@ -14,8 +14,8 @@ pub struct PyQuoteGridBuilder {
     inner: Option<QuoteGridBuilder>,
     // Column name configuration
     quote_id_col: String,
-    scenario_step_col: String,
-    multiplier_col: String,
+    scenario_index_col: String,
+    scenario_value_col: String,
     objective_col: String,
     constraint_cols: Vec<String>,
     // Lazily initialised on first append
@@ -30,22 +30,22 @@ impl PyQuoteGridBuilder {
         constraint_columns,
         *,
         quote_id = "quote_id",
-        scenario_step = "scenario_step",
-        multiplier_col = "multiplier",
+        scenario_index = "scenario_index",
+        scenario_value_col = "scenario_value",
         objective = "expected_income",
     ))]
     fn new(
         constraint_columns: Vec<String>,
         quote_id: &str,
-        scenario_step: &str,
-        multiplier_col: &str,
+        scenario_index: &str,
+        scenario_value_col: &str,
         objective: &str,
     ) -> Self {
         Self {
             inner: None,
             quote_id_col: quote_id.to_string(),
-            scenario_step_col: scenario_step.to_string(),
-            multiplier_col: multiplier_col.to_string(),
+            scenario_index_col: scenario_index.to_string(),
+            scenario_value_col: scenario_value_col.to_string(),
             objective_col: objective.to_string(),
             constraint_cols: constraint_columns,
             initialised: false,
@@ -53,7 +53,7 @@ impl PyQuoteGridBuilder {
         }
     }
 
-    /// Append a chunk of data. The first call extracts n_steps and multipliers
+    /// Append a chunk of data. The first call extracts n_steps and scenario_values
     /// from the chunk; subsequent calls validate consistency.
     fn append(&mut self, df: PyDataFrame) -> PyResult<()> {
         if self.consumed {
@@ -61,18 +61,18 @@ impl PyQuoteGridBuilder {
         }
         let df = &df.0;
 
-        // Sort by (quote_id, scenario_step)
+        // Sort by (quote_id, scenario_index)
         let df = df
             .sort(
-                [&self.quote_id_col, &self.scenario_step_col],
+                [&self.quote_id_col, &self.scenario_index_col],
                 SortMultipleOptions::default(),
             )
             .map_err(|e| PyValueError::new_err(format!("Sort failed: {e}")))?;
 
         // If first call, initialise the builder from the chunk
         if !self.initialised {
-            let (n_steps, multipliers) = extract_grid_info(&df, &self.quote_id_col, &self.multiplier_col)?;
-            let builder = QuoteGridBuilder::new(n_steps, multipliers, self.constraint_cols.clone())
+            let (n_steps, scenario_values) = extract_grid_info(&df, &self.quote_id_col, &self.scenario_value_col)?;
+            let builder = QuoteGridBuilder::new(n_steps, scenario_values, self.constraint_cols.clone())
                 .map_err(|e| PyValueError::new_err(format!("{e}")))?;
             self.inner = Some(builder);
             self.initialised = true;
@@ -87,10 +87,9 @@ impl PyQuoteGridBuilder {
         let (quote_ids, objective, constraints) = extract_chunk(
             &df,
             &self.quote_id_col,
-            &self.scenario_step_col,
+            &self.scenario_index_col,
             &self.objective_col,
             &self.constraint_cols,
-            builder.n_quotes(), // for error context only
         )?;
 
         builder
@@ -113,7 +112,7 @@ impl PyQuoteGridBuilder {
         let grid = builder
             .build()
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-        Ok(PyQuoteGrid { inner: grid })
+        Ok(PyQuoteGrid::new(grid))
     }
 
     #[getter]
@@ -122,11 +121,11 @@ impl PyQuoteGridBuilder {
     }
 }
 
-/// Extract n_steps and sorted multipliers from the first quote in a sorted DataFrame.
+/// Extract n_steps and sorted scenario_values from the first quote in a sorted DataFrame.
 fn extract_grid_info(
     df: &DataFrame,
     quote_id_col: &str,
-    multiplier_col: &str,
+    scenario_value_col: &str,
 ) -> PyResult<(usize, Vec<f32>)> {
     let n_rows = df.height();
     if n_rows == 0 {
@@ -157,26 +156,29 @@ fn extract_grid_info(
     }
 
     let mult_series = df
-        .column(multiplier_col)
-        .map_err(|_| PyValueError::new_err(format!("Missing column: {multiplier_col}")))?;
+        .column(scenario_value_col)
+        .map_err(|_| PyValueError::new_err(format!("Missing column: {scenario_value_col}")))?;
     let mult_ca = mult_series
         .f32()
-        .map_err(|_| PyValueError::new_err(format!("{multiplier_col} must be Float32")))?;
-    let multipliers: Vec<f32> = (0..n_steps)
-        .map(|i| mult_ca.get(i).unwrap_or(0.0))
-        .collect();
+        .map_err(|_| PyValueError::new_err(format!("{scenario_value_col} must be Float32")))?;
+    let scenario_values: Vec<f32> = (0..n_steps)
+        .map(|i| {
+            mult_ca.get(i).ok_or_else(|| {
+                PyValueError::new_err(format!("Null {scenario_value_col} at row {i}"))
+            })
+        })
+        .collect::<PyResult<Vec<f32>>>()?;
 
-    Ok((n_steps, multipliers))
+    Ok((n_steps, scenario_values))
 }
 
 /// Extract columns from a sorted DataFrame chunk.
 fn extract_chunk(
     df: &DataFrame,
     quote_id_col: &str,
-    scenario_step_col: &str,
+    scenario_index_col: &str,
     objective_col: &str,
     constraint_cols: &[String],
-    _prior_quotes: usize,
 ) -> PyResult<(Vec<String>, Vec<f32>, Vec<Vec<f32>>)> {
     let n_rows = df.height();
 
@@ -208,23 +210,31 @@ fn extract_chunk(
 
     // Extract quote IDs (one per quote)
     let quote_ids: Vec<String> = (0..n_quotes)
-        .map(|q| qid_ca.get(q * n_steps).unwrap_or("").to_string())
-        .collect();
+        .map(|q| {
+            let row = q * n_steps;
+            qid_ca
+                .get(row)
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("Null {quote_id_col} at row {row}"))
+                })
+        })
+        .collect::<PyResult<Vec<String>>>()?;
 
-    // Validate step sequence
+    // Validate step sequence (first 10 quotes only, for performance on large grids)
     let step_series = df
-        .column(scenario_step_col)
-        .map_err(|_| PyValueError::new_err(format!("Missing column: {scenario_step_col}")))?;
+        .column(scenario_index_col)
+        .map_err(|_| PyValueError::new_err(format!("Missing column: {scenario_index_col}")))?;
     let steps_ca = step_series
         .i32()
-        .map_err(|_| PyValueError::new_err(format!("{scenario_step_col} must be Int32")))?;
+        .map_err(|_| PyValueError::new_err(format!("{scenario_index_col} must be Int32")))?;
     for q in 0..n_quotes.min(10) {
         for j in 0..n_steps {
             let idx = q * n_steps + j;
             let step_val = steps_ca.get(idx).unwrap_or(-1);
             if step_val != j as i32 {
                 return Err(PyValueError::new_err(format!(
-                    "Quote {} step {} has scenario_step={}, expected {}",
+                    "Quote {} step {} has scenario_index={}, expected {}",
                     quote_ids[q], j, step_val, j
                 )));
             }

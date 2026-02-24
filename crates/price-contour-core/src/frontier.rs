@@ -229,7 +229,7 @@ mod tests {
         QuoteGrid {
             n_quotes: n,
             n_steps: m,
-            multipliers: vec![0.8, 0.9, 1.0, 1.1, 1.2],
+            scenario_values: vec![0.8, 0.9, 1.0, 1.1, 1.2],
             objective: obj,
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
