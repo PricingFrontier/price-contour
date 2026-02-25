@@ -1,5 +1,3 @@
-use rayon::prelude::*;
-
 use crate::constants::*;
 use crate::data::{
     ConstraintDirection, ConstraintSpec, IterationHistory, IterationRecord, QuoteGrid, SolveResult,
@@ -8,92 +6,7 @@ use crate::data::{
 use crate::error::Result;
 use crate::solver::lambda::update_lambdas_subgradient;
 
-/// Process a chunk of quotes in parallel: compute Lagrangian, find argmax per quote,
-/// accumulate totals.
-///
-/// Returns (chunk_objective_total, chunk_constraint_totals, optimal_steps for chunk).
-fn process_chunk_parallel(
-    grid: &QuoteGrid,
-    specs: &[ConstraintSpec],
-    lambdas: &[f64],
-    quote_start: usize,
-    quote_end: usize,
-) -> (f64, Vec<f64>, Vec<u32>) {
-    let chunk_size = quote_end - quote_start;
-    let n_steps = grid.n_steps;
-    let n_constraints = specs.len();
-
-    // Pre-compute lambda signs: +1 for Min (we want to push total up), -1 for Max
-    let lambda_signs: Vec<f64> = specs
-        .iter()
-        .zip(lambdas.iter())
-        .map(|(spec, &lam)| match spec.direction {
-            ConstraintDirection::Min => lam,
-            ConstraintDirection::Max => -lam,
-        })
-        .collect();
-
-    let mut steps = vec![0u32; chunk_size];
-
-    // Parallel argmax over sub-chunks
-    const PAR_GRAIN: usize = 4096;
-
-    // Each parallel task returns (partial_obj_total, partial_con_totals)
-    let partials: Vec<(f64, Vec<f64>)> = steps
-        .par_chunks_mut(PAR_GRAIN)
-        .enumerate()
-        .map(|(chunk_idx, step_slice)| {
-            let sub_start = quote_start + chunk_idx * PAR_GRAIN;
-            let sub_len = step_slice.len();
-            let mut partial_obj: f64 = 0.0;
-            let mut partial_cons = vec![0.0f64; n_constraints];
-
-            for local_i in 0..sub_len {
-                let q = sub_start + local_i;
-                let base = q * n_steps;
-
-                // Compute Lagrangian at each step, find argmax
-                let mut best_step: usize = 0;
-                let mut best_lagrangian = f64::NEG_INFINITY;
-
-                for j in 0..n_steps {
-                    let idx = base + j;
-                    let mut l = grid.objective[idx] as f64;
-                    for (k, &sign_lam) in lambda_signs.iter().enumerate() {
-                        l += sign_lam * grid.constraints[k][idx] as f64;
-                    }
-                    if l > best_lagrangian {
-                        best_lagrangian = l;
-                        best_step = j;
-                    }
-                }
-
-                step_slice[local_i] = best_step as u32;
-
-                // Accumulate totals at optimal step
-                let opt_idx = base + best_step;
-                partial_obj += grid.objective[opt_idx] as f64;
-                for k in 0..n_constraints {
-                    partial_cons[k] += grid.constraints[k][opt_idx] as f64;
-                }
-            }
-
-            (partial_obj, partial_cons)
-        })
-        .collect();
-
-    // Reduce partial totals
-    let mut total_obj: f64 = 0.0;
-    let mut total_cons = vec![0.0f64; n_constraints];
-    for (p_obj, p_cons) in &partials {
-        total_obj += p_obj;
-        for k in 0..n_constraints {
-            total_cons[k] += p_cons[k];
-        }
-    }
-
-    (total_obj, total_cons, steps)
-}
+use super::argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
 
 /// Solve the online optimisation problem via Lagrangian dual decomposition.
 pub fn solve_online(
@@ -152,13 +65,16 @@ pub fn solve_online(
         total_objective = 0.0;
         total_constraints.fill(0.0);
 
+        // Pre-compute signed lambdas once per iteration (reused across chunks)
+        let lambda_signs_f32 = compute_lambda_signs_f32(specs, &lambdas);
+
         // Process quotes in chunks
         let mut quote_offset = 0;
         while quote_offset < n_quotes {
             let chunk_end = (quote_offset + config.chunk_size).min(n_quotes);
 
-            let (chunk_obj, chunk_cons, chunk_steps) =
-                process_chunk_parallel(grid, specs, &lambdas, quote_offset, chunk_end);
+            let (chunk_steps, chunk_obj, chunk_cons) =
+                lagrangian_argmax_pass(grid, &lambda_signs_f32, quote_offset, chunk_end);
 
             total_objective += chunk_obj;
             for k in 0..n_constraints {
@@ -232,6 +148,8 @@ pub fn solve_online(
                 .collect()
         };
 
+        let lambda_signs_f32 = compute_lambda_signs_f32(specs, &final_lambdas);
+
         // Final argmax pass with the chosen lambdas
         total_objective = 0.0;
         total_constraints.fill(0.0);
@@ -240,8 +158,8 @@ pub fn solve_online(
         while quote_offset < n_quotes {
             let chunk_end = (quote_offset + config.chunk_size).min(n_quotes);
 
-            let (chunk_obj, chunk_cons, chunk_steps) =
-                process_chunk_parallel(grid, specs, &final_lambdas, quote_offset, chunk_end);
+            let (chunk_steps, chunk_obj, chunk_cons) =
+                lagrangian_argmax_pass(grid, &lambda_signs_f32, quote_offset, chunk_end);
 
             total_objective += chunk_obj;
             for k in 0..n_constraints {

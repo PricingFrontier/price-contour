@@ -141,6 +141,9 @@ class RatebookOptimiser:
         objective: str = "expected_income",
         constraints: dict[str, dict[str, float]] | None = None,
         *,
+        quote_id: str = "quote_id",
+        scenario_index: str = "scenario_index",
+        scenario_value: str = "scenario_value",
         factor_columns: list[list[str]] | None = None,
         candidate_min: float = 0.70,
         candidate_max: float = 1.40,
@@ -153,6 +156,9 @@ class RatebookOptimiser:
     ) -> None:
         self.objective = objective
         self.constraints = constraints or {}
+        self.quote_id = quote_id
+        self.scenario_index = scenario_index
+        self.scenario_value = scenario_value
         self.factor_columns = factor_columns
         self.candidate_min = candidate_min
         self.candidate_max = candidate_max
@@ -194,6 +200,9 @@ class RatebookOptimiser:
         if isinstance(df_or_grid, pl.DataFrame):
             builder = QuoteGridBuilder(
                 list(self.constraints.keys()),
+                quote_id=self.quote_id,
+                scenario_index=self.scenario_index,
+                scenario_value_col=self.scenario_value,
                 objective=self.objective,
             )
             builder.append(df_or_grid)
@@ -335,6 +344,9 @@ class RatebookOptimiser:
         if isinstance(df_or_grid, pl.DataFrame):
             builder = QuoteGridBuilder(
                 list(self.constraints.keys()),
+                quote_id=self.quote_id,
+                scenario_index=self.scenario_index,
+                scenario_value_col=self.scenario_value,
                 objective=self.objective,
             )
             builder.append(df_or_grid)

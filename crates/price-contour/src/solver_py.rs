@@ -12,6 +12,42 @@ use price_contour_core::{
 
 use crate::grid_py::PyQuoteGrid;
 
+/// Check if a DataFrame is already sorted by (col1, col2) where col1 is Utf8
+/// and col2 is Int32. Returns false on any error or null values.
+/// O(n) scan — much cheaper than the O(n log n) sort it can skip.
+pub(crate) fn is_df_sorted(df: &DataFrame, col1: &str, col2: &str) -> bool {
+    let n = df.height();
+    if n <= 1 {
+        return true;
+    }
+
+    let (Ok(s1), Ok(s2)) = (df.column(col1), df.column(col2)) else {
+        return false;
+    };
+    let (Ok(ca1), Ok(ca2)) = (s1.str(), s2.i32()) else {
+        return false;
+    };
+
+    for i in 1..n {
+        let (Some(prev1), Some(curr1)) = (ca1.get(i - 1), ca1.get(i)) else {
+            return false;
+        };
+        match prev1.cmp(curr1) {
+            std::cmp::Ordering::Greater => return false,
+            std::cmp::Ordering::Less => continue,
+            std::cmp::Ordering::Equal => {
+                let (Some(prev2), Some(curr2)) = (ca2.get(i - 1), ca2.get(i)) else {
+                    return false;
+                };
+                if prev2 > curr2 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Ingest a PyDataFrame, validate columns, sort, and build a QuoteGrid.
 pub(crate) fn ingest_dataframe(
     df: &DataFrame,
@@ -21,13 +57,17 @@ pub(crate) fn ingest_dataframe(
     objective_col: &str,
     constraint_cols: &[String],
 ) -> PyResult<QuoteGrid> {
-    // Sort by (quote_id, scenario_index)
-    let df = df
-        .sort(
+    // Skip sort if data is already in (quote_id, scenario_index) order.
+    // O(n) check vs O(n log n) sort — common case for scored DataFrames.
+    let df = if is_df_sorted(df, quote_id_col, scenario_index_col) {
+        df.clone()
+    } else {
+        df.sort(
             [quote_id_col, scenario_index_col],
             SortMultipleOptions::default(),
         )
-        .map_err(|e| PyValueError::new_err(format!("Sort failed: {e}")))?;
+        .map_err(|e| PyValueError::new_err(format!("Sort failed: {e}")))?
+    };
 
     // Extract scenario_value grid from first quote's steps
     let n_rows = df.height();

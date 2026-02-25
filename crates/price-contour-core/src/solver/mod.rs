@@ -1,3 +1,4 @@
+mod argmax;
 mod apply;
 mod grouped;
 mod lambda;

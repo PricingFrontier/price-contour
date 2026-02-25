@@ -1,8 +1,8 @@
-use rayon::prelude::*;
-
 use crate::constants::*;
-use crate::data::{ApplyResult, ConstraintDirection, ConstraintSpec, QuoteGrid};
+use crate::data::{ApplyResult, ConstraintSpec, QuoteGrid};
 use crate::error::Result;
+
+use super::argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
 
 /// Single-pass Lagrangian argmax with fixed lambdas (no iteration).
 ///
@@ -17,19 +17,10 @@ pub fn apply_lambdas(
     grid.validate()?;
 
     let n_quotes = grid.n_quotes;
-    let n_steps = grid.n_steps;
     let n_constraints = specs.len();
     let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
 
-    // Pre-compute lambda signs: +1 for Min, -1 for Max
-    let lambda_signs: Vec<f64> = specs
-        .iter()
-        .zip(lambdas.iter())
-        .map(|(spec, &lam)| match spec.direction {
-            ConstraintDirection::Min => lam,
-            ConstraintDirection::Max => -lam,
-        })
-        .collect();
+    let lambda_signs_f32 = compute_lambda_signs_f32(specs, lambdas);
 
     let mut optimal_steps = vec![0u32; n_quotes];
     let mut total_objective: f64 = 0.0;
@@ -39,59 +30,13 @@ pub fn apply_lambdas(
     let mut quote_offset = 0;
     while quote_offset < n_quotes {
         let chunk_end = (quote_offset + chunk_size).min(n_quotes);
-        let chunk_len = chunk_end - quote_offset;
 
-        let mut chunk_steps = vec![0u32; chunk_len];
+        let (chunk_steps, chunk_obj, chunk_cons) =
+            lagrangian_argmax_pass(grid, &lambda_signs_f32, quote_offset, chunk_end);
 
-        const PAR_GRAIN: usize = 4096;
-
-        let partials: Vec<(f64, Vec<f64>)> = chunk_steps
-            .par_chunks_mut(PAR_GRAIN)
-            .enumerate()
-            .map(|(grain_idx, step_slice)| {
-                let sub_start = quote_offset + grain_idx * PAR_GRAIN;
-                let sub_len = step_slice.len();
-                let mut partial_obj: f64 = 0.0;
-                let mut partial_cons = vec![0.0f64; n_constraints];
-
-                for local_i in 0..sub_len {
-                    let q = sub_start + local_i;
-                    let base = q * n_steps;
-
-                    let mut best_step: usize = 0;
-                    let mut best_lagrangian = f64::NEG_INFINITY;
-
-                    for j in 0..n_steps {
-                        let idx = base + j;
-                        let mut l = grid.objective[idx] as f64;
-                        for (k, &sign_lam) in lambda_signs.iter().enumerate() {
-                            l += sign_lam * grid.constraints[k][idx] as f64;
-                        }
-                        if l > best_lagrangian {
-                            best_lagrangian = l;
-                            best_step = j;
-                        }
-                    }
-
-                    step_slice[local_i] = best_step as u32;
-
-                    let opt_idx = base + best_step;
-                    partial_obj += grid.objective[opt_idx] as f64;
-                    for k in 0..n_constraints {
-                        partial_cons[k] += grid.constraints[k][opt_idx] as f64;
-                    }
-                }
-
-                (partial_obj, partial_cons)
-            })
-            .collect();
-
-        // Reduce
-        for (p_obj, p_cons) in &partials {
-            total_objective += p_obj;
-            for k in 0..n_constraints {
-                total_constraints[k] += p_cons[k];
-            }
+        total_objective += chunk_obj;
+        for k in 0..n_constraints {
+            total_constraints[k] += chunk_cons[k];
         }
 
         optimal_steps[quote_offset..chunk_end].copy_from_slice(&chunk_steps);

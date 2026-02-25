@@ -6,6 +6,7 @@ use pyo3_polars::PyDataFrame;
 use price_contour_core::QuoteGridBuilder;
 
 use crate::grid_py::PyQuoteGrid;
+use crate::solver_py::is_df_sorted;
 
 /// Python-visible builder that accepts Polars DataFrame chunks and
 /// constructs a QuoteGrid incrementally.
@@ -61,13 +62,17 @@ impl PyQuoteGridBuilder {
         }
         let df = &df.0;
 
-        // Sort by (quote_id, scenario_index)
-        let df = df
-            .sort(
+        // Skip sort if data is already in (quote_id, scenario_index) order.
+        // O(n) check vs O(n log n) sort — common case for scored DataFrames.
+        let df = if is_df_sorted(df, &self.quote_id_col, &self.scenario_index_col) {
+            df.clone()
+        } else {
+            df.sort(
                 [&self.quote_id_col, &self.scenario_index_col],
                 SortMultipleOptions::default(),
             )
-            .map_err(|e| PyValueError::new_err(format!("Sort failed: {e}")))?;
+            .map_err(|e| PyValueError::new_err(format!("Sort failed: {e}")))?
+        };
 
         // If first call, initialise the builder from the chunk
         if !self.initialised {

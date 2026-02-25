@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 use crate::constants::*;
 use crate::data::{
     ConstraintDirection, ConstraintSpec, GroupMapping, GroupedSolveResult, IterationHistory,
@@ -32,6 +34,179 @@ fn nearest_step(scenario_values: &[f32], target: f32) -> (usize, bool) {
     }
 }
 
+/// Pre-compute signed lambdas in f64 for the grouped solver.
+fn compute_lambda_signs(specs: &[ConstraintSpec], lambdas: &[f64]) -> Vec<f64> {
+    specs
+        .iter()
+        .zip(lambdas.iter())
+        .map(|(spec, &lam)| match spec.direction {
+            ConstraintDirection::Min => lam,
+            ConstraintDirection::Max => -lam,
+        })
+        .collect()
+}
+
+/// Accumulate Lagrangian values per group per candidate.
+///
+/// Returns (group_l flat matrix [n_groups × n_candidates], clamp_count, total_remaps).
+/// The matrix is stored row-major: group_l[g * n_candidates + j].
+///
+/// Uses rayon fold+reduce when the per-thread memory is within the cap (4 MB per
+/// fold identity). Falls back to sequential for degenerate inputs.
+fn accumulate_group_lagrangians(
+    grid: &QuoteGrid,
+    group_mapping: &GroupMapping,
+    residuals: &[f32],
+    candidates: &[f32],
+    lambda_signs: &[f64],
+    n_groups: usize,
+) -> (Vec<f64>, u64, u64) {
+    let n_steps = grid.n_steps;
+    let n_candidates = candidates.len();
+    let n_quotes = grid.n_quotes;
+
+    // Memory check: each fold identity allocates n_groups * n_candidates * 8 bytes.
+    // Cap per-identity at 4 MB to prevent degenerate inputs from exhausting memory.
+    let per_identity_bytes = n_groups * n_candidates * std::mem::size_of::<f64>();
+    const MAX_IDENTITY_BYTES: usize = 4 * 1024 * 1024;
+
+    if per_identity_bytes > MAX_IDENTITY_BYTES {
+        // Sequential fallback for degenerate group × candidate sizes
+        let mut group_l = vec![0.0f64; n_groups * n_candidates];
+        let mut clamp_count = 0u64;
+        let mut total_remaps = 0u64;
+
+        for i in 0..n_quotes {
+            let g = group_mapping.group_of[i] as usize;
+            let base = i * n_steps;
+            for (j, &cand) in candidates.iter().enumerate() {
+                let target = residuals[i] * cand;
+                let (k, clamped) = nearest_step(&grid.scenario_values, target);
+                if clamped {
+                    clamp_count += 1;
+                }
+                total_remaps += 1;
+                let idx = base + k;
+                let mut l = grid.objective[idx] as f64;
+                for (c, &sign_lam) in lambda_signs.iter().enumerate() {
+                    l += sign_lam * grid.constraints[c][idx] as f64;
+                }
+                group_l[g * n_candidates + j] += l;
+            }
+        }
+
+        (group_l, clamp_count, total_remaps)
+    } else {
+        // Parallel: each thread gets its own group_l matrix
+        const PAR_GRAIN: usize = 1024;
+
+        (0..n_quotes)
+            .into_par_iter()
+            .with_min_len(PAR_GRAIN)
+            .fold(
+                || (vec![0.0f64; n_groups * n_candidates], 0u64, 0u64),
+                |(mut local_gl, mut local_clamp, mut local_remaps), i| {
+                    let g = group_mapping.group_of[i] as usize;
+                    let base = i * n_steps;
+                    for (j, &cand) in candidates.iter().enumerate() {
+                        let target = residuals[i] * cand;
+                        let (k, clamped) = nearest_step(&grid.scenario_values, target);
+                        if clamped {
+                            local_clamp += 1;
+                        }
+                        local_remaps += 1;
+                        let idx = base + k;
+                        let mut l = grid.objective[idx] as f64;
+                        for (c, &sign_lam) in lambda_signs.iter().enumerate() {
+                            l += sign_lam * grid.constraints[c][idx] as f64;
+                        }
+                        local_gl[g * n_candidates + j] += l;
+                    }
+                    (local_gl, local_clamp, local_remaps)
+                },
+            )
+            .reduce(
+                || (vec![0.0f64; n_groups * n_candidates], 0u64, 0u64),
+                |(mut gl_a, cc_a, tr_a), (gl_b, cc_b, tr_b)| {
+                    for idx in 0..gl_a.len() {
+                        gl_a[idx] += gl_b[idx];
+                    }
+                    (gl_a, cc_a + cc_b, tr_a + tr_b)
+                },
+            )
+    }
+}
+
+/// Per-group argmax: select the candidate with highest accumulated Lagrangian.
+fn argmax_groups(
+    group_l: &[f64],
+    n_groups: usize,
+    n_candidates: usize,
+    group_best_candidate: &mut [usize],
+) {
+    for g in 0..n_groups {
+        let mut best_j = 0;
+        let mut best_val = f64::NEG_INFINITY;
+        let row_offset = g * n_candidates;
+        for j in 0..n_candidates {
+            if group_l[row_offset + j] > best_val {
+                best_val = group_l[row_offset + j];
+                best_j = j;
+            }
+        }
+        group_best_candidate[g] = best_j;
+    }
+}
+
+/// Reconstruct per-quote optimal steps from group selections and accumulate totals.
+fn reconstruct_and_accumulate(
+    grid: &QuoteGrid,
+    group_mapping: &GroupMapping,
+    residuals: &[f32],
+    candidates: &[f32],
+    group_best_candidate: &[usize],
+    optimal_steps: &mut [u32],
+) -> (f64, Vec<f64>) {
+    let n_constraints = grid.constraints.len();
+    let n_steps = grid.n_steps;
+
+    const PAR_GRAIN: usize = 4096;
+
+    optimal_steps
+        .par_chunks_mut(PAR_GRAIN)
+        .enumerate()
+        .fold(
+            || (0.0f64, vec![0.0f64; n_constraints]),
+            |(mut obj, mut cons), (chunk_idx, step_slice)| {
+                let start = chunk_idx * PAR_GRAIN;
+                for (local_i, step_out) in step_slice.iter_mut().enumerate() {
+                    let i = start + local_i;
+                    let g = group_mapping.group_of[i] as usize;
+                    let cand = candidates[group_best_candidate[g]];
+                    let target = residuals[i] * cand;
+                    let (k, _) = nearest_step(&grid.scenario_values, target);
+                    *step_out = k as u32;
+                    let idx = i * n_steps + k;
+                    obj += grid.objective[idx] as f64;
+                    for c in 0..n_constraints {
+                        cons[c] += grid.constraints[c][idx] as f64;
+                    }
+                }
+                (obj, cons)
+            },
+        )
+        .reduce(
+            || (0.0f64, vec![0.0f64; n_constraints]),
+            |(mut obj_a, mut cons_a), (obj_b, cons_b)| {
+                obj_a += obj_b;
+                for k in 0..cons_a.len() {
+                    cons_a[k] += cons_b[k];
+                }
+                (obj_a, cons_a)
+            },
+        )
+}
+
 /// Grouped Lagrangian solve: per-group argmax over candidate factor values,
 /// with remapping from (residual * candidate) to the nearest grid step.
 pub fn solve_grouped(
@@ -46,7 +221,6 @@ pub fn solve_grouped(
     grid.validate()?;
 
     let n_quotes = grid.n_quotes;
-    let n_steps = grid.n_steps;
     let n_constraints = specs.len();
     let n_groups = group_mapping.n_groups;
     let n_candidates = candidates.len();
@@ -90,76 +264,31 @@ pub fn solve_grouped(
     };
 
     for iter in 0..config.max_iter {
-        // Pre-compute lambda signs
-        let lambda_signs: Vec<f64> = specs
-            .iter()
-            .zip(lambdas.iter())
-            .map(|(spec, &lam)| match spec.direction {
-                ConstraintDirection::Min => lam,
-                ConstraintDirection::Max => -lam,
-            })
-            .collect();
+        let lambda_signs = compute_lambda_signs(specs, &lambdas);
 
-        // Allocate group_L: (n_groups, n_candidates) — Lagrangian accumulated per group per candidate
-        let mut group_l = vec![vec![0.0f64; n_candidates]; n_groups];
-        // Track per-group per-candidate remapped indices for later reconstruction
-        // We don't store all N*P indices; instead we recompute in the final pass
+        let (group_l, iter_clamp, iter_remaps) = accumulate_group_lagrangians(
+            grid,
+            group_mapping,
+            residuals,
+            candidates,
+            &lambda_signs,
+            n_groups,
+        );
+        clamp_count = iter_clamp;
+        total_remaps = iter_remaps;
 
-        clamp_count = 0;
-        total_remaps = 0;
+        argmax_groups(&group_l, n_groups, n_candidates, &mut group_best_candidate);
 
-        // For each quote, for each candidate, remap and accumulate
-        for i in 0..n_quotes {
-            let g = group_mapping.group_of[i] as usize;
-            let base = i * n_steps;
-
-            for (j, &cand) in candidates.iter().enumerate() {
-                let target = residuals[i] * cand;
-                let (k, clamped) = nearest_step(&grid.scenario_values, target);
-                if clamped {
-                    clamp_count += 1;
-                }
-                total_remaps += 1;
-
-                let idx = base + k;
-                let mut l = grid.objective[idx] as f64;
-                for (c, &sign_lam) in lambda_signs.iter().enumerate() {
-                    l += sign_lam * grid.constraints[c][idx] as f64;
-                }
-                group_l[g][j] += l;
-            }
-        }
-
-        // Argmax per group
-        for g in 0..n_groups {
-            let mut best_j = 0;
-            let mut best_val = f64::NEG_INFINITY;
-            for j in 0..n_candidates {
-                if group_l[g][j] > best_val {
-                    best_val = group_l[g][j];
-                    best_j = j;
-                }
-            }
-            group_best_candidate[g] = best_j;
-        }
-
-        // Reconstruct per-quote steps and compute totals
-        total_objective = 0.0;
-        total_constraints.fill(0.0);
-
-        for i in 0..n_quotes {
-            let g = group_mapping.group_of[i] as usize;
-            let cand = candidates[group_best_candidate[g]];
-            let target = residuals[i] * cand;
-            let (k, _) = nearest_step(&grid.scenario_values, target);
-            optimal_steps[i] = k as u32;
-
-            let idx = i * n_steps + k;
-            total_objective += grid.objective[idx] as f64;
-            for c in 0..n_constraints {
-                total_constraints[c] += grid.constraints[c][idx] as f64;
-            }
-        }
+        let (iter_obj, iter_cons) = reconstruct_and_accumulate(
+            grid,
+            group_mapping,
+            residuals,
+            candidates,
+            &group_best_candidate,
+            &mut optimal_steps,
+        );
+        total_objective = iter_obj;
+        total_constraints = iter_cons;
 
         // Check constraint satisfaction
         let all_satisfied = specs.iter().enumerate().all(|(k, spec)| {
@@ -218,57 +347,29 @@ pub fn solve_grouped(
                 .collect()
         };
 
-        let lambda_signs: Vec<f64> = specs
-            .iter()
-            .zip(final_lambdas.iter())
-            .map(|(spec, &lam)| match spec.direction {
-                ConstraintDirection::Min => lam,
-                ConstraintDirection::Max => -lam,
-            })
-            .collect();
+        let lambda_signs = compute_lambda_signs(specs, &final_lambdas);
 
-        let mut group_l = vec![vec![0.0f64; n_candidates]; n_groups];
-        for i in 0..n_quotes {
-            let g = group_mapping.group_of[i] as usize;
-            let base = i * n_steps;
-            for (j, &cand) in candidates.iter().enumerate() {
-                let target = residuals[i] * cand;
-                let (k, _) = nearest_step(&grid.scenario_values, target);
-                let idx = base + k;
-                let mut l = grid.objective[idx] as f64;
-                for (c, &sign_lam) in lambda_signs.iter().enumerate() {
-                    l += sign_lam * grid.constraints[c][idx] as f64;
-                }
-                group_l[g][j] += l;
-            }
-        }
+        let (group_l, _, _) = accumulate_group_lagrangians(
+            grid,
+            group_mapping,
+            residuals,
+            candidates,
+            &lambda_signs,
+            n_groups,
+        );
 
-        for g in 0..n_groups {
-            let mut best_j = 0;
-            let mut best_val = f64::NEG_INFINITY;
-            for j in 0..n_candidates {
-                if group_l[g][j] > best_val {
-                    best_val = group_l[g][j];
-                    best_j = j;
-                }
-            }
-            group_best_candidate[g] = best_j;
-        }
+        argmax_groups(&group_l, n_groups, n_candidates, &mut group_best_candidate);
 
-        total_objective = 0.0;
-        total_constraints.fill(0.0);
-        for i in 0..n_quotes {
-            let g = group_mapping.group_of[i] as usize;
-            let cand = candidates[group_best_candidate[g]];
-            let target = residuals[i] * cand;
-            let (k, _) = nearest_step(&grid.scenario_values, target);
-            optimal_steps[i] = k as u32;
-            let idx = i * n_steps + k;
-            total_objective += grid.objective[idx] as f64;
-            for c in 0..n_constraints {
-                total_constraints[c] += grid.constraints[c][idx] as f64;
-            }
-        }
+        let (iter_obj, iter_cons) = reconstruct_and_accumulate(
+            grid,
+            group_mapping,
+            residuals,
+            candidates,
+            &group_best_candidate,
+            &mut optimal_steps,
+        );
+        total_objective = iter_obj;
+        total_constraints = iter_cons;
 
         lambdas = final_lambdas;
     }
