@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import polars as pl
 import pytest
 
@@ -14,37 +12,7 @@ from price_contour._price_contour import (
     GroupedSolveResult,
     solve_grouped_py,
 )
-
-
-def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
-    rows = []
-    mults = [0.8 + 0.1 * j for j in range(n_steps)]
-    for q in range(n_quotes):
-        elasticity = 1.5 + 3.5 * q / n_quotes
-        base = 80.0 + 40.0 * q / n_quotes
-        for j, mult in enumerate(mults):
-            conversion = 1.0 / (1.0 + math.exp(elasticity * (mult - 1.0)))
-            rows.append(
-                {
-                    "quote_id": f"Q{q:04d}",
-                    "scenario_index": j,
-                    "scenario_value": mult,
-                    "expected_income": base * mult * conversion,
-                    "volume": conversion,
-                    "loss_ratio": 0.6 / mult * (1.0 + 0.1 * (mult - 1.0)),
-                }
-            )
-    return pl.DataFrame(
-        rows,
-        schema={
-            "quote_id": pl.Utf8,
-            "scenario_index": pl.Int32,
-            "scenario_value": pl.Float32,
-            "expected_income": pl.Float32,
-            "volume": pl.Float32,
-            "loss_ratio": pl.Float32,
-        },
-    )
+from helpers import make_small_df, CONSTRAINT_RTOL
 
 
 def _build_grid(df: pl.DataFrame) -> QuoteGrid:
@@ -57,7 +25,7 @@ class TestGroupedSolver:
     def test_all_distinct_groups_matches_online(self):
         """N groups with residuals=1.0 and candidates=scenario_values ~ online result."""
         n = 50
-        df = _make_small_df(n_quotes=n, n_steps=5)
+        df = make_small_df(n_quotes=n, n_steps=5)
         grid = _build_grid(df)
 
         # Each quote is its own group
@@ -93,7 +61,7 @@ class TestGroupedSolver:
     def test_single_group_picks_one_factor(self):
         """All quotes in one group: a single factor for the whole portfolio."""
         n = 20
-        df = _make_small_df(n_quotes=n, n_steps=5)
+        df = make_small_df(n_quotes=n, n_steps=5)
         grid = _build_grid(df)
 
         group_labels = ["ALL"] * n
@@ -116,7 +84,7 @@ class TestGroupedSolver:
     def test_known_two_group_problem(self):
         """3-quote, 2-group problem with known structure."""
         n = 3
-        df = _make_small_df(n_quotes=n, n_steps=5)
+        df = make_small_df(n_quotes=n, n_steps=5)
         grid = _build_grid(df)
 
         # Group 0: quotes 0,1; Group 1: quote 2
@@ -140,7 +108,7 @@ class TestGroupedSolver:
     def test_clamp_rate_positive_with_extreme_residuals(self):
         """Extreme residuals push targets outside grid."""
         n = 20
-        df = _make_small_df(n_quotes=n, n_steps=5)
+        df = make_small_df(n_quotes=n, n_steps=5)
         grid = _build_grid(df)
 
         group_labels = [f"G{i}" for i in range(n)]
@@ -160,7 +128,7 @@ class TestGroupedSolver:
     def test_clamp_rate_zero_with_normal_residuals(self):
         """Normal residuals within grid range."""
         n = 20
-        df = _make_small_df(n_quotes=n, n_steps=5)
+        df = make_small_df(n_quotes=n, n_steps=5)
         grid = _build_grid(df)
 
         group_labels = [f"G{i}" for i in range(n)]
@@ -180,7 +148,7 @@ class TestGroupedSolver:
     def test_result_properties(self):
         """GroupedSolveResult exposes expected getters."""
         n = 20
-        df = _make_small_df(n_quotes=n, n_steps=5)
+        df = make_small_df(n_quotes=n, n_steps=5)
         grid = _build_grid(df)
 
         group_labels = ["A"] * 10 + ["B"] * 10
@@ -206,3 +174,59 @@ class TestGroupedSolver:
         assert isinstance(result.clamp_rate, float)
         assert isinstance(result.group_labels, list)
         assert set(result.group_labels) == {"A", "B"}
+
+    def test_grouped_constraint_satisfaction(self):
+        """Grouped solver should approximately satisfy the volume constraint."""
+        n = 50
+        df = make_small_df(n_quotes=n, n_steps=5)
+        grid = _build_grid(df)
+
+        group_labels = [f"G{i}" for i in range(n)]
+        residuals = [1.0] * n
+        candidates = list(grid.scenario_values)
+
+        result = solve_grouped_py(
+            grid,
+            group_labels=group_labels,
+            residuals=residuals,
+            candidates=candidates,
+            constraints={"volume": {"min": 0.90}},
+            max_iter=200,
+        )
+
+        baseline_vol = result.baseline_constraints["volume"]
+        threshold = baseline_vol * 0.90
+        assert result.total_constraints["volume"] >= threshold * (1 - CONSTRAINT_RTOL), (
+            f"grouped volume {result.total_constraints['volume']} < "
+            f"threshold {threshold} with {CONSTRAINT_RTOL:.0%} slack"
+        )
+
+        # Lambda should be non-negative (dual feasibility)
+        assert result.lambdas["volume"] >= 0, (
+            f"volume lambda is negative: {result.lambdas['volume']}"
+        )
+
+    def test_grouped_optimal_steps_valid_indices(self):
+        """All optimal_steps_per_quote values are valid step indices."""
+        n = 20
+        df = make_small_df(n_quotes=n, n_steps=5)
+        grid = _build_grid(df)
+
+        group_labels = ["A"] * 10 + ["B"] * 10
+        residuals = [1.0] * n
+        candidates = list(grid.scenario_values)
+
+        result = solve_grouped_py(
+            grid,
+            group_labels=group_labels,
+            residuals=residuals,
+            candidates=candidates,
+            max_iter=1,
+        )
+
+        steps = result.optimal_steps_per_quote
+        assert len(steps) == n, f"expected {n} steps, got {len(steps)}"
+        for i, step in enumerate(steps):
+            assert 0 <= step < 5, (
+                f"quote {i}: optimal_step {step} out of range [0, 5)"
+            )

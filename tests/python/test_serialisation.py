@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import tempfile
 from pathlib import Path
 
@@ -12,43 +11,13 @@ import pytest
 import price_contour as pc
 from price_contour.frontier import frontier_summary
 from price_contour.ratebook import RatebookOptimiser
-
-
-def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
-    rows = []
-    mults = [0.8 + 0.1 * j for j in range(n_steps)]
-    for q in range(n_quotes):
-        elasticity = 1.5 + 3.5 * q / n_quotes
-        base = 80.0 + 40.0 * q / n_quotes
-        for j, mult in enumerate(mults):
-            conversion = 1.0 / (1.0 + math.exp(elasticity * (mult - 1.0)))
-            rows.append(
-                {
-                    "quote_id": f"Q{q:04d}",
-                    "scenario_index": j,
-                    "scenario_value": mult,
-                    "expected_income": base * mult * conversion,
-                    "volume": conversion,
-                    "loss_ratio": 0.6 / mult * (1.0 + 0.1 * (mult - 1.0)),
-                }
-            )
-    return pl.DataFrame(
-        rows,
-        schema={
-            "quote_id": pl.Utf8,
-            "scenario_index": pl.Int32,
-            "scenario_value": pl.Float32,
-            "expected_income": pl.Float32,
-            "volume": pl.Float32,
-            "loss_ratio": pl.Float32,
-        },
-    )
+from helpers import make_small_df
 
 
 class TestApplySerialisation:
     def test_save_load_roundtrip(self):
         """ApplyOptimiser save → load produces same results."""
-        df = _make_small_df(n_quotes=50, n_steps=5)
+        df = make_small_df(n_quotes=50, n_steps=5)
 
         # Solve to get lambdas
         solver = pc.OnlineOptimiser(
@@ -110,7 +79,7 @@ class TestApplySerialisation:
 class TestFrontierSummary:
     def test_frontier_summary_structure(self):
         """frontier_summary() structure is valid."""
-        df = _make_small_df(n_quotes=50, n_steps=5)
+        df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={"volume": {"min": 0.90}},
@@ -141,7 +110,7 @@ class TestRatebookSummary:
     def test_ratebook_summary_structure(self):
         """Ratebook summary() structure is valid."""
         n = 50
-        df = _make_small_df(n_quotes=n)
+        df = make_small_df(n_quotes=n)
         factors = pl.DataFrame(
             {
                 "region": [["N", "S", "E", "W"][i % 4] for i in range(n)],
@@ -168,7 +137,7 @@ class TestRatebookSummary:
 
 class TestRatebookSave:
     def _solve_ratebook(self, n=50):
-        df = _make_small_df(n_quotes=n)
+        df = make_small_df(n_quotes=n)
         factors = pl.DataFrame(
             {
                 "region": [["N", "S", "E", "W"][i % 4] for i in range(n)],
@@ -249,7 +218,7 @@ class TestRatebookSave:
     def test_save_interaction_factor(self):
         """Interaction factors use compound key and multi-column columns list."""
         n = 50
-        df = _make_small_df(n_quotes=n)
+        df = make_small_df(n_quotes=n)
         factors = pl.DataFrame(
             {
                 "region": [["N", "S"][i % 2] for i in range(n)],
@@ -276,3 +245,54 @@ class TestRatebookSave:
             # Keys should be compound "val1:val2"
             for key in interaction["table"]:
                 assert ":" in key
+
+
+class TestApplySerialisationErrors:
+    def test_load_nonexistent_file_raises(self):
+        with pytest.raises(FileNotFoundError):
+            pc.ApplyOptimiser.load("/no/such/file.json")
+
+    def test_load_corrupted_json_raises(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("not json")
+        with pytest.raises(Exception):  # json.JSONDecodeError
+            pc.ApplyOptimiser.load(bad)
+
+    def test_load_missing_lambdas_key_raises(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text('{"objective": "x"}')
+        with pytest.raises(KeyError):
+            pc.ApplyOptimiser.load(bad)
+
+    def test_load_empty_json_raises(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{}")
+        with pytest.raises(KeyError):
+            pc.ApplyOptimiser.load(bad)
+
+    def test_save_creates_parent_dirs(self, tmp_path):
+        applier = pc.ApplyOptimiser(
+            lambdas={"volume": 0.5},
+            objective="expected_income",
+        )
+        deep = tmp_path / "deep" / "nested" / "config.json"
+        applier.save(deep)
+        assert deep.exists()
+
+    def test_apply_mismatched_lambda_keys(self):
+        """Lambdas for wrong constraint name should behave like zero lambdas."""
+        df = make_small_df(n_quotes=20, n_steps=5)
+        mismatched = pc.ApplyOptimiser(
+            lambdas={"wrong_name": 1.0},
+            objective="expected_income",
+            constraints={"volume": {"min": 0.90}},
+        )
+        zero = pc.ApplyOptimiser(
+            lambdas={"volume": 0.0},
+            objective="expected_income",
+            constraints={"volume": {"min": 0.90}},
+        )
+        # Both should behave as unconstrained since effective lambda=0
+        result_mismatched = mismatched.apply(df)
+        result_zero = zero.apply(df)
+        assert abs(result_mismatched.total_objective - result_zero.total_objective) < 1e-3

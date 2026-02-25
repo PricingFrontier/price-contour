@@ -2,45 +2,12 @@
 
 from __future__ import annotations
 
-import math
-
 import polars as pl
 import pytest
 
 import price_contour as pc
 from price_contour._price_contour import QuoteGrid, QuoteGridBuilder
-
-
-def _make_small_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
-    """Build a small test DataFrame with known properties."""
-    rows = []
-    mults = [0.8 + 0.1 * j for j in range(n_steps)]
-    for q in range(n_quotes):
-        elasticity = 1.5 + 3.5 * q / n_quotes
-        base = 80.0 + 40.0 * q / n_quotes
-        for j, mult in enumerate(mults):
-            conversion = 1.0 / (1.0 + math.exp(elasticity * (mult - 1.0)))
-            rows.append(
-                {
-                    "quote_id": f"Q{q:04d}",
-                    "scenario_index": j,
-                    "scenario_value": mult,
-                    "expected_income": base * mult * conversion,
-                    "volume": conversion,
-                    "loss_ratio": 0.6 / mult * (1.0 + 0.1 * (mult - 1.0)),
-                }
-            )
-    return pl.DataFrame(
-        rows,
-        schema={
-            "quote_id": pl.Utf8,
-            "scenario_index": pl.Int32,
-            "scenario_value": pl.Float32,
-            "expected_income": pl.Float32,
-            "volume": pl.Float32,
-            "loss_ratio": pl.Float32,
-        },
-    )
+from helpers import make_small_df
 
 
 class TestQuoteGridBuilder:
@@ -48,7 +15,7 @@ class TestQuoteGridBuilder:
 
     def test_one_chunk_matches_oneshot(self):
         """Build grid from one chunk = same result as one-shot DataFrame path."""
-        df = _make_small_df(n_quotes=50, n_steps=5)
+        df = make_small_df(n_quotes=50, n_steps=5)
 
         # One-shot via DataFrame
         solver = pc.OnlineOptimiser(
@@ -73,7 +40,7 @@ class TestQuoteGridBuilder:
         """Build grid from 5 chunks = same result as one-shot."""
         n_quotes = 50
         n_steps = 5
-        df = _make_small_df(n_quotes=n_quotes, n_steps=n_steps)
+        df = make_small_df(n_quotes=n_quotes, n_steps=n_steps)
 
         # Split into 5 chunks of 10 quotes each
         chunk_size = 10
@@ -105,7 +72,7 @@ class TestQuoteGridBuilder:
 
     def test_append_after_build_raises(self):
         """Append after build() raises error."""
-        df = _make_small_df(n_quotes=10, n_steps=5)
+        df = make_small_df(n_quotes=10, n_steps=5)
         builder = QuoteGridBuilder(["volume"])
         builder.append(df)
         _grid = builder.build()
@@ -119,7 +86,7 @@ class TestQuoteGridBuilder:
         # Builder expects ["volume", "loss_ratio"] but we only supply volume data
         # This is handled at the Rust level since we pass constraint_cols at init
         # The DataFrame must contain all constraint columns
-        df = _make_small_df(n_quotes=10, n_steps=5)
+        df = make_small_df(n_quotes=10, n_steps=5)
         builder = QuoteGridBuilder(["volume", "nonexistent_col"])
         with pytest.raises(ValueError):
             builder.append(df)
@@ -132,7 +99,7 @@ class TestQuoteGridBuilder:
 
     def test_grid_properties(self):
         """QuoteGrid exposes expected getters."""
-        df = _make_small_df(n_quotes=20, n_steps=5)
+        df = make_small_df(n_quotes=20, n_steps=5)
         builder = QuoteGridBuilder(["volume"])
         builder.append(df)
         grid = builder.build()
@@ -145,10 +112,12 @@ class TestQuoteGridBuilder:
 
     def test_grid_repr(self):
         """QuoteGrid __repr__ works."""
-        df = _make_small_df(n_quotes=10, n_steps=5)
+        df = make_small_df(n_quotes=10, n_steps=5)
         builder = QuoteGridBuilder(["volume"])
         builder.append(df)
         grid = builder.build()
         r = repr(grid)
         assert "QuoteGrid" in r
         assert "10" in r
+        assert "5" in r, "n_steps should appear in repr"
+        assert "volume" in r, "constraint name should appear in repr"

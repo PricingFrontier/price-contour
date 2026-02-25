@@ -16,6 +16,7 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "maturin>=1.4",
+    "hypothesis>=6.0",
 ]
 
 [tool.maturin]
@@ -26,12 +27,14 @@ features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+pythonpath = ["tests/python"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.0",
     "ipykernel>=7.2.0",
     "maturin>=1.12.4",
     "nbclient>=0.10.4",
