@@ -38,7 +38,7 @@ jobs:
           cd crates/price-contour-core
           cargo fuzz run ${{ matrix.target }} -- -max_total_time=300
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
+          RUSTFLAGS: "-C target-cpu=x86-64-v3"
 
       - name: Upload corpus
         if: always()

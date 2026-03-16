@@ -1,2 +1,4 @@
-[target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=native"]
+# target-cpu is set via environment variable to allow CI overrides.
+# For local development, add to your shell profile:
+#   export RUSTFLAGS="-C target-cpu=native"
+# Or run: RUSTFLAGS="-C target-cpu=native" cargo build --release

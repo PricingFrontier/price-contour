@@ -30,7 +30,7 @@ jobs:
       - name: Run benchmarks
         run: cargo bench --package price-contour-core -- --output-format bencher 2>&1 | tee bench-output.txt
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
+          RUSTFLAGS: "-C target-cpu=x86-64-v3"
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
