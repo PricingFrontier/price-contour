@@ -10,6 +10,7 @@ from typing import Any
 import polars as pl
 
 from price_contour._price_contour import (
+    FrontierResult,
     GroupedSolveResult,
     QuoteGrid,
     QuoteGridBuilder,
@@ -175,6 +176,7 @@ class RatebookOptimiser:
         factors: pl.DataFrame,
         *,
         factor_columns: list[list[str]] | None = None,
+        lambdas: dict[str, float] | None = None,
     ) -> RatebookResult:
         """Run ratebook optimisation.
 
@@ -187,6 +189,9 @@ class RatebookOptimiser:
             Must contain the columns referenced by factor_columns.
         factor_columns : list[list[str]], optional
             Override factor_columns from init.
+        lambdas : dict[str, float], optional
+            Initial lambda values for warm-start. Typically from a prior
+            solve or adjacent frontier point.
 
         Returns
         -------
@@ -245,7 +250,7 @@ class RatebookOptimiser:
         per_factor_results: list[GroupedSolveResult] = []
         cd_converged = False
         cd_iter = 0
-        last_lambdas: dict[str, float] | None = None
+        last_lambdas: dict[str, float] | None = lambdas
 
         for cd_iter in range(1, self.max_cd_iterations + 1):
             max_change = 0.0
@@ -253,8 +258,6 @@ class RatebookOptimiser:
             for f_idx, (spec, labels) in enumerate(
                 zip(factor_specs, factor_group_labels)
             ):
-                factor_name = ":".join(spec)
-
                 # Compute residuals: overall_mult / current_factor_value_for_this_quote
                 old_table = factor_tables[f_idx]
                 residuals = []
@@ -393,6 +396,167 @@ class RatebookOptimiser:
 
         return [[col] for col in selected]
 
+    def frontier(
+        self,
+        df_or_grid: pl.DataFrame | QuoteGrid,
+        factors: pl.DataFrame,
+        *,
+        threshold_ranges: dict[str, tuple[float, float]],
+        n_points_per_dim: int = 5,
+        factor_columns: list[list[str]] | None = None,
+        initial_lambdas: dict[str, float] | None = None,
+    ) -> FrontierResult:
+        """Sweep the efficient frontier by running coordinate descent at each threshold.
+
+        Each frontier point is a full CD solve with modified constraint
+        bounds. Results are warm-started from adjacent points using
+        nearest-neighbour ordering.
+
+        Parameters
+        ----------
+        df_or_grid : pl.DataFrame | QuoteGrid
+            Scored DataFrame or pre-built QuoteGrid.
+        factors : pl.DataFrame
+            Per-quote factors DataFrame (same as ``solve``).
+        threshold_ranges : dict[str, tuple[float, float]]
+            Per-constraint (lo, hi) range. For relative constraints
+            (min/max), these are fractions of baseline.
+        n_points_per_dim : int
+            Number of points per constraint dimension. Default 5
+            (lower than online frontier because each point is a full CD).
+        factor_columns : list[list[str]], optional
+            Override factor_columns from init.
+        initial_lambdas : dict[str, float], optional
+            Lambdas to warm-start the first frontier point.
+
+        Returns
+        -------
+        FrontierResult
+            Result with ``.points`` (DataFrame) and ``.n_points``.
+        """
+        # Build grid once for all frontier points
+        if isinstance(df_or_grid, pl.DataFrame):
+            builder = QuoteGridBuilder(
+                list(self.constraints.keys()),
+                quote_id=self.quote_id,
+                scenario_index=self.scenario_index,
+                scenario_value_col=self.scenario_value,
+                objective=self.objective,
+            )
+            builder.append(df_or_grid)
+            grid = builder.build()
+        else:
+            grid = df_or_grid
+
+        constraint_names = list(self.constraints.keys())
+        if not constraint_names:
+            raise ValueError("frontier requires at least one constraint")
+
+        # Validate threshold_ranges keys match constraints
+        for name in constraint_names:
+            if name not in threshold_ranges:
+                raise ValueError(
+                    f"No threshold_range for constraint '{name}'. "
+                    f"Available: {list(threshold_ranges.keys())}"
+                )
+
+        # Generate threshold grid
+        dim_grids = []
+        for name in constraint_names:
+            lo, hi = threshold_ranges[name]
+            n = n_points_per_dim
+            if n <= 1:
+                dim_grids.append([lo])
+            else:
+                dim_grids.append(
+                    [lo + (hi - lo) * i / (n - 1) for i in range(n)]
+                )
+
+        # Cartesian product
+        combos: list[list[float]] = [[]]
+        for dim in dim_grids:
+            combos = [existing + [val] for existing in combos for val in dim]
+
+        if not combos:
+            raise ValueError("Empty threshold grid")
+
+        # Nearest-neighbour ordering for warm-start efficiency
+        order = _nn_order(combos, [threshold_ranges[n] for n in constraint_names])
+
+        # Sweep
+        prev_lambdas = initial_lambdas
+        points: list[tuple[int, dict[str, Any]]] = []
+
+        for idx in order:
+            thresholds = combos[idx]
+
+            # Build modified constraints with this point's thresholds
+            modified_constraints = {}
+            for k, name in enumerate(constraint_names):
+                spec = self.constraints[name]
+                # Replace the threshold value, keeping direction
+                if "min" in spec:
+                    modified_constraints[name] = {"min": thresholds[k]}
+                elif "max" in spec:
+                    modified_constraints[name] = {"max": thresholds[k]}
+                elif "min_abs" in spec:
+                    modified_constraints[name] = {"min_abs": thresholds[k]}
+                elif "max_abs" in spec:
+                    modified_constraints[name] = {"max_abs": thresholds[k]}
+
+            # Temporarily override constraints for this solve
+            saved_constraints = self.constraints
+            self.constraints = modified_constraints
+            try:
+                result = self.solve(
+                    grid, factors,
+                    factor_columns=factor_columns,
+                    lambdas=prev_lambdas,
+                )
+            finally:
+                self.constraints = saved_constraints
+
+            prev_lambdas = result.lambdas
+
+            points.append((idx, {
+                "thresholds": thresholds,
+                "total_objective": result.total_objective,
+                "total_constraints": result.total_constraints,
+                "lambdas": result.lambdas,
+                "cd_iterations": result.cd_iterations,
+                "converged": result.converged,
+                "clamp_rate": result.clamp_rate,
+            }))
+
+        # Sort back to original (cartesian product) order
+        points.sort(key=lambda x: x[0])
+
+        # Build a Polars DataFrame matching the FrontierResult.points format
+        columns: dict[str, list[Any]] = {}
+        for k, name in enumerate(constraint_names):
+            columns[f"threshold_{name}"] = [p[1]["thresholds"][k] for p in points]
+
+        columns["total_objective"] = [p[1]["total_objective"] for p in points]
+
+        for name in constraint_names:
+            columns[f"total_{name}"] = [
+                p[1]["total_constraints"].get(name, 0.0) for p in points
+            ]
+
+        for name in constraint_names:
+            columns[f"lambda_{name}"] = [
+                p[1]["lambdas"].get(name, 0.0) for p in points
+            ]
+
+        columns["iterations"] = [p[1]["cd_iterations"] for p in points]
+        columns["converged"] = [p[1]["converged"] for p in points]
+        columns["clamp_rate"] = [p[1]["clamp_rate"] for p in points]
+
+        return _RatebookFrontierResult(
+            df=pl.DataFrame(columns),
+            _constraint_names=constraint_names,
+        )
+
     def summary(self, result: RatebookResult) -> dict[str, Any]:
         """Package a ratebook result into MLflow-ready dicts."""
         params: dict[str, Any] = {
@@ -406,7 +570,6 @@ class RatebookOptimiser:
             "n_factors": len(result.factor_tables),
         }
         if self.constraints:
-            import json
             params["constraints"] = json.dumps(self.constraints)
 
         metrics: dict[str, float] = {
@@ -441,3 +604,73 @@ class RatebookOptimiser:
             "metrics": metrics,
             "artifacts": artifacts,
         }
+
+
+def _nn_order(
+    points: list[list[float]], ranges: list[tuple[float, float]]
+) -> list[int]:
+    """Greedy nearest-neighbour ordering through normalised threshold space."""
+    n = len(points)
+    if n == 0:
+        return []
+
+    # Normalise to [0, 1]
+    normalised = []
+    for p in points:
+        norm = []
+        for val, (lo, hi) in zip(p, ranges):
+            span = hi - lo
+            norm.append((val - lo) / span if abs(span) > 1e-15 else 0.5)
+        normalised.append(norm)
+
+    # Start from point nearest origin
+    def sq_dist_origin(idx: int) -> float:
+        return sum(v * v for v in normalised[idx])
+
+    current = min(range(n), key=sq_dist_origin)
+    visited = [False] * n
+    order: list[int] = []
+
+    for _ in range(n):
+        visited[current] = True
+        order.append(current)
+
+        best_dist = float("inf")
+        best_next = 0
+        for j in range(n):
+            if visited[j]:
+                continue
+            dist = sum(
+                (a - b) ** 2
+                for a, b in zip(normalised[current], normalised[j])
+            )
+            if dist < best_dist:
+                best_dist = dist
+                best_next = j
+        current = best_next
+
+    return order
+
+
+class _RatebookFrontierResult:
+    """Lightweight frontier result for ratebook mode.
+
+    Mirrors the interface of ``FrontierResult`` (from the Rust frontier)
+    so Haute can handle both modes uniformly.
+    """
+
+    def __init__(self, df: pl.DataFrame, _constraint_names: list[str]) -> None:
+        self._df = df
+        self._constraint_names = _constraint_names
+
+    @property
+    def points(self) -> pl.DataFrame:
+        return self._df
+
+    @property
+    def n_points(self) -> int:
+        return self._df.shape[0]
+
+    @property
+    def constraint_names(self) -> list[str]:
+        return self._constraint_names

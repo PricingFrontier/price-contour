@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import polars as pl
 
-from price_contour._price_contour import ApplyResult, apply_lambdas_py
+from price_contour._price_contour import (
+    ApplyResult,
+    apply_from_grid_py,
+    apply_lambdas_py,
+)
+from price_contour.builder import QuoteGrid
 
 
 class ApplyOptimiser:
@@ -121,3 +125,38 @@ class ApplyOptimiser:
             scenario_value=config.get("scenario_value", "scenario_value"),
             chunk_size=config.get("chunk_size", 500_000),
         )
+
+
+def apply_from_grid(
+    grid: QuoteGrid,
+    lambdas: dict[str, float],
+    constraints: dict[str, dict[str, float]],
+    chunk_size: int = 500_000,
+) -> ApplyResult:
+    """Single-pass Lagrangian apply on an existing QuoteGrid.
+
+    This performs the same argmax as ``ApplyOptimiser.apply()``, but
+    operates directly on an in-memory QuoteGrid — no DataFrame
+    re-ingestion. Useful when the grid is already available (e.g. after
+    a ``solve()`` or ``frontier()`` call) and you want O(N) evaluation
+    at specific lambdas with no iteration overhead.
+
+    Parameters
+    ----------
+    grid : QuoteGrid
+        Pre-built QuoteGrid (e.g. from ``SolveResult.grid`` or a builder).
+    lambdas : dict[str, float]
+        Fixed Lagrange multipliers keyed by constraint name.
+    constraints : dict[str, dict[str, float]]
+        Constraint specifications (same format as ``OnlineOptimiser``).
+    chunk_size : int
+        Quotes per parallel chunk.
+
+    Returns
+    -------
+    ApplyResult
+        Result with ``.total_objective``, ``.total_constraints``,
+        ``.baseline_objective``, ``.baseline_constraints``, ``.lambdas``,
+        ``.dataframe``.
+    """
+    return apply_from_grid_py(grid, lambdas, constraints, chunk_size)

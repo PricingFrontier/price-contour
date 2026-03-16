@@ -10,5 +10,5 @@ pub use data::{
     SolverConfig, build_group_mapping,
 };
 pub use error::{PriceContourError, Result};
-pub use frontier::{FrontierConfig, FrontierPoint, FrontierResult, sweep_frontier};
+pub use frontier::{FrontierConfig, FrontierPoint, FrontierResult, ScenarioValueStats, sweep_frontier};
 pub use solver::{apply_lambdas, solve_grouped, solve_online};

@@ -15,6 +15,7 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solver_py::solve_from_grid_py, m)?)?;
     m.add_class::<apply_py::PyApplyResult>()?;
     m.add_function(wrap_pyfunction!(apply_py::apply_lambdas_py, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_py::apply_from_grid_py, m)?)?;
     m.add_class::<builder_py::PyQuoteGridBuilder>()?;
     m.add_class::<grid_py::PyQuoteGrid>()?;
     m.add_class::<grouped_py::PyGroupedSolveResult>()?;

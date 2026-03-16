@@ -69,6 +69,25 @@ impl PyFrontierResult {
         let conv_vals: Vec<bool> = self.inner.points.iter().map(|p| p.converged).collect();
         columns.push(Column::new("converged".into(), &conv_vals));
 
+        // Scenario value distribution stats — helper macro avoids complex type
+        macro_rules! sv_col {
+            ($name:expr, $field:ident) => {
+                let vals: Vec<f64> = self.inner.points.iter().map(|p| p.sv_stats.$field).collect();
+                columns.push(Column::new($name.into(), &vals));
+            };
+        }
+        sv_col!("sv_mean", mean);
+        sv_col!("sv_std", std);
+        sv_col!("sv_min", min);
+        sv_col!("sv_p5", p5);
+        sv_col!("sv_p25", p25);
+        sv_col!("sv_median", median);
+        sv_col!("sv_p75", p75);
+        sv_col!("sv_p95", p95);
+        sv_col!("sv_max", max);
+        sv_col!("sv_pct_increase", pct_increase);
+        sv_col!("sv_pct_decrease", pct_decrease);
+
         let df = DataFrame::new(columns)
             .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))?;
         let py_df: Py<PyAny> = PyDataFrame(df).into_pyobject(py)?.into();
@@ -87,6 +106,7 @@ impl PyFrontierResult {
 }
 
 #[pyfunction]
+#[allow(clippy::too_many_arguments)] // PyO3 binding: each arg is a Python keyword argument
 #[pyo3(signature = (
     grid,
     constraints,
@@ -95,6 +115,7 @@ impl PyFrontierResult {
     max_iter = 50,
     chunk_size = 500_000,
     tolerance = 1e-6,
+    initial_lambdas = None,
 ))]
 pub fn sweep_frontier_py(
     grid: &PyQuoteGrid,
@@ -104,6 +125,7 @@ pub fn sweep_frontier_py(
     max_iter: usize,
     chunk_size: usize,
     tolerance: f64,
+    initial_lambdas: Option<HashMap<String, f64>>,
 ) -> PyResult<PyFrontierResult> {
     let (_, baseline_totals) = grid.inner.baseline_totals();
 
@@ -170,8 +192,22 @@ pub fn sweep_frontier_py(
         ..Default::default()
     };
 
-    let result = sweep_frontier(&grid.inner, &specs_template, &frontier_config, &solver_config)
-        .map_err(|e| PyValueError::new_err(format!("Frontier error: {e}")))?;
+    // Convert initial_lambdas dict to Vec<f64> in specs_template order
+    let initial_lambda_vec: Option<Vec<f64>> = initial_lambdas.map(|lam_dict| {
+        specs_template
+            .iter()
+            .map(|spec| *lam_dict.get(&spec.name).unwrap_or(&0.0))
+            .collect()
+    });
+
+    let result = sweep_frontier(
+        &grid.inner,
+        &specs_template,
+        &frontier_config,
+        &solver_config,
+        initial_lambda_vec.as_deref(),
+    )
+    .map_err(|e| PyValueError::new_err(format!("Frontier error: {e}")))?;
 
     Ok(PyFrontierResult { inner: result })
 }

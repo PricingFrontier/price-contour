@@ -7,6 +7,22 @@ pub struct FrontierConfig {
     pub threshold_ranges: Vec<(f64, f64)>,
 }
 
+/// Distribution statistics for per-quote optimal scenario values.
+#[derive(Debug, Clone)]
+pub struct ScenarioValueStats {
+    pub mean: f64,
+    pub std: f64,
+    pub min: f64,
+    pub p5: f64,
+    pub p25: f64,
+    pub median: f64,
+    pub p75: f64,
+    pub p95: f64,
+    pub max: f64,
+    pub pct_increase: f64,
+    pub pct_decrease: f64,
+}
+
 pub struct FrontierPoint {
     pub thresholds: Vec<f64>,
     pub total_objective: f64,
@@ -14,11 +30,67 @@ pub struct FrontierPoint {
     pub lambdas: Vec<f64>,
     pub iterations: usize,
     pub converged: bool,
+    pub sv_stats: ScenarioValueStats,
 }
 
 pub struct FrontierResult {
     pub points: Vec<FrontierPoint>,
     pub constraint_names: Vec<String>,
+}
+
+/// Linear interpolation percentile on a sorted slice.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 {
+        return sorted[0];
+    }
+    let pos = p * (n - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil().min((n - 1) as f64) as usize;
+    let frac = pos - lo as f64;
+    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
+/// Compute scenario value distribution stats from optimal steps.
+fn compute_sv_stats(optimal_steps: &[u32], grid: &QuoteGrid) -> ScenarioValueStats {
+    let n = optimal_steps.len();
+    if n == 0 {
+        return ScenarioValueStats {
+            mean: 0.0, std: 0.0, min: 0.0,
+            p5: 0.0, p25: 0.0, median: 0.0, p75: 0.0, p95: 0.0,
+            max: 0.0, pct_increase: 0.0, pct_decrease: 0.0,
+        };
+    }
+
+    let mut vals: Vec<f64> = optimal_steps
+        .iter()
+        .map(|&step| grid.scenario_values[step as usize] as f64)
+        .collect();
+    vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let sum: f64 = vals.iter().sum();
+    let mean = sum / n as f64;
+    let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+
+    let n_increase = vals.iter().filter(|&&v| v > 1.0).count();
+    let n_decrease = vals.iter().filter(|&&v| v < 1.0).count();
+
+    ScenarioValueStats {
+        mean,
+        std: variance.sqrt(),
+        min: vals[0],
+        p5: percentile(&vals, 0.05),
+        p25: percentile(&vals, 0.25),
+        median: percentile(&vals, 0.50),
+        p75: percentile(&vals, 0.75),
+        p95: percentile(&vals, 0.95),
+        max: vals[n - 1],
+        pct_increase: n_increase as f64 / n as f64,
+        pct_decrease: n_decrease as f64 / n as f64,
+    }
 }
 
 /// Greedy nearest-neighbour ordering through normalised threshold space.
@@ -117,11 +189,17 @@ fn cartesian_product(grids: &[Vec<f64>]) -> Vec<Vec<f64>> {
 
 /// Sweep the efficient frontier by solving at each threshold combination.
 /// Uses warm-start from the nearest previously solved point (NN ordering).
+///
+/// If `initial_lambdas` is provided, the first point in the NN ordering
+/// warm-starts from these lambdas instead of cold-starting from zero.
+/// This is useful when a prior `solve_online` has already been run on the
+/// same grid — its lambdas will be close to the first frontier point.
 pub fn sweep_frontier(
     grid: &QuoteGrid,
     specs_template: &[ConstraintSpec],
     frontier_config: &FrontierConfig,
     solver_config: &SolverConfig,
+    initial_lambdas: Option<&[f64]>,
 ) -> Result<FrontierResult> {
     grid.validate()?;
 
@@ -156,7 +234,7 @@ pub fn sweep_frontier(
     let order = nn_order(&threshold_combos, &frontier_config.threshold_ranges);
 
     let mut points = Vec::with_capacity(n_points);
-    let mut prev_lambdas: Option<Vec<f64>> = None;
+    let mut prev_lambdas: Option<Vec<f64>> = initial_lambdas.map(|l| l.to_vec());
 
     for &idx in &order {
         let thresholds = &threshold_combos[idx];
@@ -180,6 +258,7 @@ pub fn sweep_frontier(
         )?;
 
         prev_lambdas = Some(result.lambdas.clone());
+        let sv_stats = compute_sv_stats(&result.optimal_steps, grid);
 
         points.push((
             idx,
@@ -190,6 +269,7 @@ pub fn sweep_frontier(
                 lambdas: result.lambdas,
                 iterations: result.iterations,
                 converged: result.converged,
+                sv_stats,
             },
         ));
     }
@@ -274,7 +354,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = sweep_frontier(&grid, &specs_template, &frontier_config, &solver_config).unwrap();
+        let result = sweep_frontier(&grid, &specs_template, &frontier_config, &solver_config, None).unwrap();
 
         assert_eq!(result.points.len(), 5);
         for p in &result.points {
@@ -305,7 +385,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = sweep_frontier(&grid, &specs_template, &frontier_config, &solver_config).unwrap();
+        let result = sweep_frontier(&grid, &specs_template, &frontier_config, &solver_config, None).unwrap();
 
         // At least some points should converge in fewer iterations than max
         let avg_iters: f64 =
@@ -321,5 +401,47 @@ mod tests {
         let grids = vec![vec![1.0, 2.0], vec![3.0, 4.0, 5.0]];
         let product = cartesian_product(&grids);
         assert_eq!(product.len(), 6);
+    }
+
+    #[test]
+    fn test_initial_lambdas_warm_start() {
+        let grid = make_test_grid();
+        let (_, baseline_cons) = grid.baseline_totals();
+
+        let specs = vec![ConstraintSpec {
+            name: "volume".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold: baseline_cons[0] * 0.90,
+        }];
+
+        let config = SolverConfig {
+            max_iter: 200,
+            ..Default::default()
+        };
+
+        // First, solve to get lambdas
+        let solve_result = crate::solver::solve_online(&grid, &specs, &config, None).unwrap();
+
+        // Run frontier without initial_lambdas
+        let frontier_config = FrontierConfig {
+            n_points_per_dim: 5,
+            threshold_ranges: vec![(baseline_cons[0] * 0.85, baseline_cons[0] * 1.0)],
+        };
+
+        let cold_result = sweep_frontier(&grid, &specs, &frontier_config, &config, None).unwrap();
+        let cold_total_iters: usize = cold_result.points.iter().map(|p| p.iterations).sum();
+
+        // Run frontier with initial_lambdas from the prior solve
+        let warm_result = sweep_frontier(
+            &grid, &specs, &frontier_config, &config,
+            Some(&solve_result.lambdas),
+        ).unwrap();
+        let warm_total_iters: usize = warm_result.points.iter().map(|p| p.iterations).sum();
+
+        // Warm-started frontier should use no more total iterations than cold
+        assert!(
+            warm_total_iters <= cold_total_iters,
+            "warm-start ({warm_total_iters}) should use <= iterations than cold ({cold_total_iters})"
+        );
     }
 }

@@ -7,6 +7,7 @@ use pyo3_polars::PyDataFrame;
 
 use price_contour_core::{apply_lambdas, ApplyResult, QuoteGrid};
 
+use crate::grid_py::PyQuoteGrid;
 use crate::solver_py::{build_result_dataframe, ingest_dataframe, parse_constraints};
 
 /// Python-visible apply result.
@@ -118,6 +119,38 @@ pub fn apply_lambdas_py(
     Ok(PyApplyResult {
         inner: result,
         grid,
+        constraint_names,
+        result_df: None,
+    })
+}
+
+/// Single-pass Lagrangian apply on an existing QuoteGrid (no re-ingestion).
+///
+/// This avoids re-building the grid from a DataFrame — useful when the grid
+/// is already in memory (e.g. after a `solve()` or `frontier()` call).
+#[pyfunction]
+#[pyo3(signature = (grid, lambdas, constraints, chunk_size = 500_000))]
+pub fn apply_from_grid_py(
+    grid: &PyQuoteGrid,
+    lambdas: HashMap<String, f64>,
+    constraints: HashMap<String, HashMap<String, f64>>,
+    chunk_size: usize,
+) -> PyResult<PyApplyResult> {
+    let specs = parse_constraints(constraints, &grid.inner)?;
+
+    let lambda_vec: Vec<f64> = specs
+        .iter()
+        .map(|spec| *lambdas.get(&spec.name).unwrap_or(&0.0))
+        .collect();
+
+    let result = apply_lambdas(&grid.inner, &specs, &lambda_vec, Some(chunk_size))
+        .map_err(|e| PyValueError::new_err(format!("Apply error: {e}")))?;
+
+    let constraint_names = specs.iter().map(|s| s.name.clone()).collect();
+
+    Ok(PyApplyResult {
+        inner: result,
+        grid: Arc::clone(&grid.inner),
         constraint_names,
         result_df: None,
     })

@@ -119,6 +119,7 @@ class OnlineOptimiser:
         *,
         threshold_ranges: dict[str, tuple[float, float]],
         n_points_per_dim: int = 10,
+        initial_lambdas: dict[str, float] | None = None,
     ) -> FrontierResult:
         """Sweep the efficient frontier over constraint threshold ranges.
 
@@ -131,6 +132,10 @@ class OnlineOptimiser:
             For relative constraints (min/max), these are fractions of baseline.
         n_points_per_dim : int
             Number of points per constraint dimension.
+        initial_lambdas : dict[str, float], optional
+            Lambdas to warm-start the first frontier point. Typically from
+            a prior ``solve()`` call on the same grid. Subsequent points
+            warm-start from their nearest neighbour as usual.
 
         Returns
         -------
@@ -158,6 +163,7 @@ class OnlineOptimiser:
             max_iter=self.max_iter,
             chunk_size=self.chunk_size,
             tolerance=self.tolerance,
+            initial_lambdas=initial_lambdas,
         )
 
     def config_dict(self) -> dict[str, Any]:
