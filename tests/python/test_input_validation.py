@@ -108,18 +108,13 @@ class TestInvalidData:
         with pytest.raises((ValueError, Exception)):
             solver.solve(df)
 
-    # NOTE: The Rust layer uses into_no_null_iter() on the objective column,
-    # which silently drops nulls and produces a shorter vector. On small inputs
-    # this may not trigger an error; on larger inputs it can cause panics or
-    # incorrect results. This test documents the current behavior: the solver
-    # does NOT reliably raise on null/NaN objectives. It is skipped until the
-    # library adds explicit null validation.
-    @pytest.mark.skip(
-        reason="library does not validate nulls in objective column"
-    )
-    def test_null_in_objective_raises_or_documents_behavior(self) -> None:
-        """Insert null into expected_income — should raise but currently
-        does not. Polars uses null (not NaN) for missing Float32 values."""
+    def test_null_in_objective_raises(self) -> None:
+        """Insert null into expected_income — should raise ValueError.
+
+        Now that we validate nulls in both the Python layer and the Rust
+        binding layer (via null_count check before into_no_null_iter),
+        this correctly raises before reaching the solver.
+        """
         df = make_small_df(n_quotes=10, n_steps=3)
         # Replace the first row's expected_income with null.
         df = (
@@ -148,13 +143,11 @@ class TestInvalidConstraintSpec:
     def test_invalid_constraint_key_raises(self) -> None:
         """Constraint dicts must use one of min, max, min_abs, max_abs.
         An unrecognised key like 'invalid_key' should raise ValueError."""
-        df = make_small_df(n_quotes=10, n_steps=3)
-        solver = pc.OnlineOptimiser(
-            objective="expected_income",
-            constraints={"volume": {"invalid_key": 0.9}},
-        )
         with pytest.raises((ValueError, Exception)):
-            solver.solve(df)
+            pc.OnlineOptimiser(
+                objective="expected_income",
+                constraints={"volume": {"invalid_key": 0.9}},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -172,11 +165,34 @@ class TestUnevenData:
         df = make_small_df(n_quotes=10, n_steps=5)
         # Remove the last step of the first quote, creating a ragged grid
         # (Q0000 has 4 steps while others have 5).
-        mask = ~(
-            (pl.col("quote_id") == "Q0000")
-            & (pl.col("scenario_index") == 4)
-        )
+        mask = ~((pl.col("quote_id") == "Q0000") & (pl.col("scenario_index") == 4))
         df = df.filter(mask)
         solver = pc.OnlineOptimiser(objective="expected_income")
         with pytest.raises((ValueError, Exception)):
             solver.solve(df)
+
+
+# ---------------------------------------------------------------------------
+# Issue 35: Sorted optimisation — shuffle invariance
+# ---------------------------------------------------------------------------
+
+
+class TestSortedOptimization:
+    def test_presorted_df_produces_same_result(self):
+        """Pre-sorted and unsorted DataFrames should give identical results."""
+        df = make_small_df(n_quotes=50)
+        solver = pc.OnlineOptimiser(
+            objective="expected_income",
+            constraints={"volume": {"min": 0.90}},
+            max_iter=200,
+        )
+        result1 = solver.solve(df)
+
+        # Shuffle the DataFrame
+        shuffled = df.sample(fraction=1.0, shuffle=True, seed=42)
+        result2 = solver.solve(shuffled)
+
+        # Results should match
+        steps1 = result1.dataframe.sort("quote_id")["optimal_step"].to_list()
+        steps2 = result2.dataframe.sort("quote_id")["optimal_step"].to_list()
+        assert steps1 == steps2

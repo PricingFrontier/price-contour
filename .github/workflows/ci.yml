@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Override .cargo/config.toml's target-cpu=native with a portable AVX2 baseline.
+  # Ensures reproducible builds across CI runners.
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Ruff check
+        run: uvx ruff check python/ tests/
+
+      - name: Ruff format
+        run: uvx ruff format --check python/ tests/
+
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: py-${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies and build
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          uv pip install "maturin>=1.4" "pytest>=9.0" "hypothesis>=6.0" "polars>=0.20" "pyarrow>=23.0.1"
+          uv run maturin develop --release
+
+      - name: Run tests
+        run: uv run pytest tests/python -v --tb=short

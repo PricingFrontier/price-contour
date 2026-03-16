@@ -13,7 +13,9 @@ pub struct PyQuoteGrid {
 impl PyQuoteGrid {
     /// Create a new PyQuoteGrid wrapping a QuoteGrid in Arc.
     pub fn new(grid: QuoteGrid) -> Self {
-        Self { inner: Arc::new(grid) }
+        Self {
+            inner: Arc::new(grid),
+        }
     }
 }
 

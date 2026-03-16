@@ -158,16 +158,16 @@ frontier = optimiser.frontier(
 
 # DataFrame with one row per frontier point
 print(frontier.points)
-# ┌──────────────────┬─────────────────┬──────────────┬───────────────┬────────────┬───────────┐
-# │ threshold_volume │ total_objective │ total_volume │ lambda_volume │ iterations │ converged │
-# ╞══════════════════╪═════════════════╪══════════════╪═══════════════╪════════════╪═══════════╡
-# │ 0.85             │ 1_350_102       │ 0.851        │ 0.089         │ 18         │ true      │
-# │ 0.86             │ 1_342_891       │ 0.861        │ 0.102         │ 21         │ true      │
-# │ ...              │ ...             │ ...          │ ...           │ ...        │ ...       │
-# └──────────────────┴─────────────────┴──────────────┴───────────────┴────────────┴───────────┘
+# ┌──────────────────┬─────────────────┬──────────────┬───────────────┬────────────┬───────────┬─────────┬─────────────────┐
+# │ threshold_volume │ total_objective │ total_volume │ lambda_volume │ iterations │ converged │ sv_mean │ sv_pct_increase │
+# ╞══════════════════╪═════════════════╪══════════════╪═══════════════╪════════════╪═══════════╪═════════╪═════════════════╡
+# │ 0.85             │ 1_350_102       │ 0.851        │ 0.089         │ 18         │ true      │ 1.04    │ 0.62            │
+# │ 0.86             │ 1_342_891       │ 0.861        │ 0.102         │ 21         │ true      │ 1.03    │ 0.58            │
+# │ ...              │ ...             │ ...          │ ...           │ ...        │ ...       │ ...     │ ...             │
+# └──────────────────┴─────────────────┴──────────────┴───────────────┴────────────┴───────────┴─────────┴─────────────────┘
 ```
 
-Adjacent points are warm-started from each other (nearest-neighbour traversal of the threshold grid), so the full frontier solves much faster than running each point independently.
+Adjacent points are warm-started from each other (nearest-neighbour traversal of the threshold grid), so the full frontier solves much faster than running each point independently. Each point also includes scenario value distribution statistics (`sv_mean`, `sv_std`, percentiles, `sv_pct_increase`/`sv_pct_decrease`).
 
 ---
 
@@ -181,6 +181,21 @@ constraints = {
     "loss_ratio": {"max": 1.05},        # portfolio loss ratio <= 105% of baseline
     "premium": {"min_abs": 1_000_000},  # absolute: portfolio premium >= 1M
 }
+```
+
+---
+
+## Direct Parquet loading
+
+For large datasets, build the internal grid directly from a Parquet file without materialising a DataFrame in Python memory:
+
+```python
+grid = pc.build_grid_from_parquet(
+    "scored_quotes.parquet",
+    constraint_columns=["volume", "loss_ratio"],
+    objective="income",
+)
+result = optimiser.solve(grid)
 ```
 
 ---
@@ -274,6 +289,7 @@ price-contour/
 │   │       ├── solver/
 │   │       │   ├── online.rs      # Lagrangian dual decomposition
 │   │       │   ├── grouped.rs     # Grouped solve (ratebook inner loop)
+│   │       │   ├── argmax.rs      # Per-quote Lagrangian argmax (parallel)
 │   │       │   ├── lambda.rs      # Subgradient lambda updates
 │   │       │   └── apply.rs       # Fixed-lambda forward pass
 │   │       ├── frontier.rs        # Efficient frontier sweeping
@@ -286,16 +302,20 @@ price-contour/
 │           ├── apply_py.rs        # Apply bindings
 │           ├── frontier_py.rs     # Frontier bindings
 │           ├── builder_py.rs      # QuoteGridBuilder bindings
-│           └── grid_py.rs         # QuoteGrid bindings
+│           ├── grid_py.rs         # QuoteGrid bindings
+│           └── parquet_grid_py.rs # Parquet → QuoteGrid loader
 ├── python/
 │   └── price_contour/
 │       ├── solver.py              # OnlineOptimiser
 │       ├── ratebook.py            # RatebookOptimiser + RatebookResult
-│       ├── apply.py               # ApplyOptimiser
-│       ├── frontier.py            # FrontierResult helpers
+│       ├── apply.py               # ApplyOptimiser + apply_from_grid
+│       ├── frontier.py            # FrontierResult helpers + frontier_summary
 │       └── builder.py             # QuoteGridBuilder wrapper
-└── tests/
-    └── python/                    # Integration tests
+├── tests/
+│   └── python/                    # Integration tests
+├── notebooks/                     # Demo notebooks
+├── docs/                          # Design documentation
+└── scripts/                       # Utility scripts
 ```
 
 The pure-Rust core (`price-contour-core`) has no Python dependencies and can be tested independently with `cargo test`. The PyO3 crate (`price-contour`) is a thin binding layer that converts between Polars DataFrames and the internal `QuoteGrid` representation with zero-copy where possible.
@@ -334,7 +354,7 @@ maturin develop
 | Method | Description |
 |---|---|
 | `solve(df_or_grid, *, lambdas=None)` | Run full optimisation. Returns `SolveResult`. |
-| `frontier(df_or_grid, *, threshold_ranges, n_points_per_dim=10)` | Sweep the efficient frontier. Returns `FrontierResult`. |
+| `frontier(df_or_grid, *, threshold_ranges, n_points_per_dim=10, initial_lambdas=None)` | Sweep the efficient frontier. Returns `FrontierResult`. |
 | `summary(result)` | Package result into MLflow-ready `params`, `metrics`, `artifacts` dicts. |
 | `config_dict()` | Serialisable solver configuration. |
 
@@ -342,7 +362,8 @@ maturin develop
 
 | Method | Description |
 |---|---|
-| `solve(df_or_grid, factors, *, factor_columns=None)` | Run ratebook optimisation via coordinate descent. Returns `RatebookResult`. |
+| `solve(df_or_grid, factors, *, factor_columns=None, lambdas=None)` | Run ratebook optimisation via coordinate descent. Returns `RatebookResult`. |
+| `frontier(df_or_grid, factors, *, threshold_ranges, n_points_per_dim=5, factor_columns=None, initial_lambdas=None)` | Sweep the efficient frontier via coordinate descent at each threshold. Returns `FrontierResult`. |
 | `summary(result)` | Package result into MLflow-ready dicts. |
 
 ### ApplyOptimiser
@@ -376,17 +397,50 @@ maturin develop
 | `n_quotes` | `int` | Number of quotes in the grid. |
 | `n_steps` | `int` | Number of scenario value steps. |
 | `scenario_values` | `list[float]` | The scenario value grid. |
+| `grid` | `QuoteGrid` | The internal grid (reusable for subsequent solves or apply). |
+
+### ApplyResult
+
+| Property | Type | Description |
+|---|---|---|
+| `total_objective` | `float` | Portfolio-level objective. |
+| `total_constraints` | `dict[str, float]` | Portfolio-level constraint totals. |
+| `baseline_objective` | `float` | Objective at scenario_value = 1.0. |
+| `baseline_constraints` | `dict[str, float]` | Constraints at scenario_value = 1.0. |
+| `lambdas` | `dict[str, float]` | Applied Lagrange multipliers. |
+| `dataframe` | `pl.DataFrame` | Per-quote results with optimal scenario values. |
+
+### FrontierResult
+
+| Property | Type | Description |
+|---|---|---|
+| `points` | `pl.DataFrame` | One row per frontier point with `threshold_*`, `total_objective`, `total_*`, `lambda_*`, `iterations`, `converged`, and scenario value statistics (`sv_mean`, `sv_std`, `sv_min`, `sv_p5`–`sv_p95`, `sv_max`, `sv_pct_increase`, `sv_pct_decrease`). |
+| `n_points` | `int` | Number of frontier points. |
 
 ### RatebookResult
 
 | Property | Type | Description |
 |---|---|---|
 | `factor_tables` | `dict[str, dict[str, float]]` | Factor name to level-value mapping. |
+| `lambdas` | `dict[str, float]` | Final Lagrange multipliers. |
+| `total_objective` | `float` | Portfolio-level objective at optimal solution. |
+| `total_constraints` | `dict[str, float]` | Portfolio-level constraint totals. |
+| `baseline_objective` | `float` | Objective at scenario_value = 1.0. |
+| `baseline_constraints` | `dict[str, float]` | Constraints at scenario_value = 1.0. |
 | `converged` | `bool` | Whether coordinate descent converged. |
 | `cd_iterations` | `int` | Coordinate descent iterations. |
 | `clamp_rate` | `float` | Fraction of remappings that hit a grid boundary. |
+| `per_factor_results` | `list[GroupedSolveResult]` | Per-factor inner solve results. |
 | `save(path)` | | Save factor tables to a directory (one JSON per factor). |
 | `to_rating_entries()` | `dict[str, pl.DataFrame]` | Convert to rating-step DataFrames. |
+
+### Utility functions
+
+| Function | Description |
+|---|---|
+| `build_grid_from_parquet(path, *, constraint_columns, ...)` | Build a `QuoteGrid` directly from a Parquet file without materialising a DataFrame in Python. |
+| `apply_from_grid(grid, lambdas, constraints, *, chunk_size=500_000)` | Single-pass Lagrangian apply on an existing `QuoteGrid`. Returns `ApplyResult`. |
+| `frontier_summary(frontier_result, selected_index)` | Package a frontier result into MLflow-ready `params`, `metrics`, `artifacts` dicts. |
 
 ---
 

@@ -62,7 +62,10 @@ mod tests {
         let totals = vec![90.0];
         let change =
             update_lambdas_subgradient(&mut lambdas, &specs, &totals, &default_scales(1), 0);
-        assert!(lambdas[0] > 0.0, "lambda should increase when min constraint is violated");
+        assert!(
+            lambdas[0] > 0.0,
+            "lambda should increase when min constraint is violated"
+        );
         assert!(change > 0.0);
     }
 
@@ -76,7 +79,10 @@ mod tests {
         }];
         let totals = vec![110.0];
         update_lambdas_subgradient(&mut lambdas, &specs, &totals, &default_scales(1), 0);
-        assert!(lambdas[0] < 1.0, "lambda should decrease when min constraint is satisfied");
+        assert!(
+            lambdas[0] < 1.0,
+            "lambda should decrease when min constraint is satisfied"
+        );
     }
 
     #[test]
@@ -89,7 +95,10 @@ mod tests {
         }];
         let totals = vec![110.0];
         update_lambdas_subgradient(&mut lambdas, &specs, &totals, &default_scales(1), 0);
-        assert!(lambdas[0] > 0.0, "lambda should increase when max constraint is violated");
+        assert!(
+            lambdas[0] > 0.0,
+            "lambda should increase when max constraint is violated"
+        );
     }
 
     #[test]
@@ -115,7 +124,11 @@ mod tests {
         }];
         let totals = vec![1_000_000.0];
         update_lambdas_subgradient(&mut lambdas, &specs, &totals, &default_scales(1), 0);
-        assert!(lambdas[0] >= 0.0, "lambda must be non-negative, got {}", lambdas[0]);
+        assert!(
+            lambdas[0] >= 0.0,
+            "lambda must be non-negative, got {}",
+            lambdas[0]
+        );
     }
 
     #[test]

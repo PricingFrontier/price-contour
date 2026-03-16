@@ -32,7 +32,8 @@ class ApplyOptimiser:
     quote_id, scenario_index, scenario_value : str
         Column name overrides.
     chunk_size : int
-        Quotes per parallel chunk.
+        Deprecated: no longer used by the solver. Retained for API
+        compatibility. Internal parallelism is managed by rayon grain sizes.
     """
 
     def __init__(
@@ -53,6 +54,18 @@ class ApplyOptimiser:
         self.scenario_index = scenario_index
         self.scenario_value = scenario_value
         self.chunk_size = chunk_size
+        _validate_constraint_dict(self.constraints)
+        if self.lambdas:
+            lambda_keys = set(self.lambdas.keys())
+            constraint_keys = set(self.constraints.keys())
+            extra = lambda_keys - constraint_keys
+            if extra:
+                import warnings
+
+                warnings.warn(
+                    f"Lambda keys {extra} do not match any constraint. "
+                    f"They will be ignored."
+                )
 
     def apply(self, df: pl.DataFrame) -> ApplyResult:
         """Apply lambdas to the scored DataFrame.
@@ -68,6 +81,16 @@ class ApplyOptimiser:
             Result with .total_objective, .total_constraints,
             .baseline_objective, .baseline_constraints, .lambdas, .dataframe.
         """
+        if not isinstance(df, pl.DataFrame):
+            raise TypeError(f"Expected pl.DataFrame, got {type(df).__name__}")
+        _validate_dataframe(
+            df,
+            quote_id=self.quote_id,
+            scenario_index=self.scenario_index,
+            scenario_value=self.scenario_value,
+            objective=self.objective,
+            constraint_cols=list(self.constraints.keys()),
+        )
         return apply_lambdas_py(
             df,
             lambdas=self.lambdas,
@@ -90,6 +113,7 @@ class ApplyOptimiser:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         config = {
+            "version": 1,
             "lambdas": self.lambdas,
             "objective": self.objective,
             "constraints": self.constraints,
@@ -116,6 +140,17 @@ class ApplyOptimiser:
         """
         path = Path(path)
         config = json.loads(path.read_text())
+        if "lambdas" not in config:
+            raise ValueError(
+                f"Invalid config file {path}: missing 'lambdas' key. "
+                f"Available keys: {list(config.keys())}"
+            )
+        version = config.get("version", 0)
+        if version > 1:
+            raise ValueError(
+                f"Config file version {version} is not supported by this "
+                f"version of price-contour (max supported: 1)"
+            )
         return cls(
             lambdas=config["lambdas"],
             objective=config.get("objective", "expected_income"),
@@ -160,3 +195,51 @@ def apply_from_grid(
         ``.dataframe``.
     """
     return apply_from_grid_py(grid, lambdas, constraints, chunk_size)
+
+
+def _validate_constraint_dict(
+    constraints: dict[str, dict[str, float]],
+) -> None:
+    """Validate constraint specification dict structure and values."""
+    valid_keys = {"min", "max", "min_abs", "max_abs"}
+    for name, spec in constraints.items():
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"Constraint '{name}' value must be a dict, got {type(spec).__name__}"
+            )
+        if len(spec) != 1:
+            raise ValueError(
+                f"Constraint '{name}' must have exactly one key from "
+                f"{valid_keys}, got {set(spec.keys())}"
+            )
+        key = next(iter(spec))
+        if key not in valid_keys:
+            raise ValueError(
+                f"Constraint '{name}' has invalid key '{key}'. "
+                f"Must be one of: {valid_keys}"
+            )
+        value = spec[key]
+        if not isinstance(value, (int, float)):
+            raise ValueError(
+                f"Constraint '{name}' value for '{key}' must be numeric, "
+                f"got {type(value).__name__}"
+            )
+
+
+def _validate_dataframe(
+    df: pl.DataFrame,
+    *,
+    quote_id: str,
+    scenario_index: str,
+    scenario_value: str,
+    objective: str,
+    constraint_cols: list[str],
+) -> None:
+    """Validate DataFrame schema before passing to Rust layer."""
+    required = [quote_id, scenario_index, scenario_value, objective] + constraint_cols
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    for col_name in [objective] + constraint_cols:
+        if df[col_name].null_count() > 0:
+            raise ValueError(f"Column '{col_name}' contains null values")

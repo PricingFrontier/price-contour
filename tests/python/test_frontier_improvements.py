@@ -13,7 +13,7 @@ import pytest
 
 import price_contour as pc
 from price_contour.apply import apply_from_grid
-from price_contour.ratebook import RatebookOptimiser, _RatebookFrontierResult
+from price_contour.ratebook import RatebookOptimiser
 from helpers import make_small_df, make_factors
 
 
@@ -173,10 +173,13 @@ class TestApplyFromGrid:
 
         assert abs(grid_result.total_objective - df_result.total_objective) < 1e-3
         for name in ["volume"]:
-            assert abs(
-                grid_result.total_constraints[name]
-                - df_result.total_constraints[name]
-            ) < 1e-3
+            assert (
+                abs(
+                    grid_result.total_constraints[name]
+                    - df_result.total_constraints[name]
+                )
+                < 1e-3
+            )
 
     def test_apply_from_grid_matches_solve(self):
         """apply_from_grid with solve lambdas reproduces the solve's total_objective."""
@@ -314,9 +317,17 @@ class TestFrontierScenarioValueStats:
         )
         pts = result.points
         expected_cols = {
-            "sv_mean", "sv_std", "sv_min", "sv_p5", "sv_p25",
-            "sv_median", "sv_p75", "sv_p95", "sv_max",
-            "sv_pct_increase", "sv_pct_decrease",
+            "sv_mean",
+            "sv_std",
+            "sv_min",
+            "sv_p5",
+            "sv_p25",
+            "sv_median",
+            "sv_p75",
+            "sv_p95",
+            "sv_max",
+            "sv_pct_increase",
+            "sv_pct_decrease",
         }
         assert expected_cols.issubset(set(pts.columns)), (
             f"Missing columns: {expected_cols - set(pts.columns)}"
@@ -382,9 +393,7 @@ class TestFrontierScenarioValueStats:
 
         for row in pts.iter_rows(named=True):
             total = row["sv_pct_increase"] + row["sv_pct_decrease"]
-            assert total <= 1.0 + 1e-9, (
-                f"pct_increase + pct_decrease = {total} > 1.0"
-            )
+            assert total <= 1.0 + 1e-9, f"pct_increase + pct_decrease = {total} > 1.0"
 
     def test_sv_std_non_negative(self):
         """sv_std is non-negative."""
@@ -466,7 +475,8 @@ class TestRatebookFrontier:
         )
 
         result = opt.frontier(
-            df, factors,
+            df,
+            factors,
             threshold_ranges={"volume": (0.85, 1.0)},
             n_points_per_dim=3,
         )
@@ -496,7 +506,8 @@ class TestRatebookFrontier:
         )
 
         result = opt.frontier(
-            df, factors,
+            df,
+            factors,
             threshold_ranges={"volume": (0.85, 1.0)},
             n_points_per_dim=3,
         )
@@ -522,7 +533,8 @@ class TestRatebookFrontier:
         )
 
         result = opt.frontier(
-            df, factors,
+            df,
+            factors,
             threshold_ranges={"volume": (0.80, 1.0)},
             n_points_per_dim=5,
         )
@@ -535,7 +547,7 @@ class TestRatebookFrontier:
         for i in range(len(objectives) - 1):
             assert objectives[i] >= objectives[i + 1] - abs(objectives[i + 1]) * 0.02, (
                 f"Ratebook frontier non-monotonic at point {i}: "
-                f"{objectives[i]:.2f} vs {objectives[i+1]:.2f}"
+                f"{objectives[i]:.2f} vs {objectives[i + 1]:.2f}"
             )
 
     def test_ratebook_frontier_warm_start(self):
@@ -555,7 +567,8 @@ class TestRatebookFrontier:
         solve_result = opt.solve(df, factors)
 
         result = opt.frontier(
-            df, factors,
+            df,
+            factors,
             threshold_ranges={"volume": (0.85, 1.0)},
             n_points_per_dim=3,
             initial_lambdas=solve_result.lambdas,
@@ -578,7 +591,8 @@ class TestRatebookFrontier:
         )
 
         result = opt.frontier(
-            df, factors,
+            df,
+            factors,
             threshold_ranges={"volume": (0.85, 1.0)},
             n_points_per_dim=3,
         )
@@ -601,7 +615,8 @@ class TestRatebookFrontier:
 
         with pytest.raises(ValueError, match="No threshold_range"):
             opt.frontier(
-                df, factors,
+                df,
+                factors,
                 threshold_ranges={},  # missing "volume"
                 n_points_per_dim=3,
             )
@@ -622,7 +637,8 @@ class TestRatebookFrontier:
 
         with pytest.raises(ValueError, match="at least one constraint"):
             opt.frontier(
-                df, factors,
+                df,
+                factors,
                 threshold_ranges={"volume": (0.85, 1.0)},
                 n_points_per_dim=3,
             )

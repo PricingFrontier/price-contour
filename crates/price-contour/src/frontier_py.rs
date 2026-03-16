@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use polars::prelude::*;
 use pyo3::exceptions::PyValueError;
@@ -11,6 +12,7 @@ use price_contour_core::{
 };
 
 use crate::grid_py::PyQuoteGrid;
+use crate::utils::order_lambdas;
 
 /// Python-visible frontier result.
 #[pyclass(name = "FrontierResult")]
@@ -35,7 +37,12 @@ impl PyFrontierResult {
         }
 
         // Total objective
-        let obj_vals: Vec<f64> = self.inner.points.iter().map(|p| p.total_objective).collect();
+        let obj_vals: Vec<f64> = self
+            .inner
+            .points
+            .iter()
+            .map(|p| p.total_objective)
+            .collect();
         columns.push(Column::new("total_objective".into(), &obj_vals));
 
         // Total constraints
@@ -72,7 +79,12 @@ impl PyFrontierResult {
         // Scenario value distribution stats — helper macro avoids complex type
         macro_rules! sv_col {
             ($name:expr, $field:ident) => {
-                let vals: Vec<f64> = self.inner.points.iter().map(|p| p.sv_stats.$field).collect();
+                let vals: Vec<f64> = self
+                    .inner
+                    .points
+                    .iter()
+                    .map(|p| p.sv_stats.$field)
+                    .collect();
                 columns.push(Column::new($name.into(), &vals));
             };
         }
@@ -100,6 +112,11 @@ impl PyFrontierResult {
     }
 
     #[getter]
+    fn n_converged(&self) -> usize {
+        self.inner.n_converged
+    }
+
+    #[getter]
     fn constraint_names(&self) -> Vec<String> {
         self.inner.constraint_names.clone()
     }
@@ -114,10 +131,13 @@ impl PyFrontierResult {
     n_points_per_dim = 10,
     max_iter = 50,
     chunk_size = 500_000,
-    tolerance = 1e-6,
+    tolerance = 1e-5,
     initial_lambdas = None,
+    max_total_points = 10_000,
+    parallel = false,
 ))]
 pub fn sweep_frontier_py(
+    py: Python<'_>,
     grid: &PyQuoteGrid,
     constraints: HashMap<String, HashMap<String, f64>>,
     threshold_ranges: HashMap<String, (f64, f64)>,
@@ -126,6 +146,8 @@ pub fn sweep_frontier_py(
     chunk_size: usize,
     tolerance: f64,
     initial_lambdas: Option<HashMap<String, f64>>,
+    max_total_points: usize,
+    parallel: bool,
 ) -> PyResult<PyFrontierResult> {
     let (_, baseline_totals) = grid.inner.baseline_totals();
 
@@ -133,7 +155,11 @@ pub fn sweep_frontier_py(
     let mut specs_template = Vec::new();
     let mut ranges = Vec::new();
 
-    for (name, spec_dict) in &constraints {
+    let mut constraint_names_sorted: Vec<String> = constraints.keys().cloned().collect();
+    constraint_names_sorted.sort();
+
+    for name in &constraint_names_sorted {
+        let spec_dict = &constraints[name];
         let constraint_idx = grid
             .inner
             .constraint_names
@@ -165,14 +191,15 @@ pub fn sweep_frontier_py(
 
         // Get threshold range for this constraint
         let (lo, hi) = threshold_ranges.get(name).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "No threshold_range for constraint '{}'", name
-            ))
+            PyValueError::new_err(format!("No threshold_range for constraint '{}'", name))
         })?;
 
         // Convert relative to absolute if needed
         let (abs_lo, abs_hi) = if spec_dict.contains_key("min") || spec_dict.contains_key("max") {
-            (baseline_totals[constraint_idx] * lo, baseline_totals[constraint_idx] * hi)
+            (
+                baseline_totals[constraint_idx] * lo,
+                baseline_totals[constraint_idx] * hi,
+            )
         } else {
             (*lo, *hi)
         };
@@ -183,6 +210,8 @@ pub fn sweep_frontier_py(
     let frontier_config = FrontierConfig {
         n_points_per_dim,
         threshold_ranges: ranges,
+        max_total_points: Some(max_total_points),
+        parallel,
     };
 
     let solver_config = SolverConfig {
@@ -193,21 +222,21 @@ pub fn sweep_frontier_py(
     };
 
     // Convert initial_lambdas dict to Vec<f64> in specs_template order
-    let initial_lambda_vec: Option<Vec<f64>> = initial_lambdas.map(|lam_dict| {
-        specs_template
-            .iter()
-            .map(|spec| *lam_dict.get(&spec.name).unwrap_or(&0.0))
-            .collect()
-    });
+    let initial_lambda_vec: Option<Vec<f64>> =
+        initial_lambdas.map(|lam_dict| order_lambdas(&lam_dict, &constraint_names_sorted));
 
-    let result = sweep_frontier(
-        &grid.inner,
-        &specs_template,
-        &frontier_config,
-        &solver_config,
-        initial_lambda_vec.as_deref(),
-    )
-    .map_err(|e| PyValueError::new_err(format!("Frontier error: {e}")))?;
+    let grid_arc = Arc::clone(&grid.inner);
+    let result = py
+        .detach(|| {
+            sweep_frontier(
+                &grid_arc,
+                &specs_template,
+                &frontier_config,
+                &solver_config,
+                initial_lambda_vec.as_deref(),
+            )
+        })
+        .map_err(|e| PyValueError::new_err(format!("Frontier error: {e}")))?;
 
     Ok(PyFrontierResult { inner: result })
 }

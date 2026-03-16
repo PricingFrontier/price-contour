@@ -1,9 +1,8 @@
-use crate::constants::*;
 use crate::data::{
-    ConstraintDirection, ConstraintSpec, IterationHistory, IterationRecord, QuoteGrid, SolveResult,
-    SolverConfig,
+    ConstraintSpec, IterationHistory, IterationRecord, QuoteGrid, SolveResult, SolverConfig,
 };
-use crate::error::Result;
+use crate::error::{PriceContourError, Result};
+use crate::solver::convergence::{all_constraints_satisfied, select_final_lambdas};
 use crate::solver::lambda::update_lambdas_subgradient;
 
 use super::argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
@@ -17,23 +16,58 @@ pub fn solve_online(
 ) -> Result<SolveResult> {
     grid.validate()?;
 
+    if specs.len() != grid.constraints.len() {
+        return Err(PriceContourError::DimensionMismatch(format!(
+            "specs count {} != grid constraints count {}",
+            specs.len(),
+            grid.constraints.len()
+        )));
+    }
+    if let Some(il) = initial_lambdas {
+        if il.len() != specs.len() {
+            return Err(PriceContourError::DimensionMismatch(format!(
+                "initial_lambdas length {} != specs count {}",
+                il.len(),
+                specs.len()
+            )));
+        }
+    }
+    if config.chunk_size == 0 {
+        return Err(PriceContourError::InvalidValue(
+            "chunk_size must be > 0".into(),
+        ));
+    }
+
+    let (baseline_obj, baseline_cons, scale_factors) = grid.compute_scale_factors();
+    solve_online_with_precomputed(
+        grid,
+        specs,
+        config,
+        initial_lambdas,
+        baseline_obj,
+        baseline_cons,
+        scale_factors,
+    )
+}
+
+/// Internal solve variant that accepts pre-computed baselines and scale factors.
+///
+/// This avoids redundant `compute_scale_factors()` calls when the caller
+/// (e.g. `sweep_frontier`) invokes the solver many times on the same grid.
+pub(crate) fn solve_online_with_precomputed(
+    grid: &QuoteGrid,
+    specs: &[ConstraintSpec],
+    config: &SolverConfig,
+    initial_lambdas: Option<&[f64]>,
+    baseline_obj: f64,
+    baseline_cons: Vec<f64>,
+    scale_factors: Vec<f64>,
+) -> Result<SolveResult> {
     let n_constraints = specs.len();
     let n_quotes = grid.n_quotes;
 
-    // Compute scale factors for subgradient: ratio of objective scale to each
-    // constraint's scale. This ensures the step size adapts to the magnitude
-    // difference between objective and constraint values.
-    let (baseline_obj, baseline_cons) = grid.baseline_totals();
     let baseline_objective = baseline_obj;
-    let baseline_constraints = baseline_cons.clone();
-    let obj_per_quote = baseline_obj / n_quotes.max(1) as f64;
-    let scale_factors: Vec<f64> = baseline_cons
-        .iter()
-        .map(|&bc| {
-            let con_per_quote = bc / n_quotes.max(1) as f64;
-            obj_per_quote / (con_per_quote.abs() + 1e-10)
-        })
-        .collect();
+    let baseline_constraints = baseline_cons;
 
     // Initialise lambdas
     let mut lambdas = match initial_lambdas {
@@ -61,45 +95,37 @@ pub fn solve_online(
     };
 
     for iter in 0..config.max_iter {
-        // Reset totals
-        total_objective = 0.0;
-        total_constraints.fill(0.0);
-
-        // Pre-compute signed lambdas once per iteration (reused across chunks)
+        // Pre-compute signed lambdas once per iteration
         let lambda_signs_f32 = compute_lambda_signs_f32(specs, &lambdas);
 
-        // Process quotes in chunks
-        let mut quote_offset = 0;
-        while quote_offset < n_quotes {
-            let chunk_end = (quote_offset + config.chunk_size).min(n_quotes);
+        // Single-pass argmax over all quotes (rayon parallelism inside)
+        let (all_steps, iter_obj, iter_cons) =
+            lagrangian_argmax_pass(grid, &lambda_signs_f32, 0, n_quotes);
 
-            let (chunk_steps, chunk_obj, chunk_cons) =
-                lagrangian_argmax_pass(grid, &lambda_signs_f32, quote_offset, chunk_end);
-
-            total_objective += chunk_obj;
-            for k in 0..n_constraints {
-                total_constraints[k] += chunk_cons[k];
-            }
-
-            // Copy optimal steps
-            optimal_steps[quote_offset..chunk_end].copy_from_slice(&chunk_steps);
-
-            quote_offset = chunk_end;
-        }
+        optimal_steps.copy_from_slice(&all_steps);
+        total_objective = iter_obj;
+        total_constraints = iter_cons;
 
         // Track best feasible solution
-        let all_satisfied = specs.iter().enumerate().all(|(k, spec)| {
-            let tol = spec.threshold.abs() * CONSTRAINT_SATISFACTION_TOL;
-            match spec.direction {
-                ConstraintDirection::Min => total_constraints[k] >= spec.threshold - tol,
-                ConstraintDirection::Max => total_constraints[k] <= spec.threshold + tol,
-            }
-        });
+        let all_satisfied = all_constraints_satisfied(specs, &total_constraints, config.tolerance);
 
         if all_satisfied && total_objective > best_feasible_obj {
             best_feasible_obj = total_objective;
             best_lambdas = lambdas.clone();
         }
+
+        // Accumulate for averaging (before update, so we average the lambdas
+        // that were actually used for this iteration's argmax pass)
+        for k in 0..n_constraints {
+            lambda_sum[k] += lambdas[k];
+        }
+
+        // Clone lambdas before update for history recording
+        let pre_update_lambdas = if config.record_history {
+            Some(lambdas.clone())
+        } else {
+            None
+        };
 
         // Update lambdas
         let max_lambda_change = update_lambdas_subgradient(
@@ -111,10 +137,10 @@ pub fn solve_online(
         );
 
         // Record history if requested
-        if config.record_history {
+        if let Some(hist_lambdas) = pre_update_lambdas {
             history_records.push(IterationRecord {
                 iteration: iter,
-                lambdas: lambdas.clone(),
+                lambdas: hist_lambdas,
                 total_objective,
                 total_constraints: total_constraints.clone(),
                 max_lambda_change,
@@ -122,14 +148,9 @@ pub fn solve_online(
             });
         }
 
-        // Accumulate for averaging
-        for k in 0..n_constraints {
-            lambda_sum[k] += lambdas[k];
-        }
-
         iterations = iter + 1;
 
-        if all_satisfied && max_lambda_change < LAMBDA_CONVERGENCE_TOL {
+        if all_satisfied && max_lambda_change < config.tolerance {
             converged = true;
             break;
         }
@@ -138,36 +159,18 @@ pub fn solve_online(
     // If we didn't converge via the main loop, use the averaged lambdas
     // for a final pass to get a better solution.
     if !converged {
-        // Use the best feasible lambdas if we found any, otherwise use averaged
-        let final_lambdas = if best_feasible_obj > f64::NEG_INFINITY {
-            best_lambdas
-        } else {
-            lambda_sum
-                .iter()
-                .map(|&s| s / iterations.max(1) as f64)
-                .collect()
-        };
+        let final_lambdas =
+            select_final_lambdas(best_feasible_obj, best_lambdas, &lambda_sum, iterations);
 
         let lambda_signs_f32 = compute_lambda_signs_f32(specs, &final_lambdas);
 
-        // Final argmax pass with the chosen lambdas
-        total_objective = 0.0;
-        total_constraints.fill(0.0);
+        // Final single-pass argmax with the chosen lambdas
+        let (all_steps, final_obj, final_cons) =
+            lagrangian_argmax_pass(grid, &lambda_signs_f32, 0, n_quotes);
 
-        let mut quote_offset = 0;
-        while quote_offset < n_quotes {
-            let chunk_end = (quote_offset + config.chunk_size).min(n_quotes);
-
-            let (chunk_steps, chunk_obj, chunk_cons) =
-                lagrangian_argmax_pass(grid, &lambda_signs_f32, quote_offset, chunk_end);
-
-            total_objective += chunk_obj;
-            for k in 0..n_constraints {
-                total_constraints[k] += chunk_cons[k];
-            }
-            optimal_steps[quote_offset..chunk_end].copy_from_slice(&chunk_steps);
-            quote_offset = chunk_end;
-        }
+        optimal_steps.copy_from_slice(&all_steps);
+        total_objective = final_obj;
+        total_constraints = final_cons;
 
         lambdas = final_lambdas;
     }
@@ -197,6 +200,7 @@ pub fn solve_online(
 mod tests {
     use super::*;
     use crate::data::*;
+    use approx::assert_abs_diff_eq;
 
     /// Unconstrained solve: with no constraints, every quote picks the step
     /// with highest objective.
@@ -221,7 +225,7 @@ mod tests {
         };
         let result = solve_online(&grid, &[], &config, None).unwrap();
         assert_eq!(result.optimal_steps, vec![1, 0, 3]);
-        assert!((result.total_objective - (3.0 + 5.0 + 0.9)).abs() < 1e-6);
+        assert_abs_diff_eq!(result.total_objective, 3.0 + 5.0 + 0.9, epsilon = 1e-6);
     }
 
     /// Single min constraint with heterogeneous quotes — each has a different
@@ -280,8 +284,27 @@ mod tests {
             result.total_constraints[0],
             threshold * 0.98
         );
-        // Objective should be less than unconstrained max
-        let unconstrained_result = solve_online(&grid, &[], &SolverConfig { max_iter: 1, ..Default::default() }, None).unwrap();
+        // Objective should be less than unconstrained max.
+        // Build a grid without constraints for the unconstrained comparison.
+        let unconstrained_grid = QuoteGrid {
+            n_quotes: grid.n_quotes,
+            n_steps: grid.n_steps,
+            scenario_values: grid.scenario_values.clone(),
+            objective: grid.objective.clone(),
+            constraints: vec![],
+            constraint_names: vec![],
+            quote_ids: grid.quote_ids.clone(),
+        };
+        let unconstrained_result = solve_online(
+            &unconstrained_grid,
+            &[],
+            &SolverConfig {
+                max_iter: 1,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
         assert!(
             result.total_objective <= unconstrained_result.total_objective + 1e-6,
             "constrained objective should not exceed unconstrained"
@@ -343,15 +366,9 @@ mod tests {
             n_quotes: 3,
             n_steps: 4,
             scenario_values: vec![0.9, 0.95, 1.0, 1.05],
-            objective: vec![
-                1.0, 3.0, 2.0, 0.5,
-                5.0, 4.0, 3.0, 2.0,
-                0.1, 0.2, 0.3, 0.9,
-            ],
+            objective: vec![1.0, 3.0, 2.0, 0.5, 5.0, 4.0, 3.0, 2.0, 0.1, 0.2, 0.3, 0.9],
             constraints: vec![vec![
-                1.0, 0.9, 0.8, 0.7,
-                1.0, 0.9, 0.8, 0.7,
-                1.0, 0.9, 0.8, 0.7,
+                1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7,
             ]],
             constraint_names: vec!["volume".to_string()],
             quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
@@ -379,11 +396,7 @@ mod tests {
             n_quotes: 3,
             n_steps: 4,
             scenario_values: vec![0.9, 0.95, 1.0, 1.05],
-            objective: vec![
-                1.0, 3.0, 2.0, 0.5,
-                5.0, 4.0, 3.0, 2.0,
-                0.1, 0.2, 0.3, 0.9,
-            ],
+            objective: vec![1.0, 3.0, 2.0, 0.5, 5.0, 4.0, 3.0, 2.0, 0.1, 0.2, 0.3, 0.9],
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
@@ -414,6 +427,182 @@ mod tests {
         };
         let result = solve_online(&grid, &[], &config, None).unwrap();
         // Baseline at step 1 (mult=1.0): 20 + 50 = 70
-        assert!((result.baseline_objective - 70.0).abs() < 1e-6);
+        assert_abs_diff_eq!(result.baseline_objective, 70.0, epsilon = 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 32: Multi-constraint test (min volume + max loss_ratio)
+    // -----------------------------------------------------------------------
+
+    /// Build a heterogeneous grid with 2 constraints (volume and loss_ratio),
+    /// used by multi-constraint tests.
+    fn make_two_constraint_grid(n: usize, m: usize) -> QuoteGrid {
+        let mut obj = vec![0.0f32; n * m];
+        let mut vol = vec![0.0f32; n * m];
+        let mut lr = vec![0.0f32; n * m];
+
+        for q in 0..n {
+            let elasticity = 1.0 + 4.0 * (q as f32) / (n as f32);
+            let base = 50.0 + 100.0 * (q as f32) / (n as f32);
+            for j in 0..m {
+                let mult = 0.8 + 0.1 * j as f32;
+                let conversion = 1.0 / (1.0 + (elasticity * (mult - 1.0)).exp());
+                obj[q * m + j] = base * mult * conversion;
+                vol[q * m + j] = conversion;
+                lr[q * m + j] = 0.6 / mult * (1.0 + 0.1 * (mult - 1.0));
+            }
+        }
+
+        QuoteGrid {
+            n_quotes: n,
+            n_steps: m,
+            scenario_values: vec![0.8, 0.9, 1.0, 1.1, 1.2],
+            objective: obj,
+            constraints: vec![vol, lr],
+            constraint_names: vec!["volume".to_string(), "loss_ratio".to_string()],
+            quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+        }
+    }
+
+    #[test]
+    fn test_two_constraints_min_and_max() {
+        // 30 quotes, 5 steps, 2 constraints: volume (Min) and loss_ratio (Max).
+        let n = 30;
+        let m = 5;
+        let grid = make_two_constraint_grid(n, m);
+
+        let (_, baseline_cons) = grid.baseline_totals();
+        let vol_threshold = baseline_cons[0] * 0.90;
+        let lr_threshold = baseline_cons[1] * 1.10;
+
+        let specs = vec![
+            ConstraintSpec {
+                name: "volume".to_string(),
+                direction: ConstraintDirection::Min,
+                threshold: vol_threshold,
+            },
+            ConstraintSpec {
+                name: "loss_ratio".to_string(),
+                direction: ConstraintDirection::Max,
+                threshold: lr_threshold,
+            },
+        ];
+
+        let config = SolverConfig {
+            max_iter: 300,
+            ..Default::default()
+        };
+        let result = solve_online(&grid, &specs, &config, None).unwrap();
+
+        // Should produce a valid result with correct structure
+        assert_eq!(result.lambdas.len(), 2);
+        assert_eq!(result.total_constraints.len(), 2);
+        assert!(result.iterations > 0);
+
+        // Volume should approximately satisfy the min constraint (allow 5% slack
+        // because discrete Lagrangian relaxation on small grids may not converge
+        // perfectly with multiple constraints).
+        assert!(
+            result.total_constraints[0] >= vol_threshold * 0.95,
+            "volume constraint not approximately satisfied: {} < {} (95% of threshold {})",
+            result.total_constraints[0],
+            vol_threshold * 0.95,
+            vol_threshold
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 33: Error path tests for solve_online
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_solve_rejects_specs_grid_mismatch() {
+        // specs.len() != grid.constraints.len() should error
+        let grid = QuoteGrid {
+            n_quotes: 3,
+            n_steps: 3,
+            scenario_values: vec![0.9, 1.0, 1.1],
+            objective: vec![1.0; 9],
+            constraints: vec![vec![1.0; 9]], // 1 constraint
+            constraint_names: vec!["volume".to_string()],
+            quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+        };
+
+        // 2 specs but only 1 constraint in grid
+        let specs = vec![
+            ConstraintSpec {
+                name: "volume".to_string(),
+                direction: ConstraintDirection::Min,
+                threshold: 1.0,
+            },
+            ConstraintSpec {
+                name: "extra".to_string(),
+                direction: ConstraintDirection::Max,
+                threshold: 1.0,
+            },
+        ];
+
+        let config = SolverConfig::default();
+        let err = solve_online(&grid, &specs, &config, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("specs count") || msg.contains("mismatch"),
+            "error should mention specs/grid mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_solve_rejects_wrong_initial_lambdas_len() {
+        // initial_lambdas with wrong length should error
+        let grid = QuoteGrid {
+            n_quotes: 3,
+            n_steps: 3,
+            scenario_values: vec![0.9, 1.0, 1.1],
+            objective: vec![1.0; 9],
+            constraints: vec![vec![1.0; 9]],
+            constraint_names: vec!["volume".to_string()],
+            quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+        };
+
+        let specs = vec![ConstraintSpec {
+            name: "volume".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold: 1.0,
+        }];
+
+        let config = SolverConfig::default();
+        // Pass 2 lambdas but only 1 constraint
+        let err = solve_online(&grid, &specs, &config, Some(&[0.0, 0.0])).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("initial_lambdas") || msg.contains("length"),
+            "error should mention initial_lambdas length: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_solve_rejects_zero_chunk_size() {
+        // chunk_size = 0 should error
+        let grid = QuoteGrid {
+            n_quotes: 3,
+            n_steps: 3,
+            scenario_values: vec![0.9, 1.0, 1.1],
+            objective: vec![1.0; 9],
+            constraints: vec![],
+            constraint_names: vec![],
+            quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+        };
+
+        let config = SolverConfig {
+            chunk_size: 0,
+            ..Default::default()
+        };
+
+        let err = solve_online(&grid, &[], &config, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("chunk_size"),
+            "error should mention chunk_size: {msg}"
+        );
     }
 }

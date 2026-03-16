@@ -6,7 +6,7 @@ import polars as pl
 import pytest
 
 import price_contour as pc
-from price_contour._price_contour import QuoteGrid, QuoteGridBuilder
+from price_contour._price_contour import QuoteGridBuilder
 from helpers import make_small_df
 
 

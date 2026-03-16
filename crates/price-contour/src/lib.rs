@@ -4,7 +4,9 @@ mod frontier_py;
 mod grid_py;
 mod grouped_py;
 mod parquet_grid_py;
+mod ratebook_helpers_py;
 mod solver_py;
+pub(crate) mod utils;
 
 use pyo3::prelude::*;
 
@@ -22,6 +24,21 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(grouped_py::solve_grouped_py, m)?)?;
     m.add_class::<frontier_py::PyFrontierResult>()?;
     m.add_function(wrap_pyfunction!(frontier_py::sweep_frontier_py, m)?)?;
-    m.add_function(wrap_pyfunction!(parquet_grid_py::build_grid_from_parquet_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        parquet_grid_py::build_grid_from_parquet_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        ratebook_helpers_py::compute_residuals_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        ratebook_helpers_py::update_multipliers_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        ratebook_helpers_py::build_interaction_labels_py,
+        m
+    )?)?;
     Ok(())
 }

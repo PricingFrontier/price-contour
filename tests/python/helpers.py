@@ -10,7 +10,19 @@ import polars as pl
 # Tolerance constant — used by all constraint-satisfaction assertions
 # ---------------------------------------------------------------------------
 
-CONSTRAINT_RTOL = 0.02  # 2% relative tolerance for constraint checks
+# 2% relative tolerance for constraint-satisfaction checks.
+#
+# Why 2%: The discrete Lagrangian relaxation selects from a finite set of
+# price-multiplier steps per quote.  With small test portfolios (50-200
+# quotes) and only 5 steps, the solver cannot satisfy constraints to
+# arbitrary precision — each quote's contribution to the constraint total
+# jumps discretely when its optimal step changes.  2% provides enough
+# headroom for these discrete jumps while still catching genuine failures.
+#
+# Tests that use multi-constraint or max-direction constraints may apply
+# additional multipliers to this value (e.g., CONSTRAINT_RTOL * 3) because
+# simultaneous constraints are harder to satisfy on small grids.
+CONSTRAINT_RTOL = 0.02
 
 
 # ---------------------------------------------------------------------------

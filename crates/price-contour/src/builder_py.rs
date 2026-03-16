@@ -8,6 +8,9 @@ use price_contour_core::QuoteGridBuilder;
 use crate::grid_py::PyQuoteGrid;
 use crate::solver_py::is_df_sorted;
 
+/// Extracted chunk: (quote_ids, objective_values, constraint_columns).
+type ChunkData = (Vec<String>, Vec<f32>, Vec<Vec<f32>>);
+
 /// Python-visible builder that accepts Polars DataFrame chunks and
 /// constructs a QuoteGrid incrementally.
 #[pyclass(name = "QuoteGridBuilder")]
@@ -76,9 +79,11 @@ impl PyQuoteGridBuilder {
 
         // If first call, initialise the builder from the chunk
         if !self.initialised {
-            let (n_steps, scenario_values) = extract_grid_info(&df, &self.quote_id_col, &self.scenario_value_col)?;
-            let builder = QuoteGridBuilder::new(n_steps, scenario_values, self.constraint_cols.clone())
-                .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+            let (n_steps, scenario_values) =
+                extract_grid_info(&df, &self.quote_id_col, &self.scenario_value_col)?;
+            let builder =
+                QuoteGridBuilder::new(n_steps, scenario_values, self.constraint_cols.clone())
+                    .map_err(|e| PyValueError::new_err(format!("{e}")))?;
             self.inner = Some(builder);
             self.initialised = true;
         }
@@ -184,7 +189,7 @@ fn extract_chunk(
     scenario_index_col: &str,
     objective_col: &str,
     constraint_cols: &[String],
-) -> PyResult<(Vec<String>, Vec<f32>, Vec<Vec<f32>>)> {
+) -> PyResult<ChunkData> {
     let n_rows = df.height();
 
     let qid_series = df
@@ -206,7 +211,7 @@ fn extract_chunk(
             break;
         }
     }
-    if n_steps == 0 || n_rows % n_steps != 0 {
+    if n_steps == 0 || !n_rows.is_multiple_of(n_steps) {
         return Err(PyValueError::new_err(format!(
             "Row count {n_rows} not divisible by n_steps {n_steps}"
         )));
@@ -220,9 +225,7 @@ fn extract_chunk(
             qid_ca
                 .get(row)
                 .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    PyValueError::new_err(format!("Null {quote_id_col} at row {row}"))
-                })
+                .ok_or_else(|| PyValueError::new_err(format!("Null {quote_id_col} at row {row}")))
         })
         .collect::<PyResult<Vec<String>>>()?;
 
@@ -233,14 +236,13 @@ fn extract_chunk(
     let steps_ca = step_series
         .i32()
         .map_err(|_| PyValueError::new_err(format!("{scenario_index_col} must be Int32")))?;
-    for q in 0..n_quotes.min(10) {
+    for (q, qid) in quote_ids.iter().enumerate().take(n_quotes.min(10)) {
         for j in 0..n_steps {
             let idx = q * n_steps + j;
             let step_val = steps_ca.get(idx).unwrap_or(-1);
             if step_val != j as i32 {
                 return Err(PyValueError::new_err(format!(
-                    "Quote {} step {} has scenario_index={}, expected {}",
-                    quote_ids[q], j, step_val, j
+                    "Quote {qid} step {j} has scenario_index={step_val}, expected {j}",
                 )));
             }
         }
@@ -253,6 +255,12 @@ fn extract_chunk(
     let obj_ca = obj_series
         .f32()
         .map_err(|_| PyValueError::new_err(format!("{objective_col} must be Float32")))?;
+    if obj_ca.null_count() > 0 {
+        return Err(PyValueError::new_err(format!(
+            "Column '{}' contains null values",
+            objective_col
+        )));
+    }
     let objective: Vec<f32> = obj_ca.into_no_null_iter().collect();
 
     // Extract constraints
@@ -264,6 +272,12 @@ fn extract_chunk(
         let ca = series
             .f32()
             .map_err(|_| PyValueError::new_err(format!("{col_name} must be Float32")))?;
+        if ca.null_count() > 0 {
+            return Err(PyValueError::new_err(format!(
+                "Column '{}' contains null values",
+                col_name
+            )));
+        }
         constraints.push(ca.into_no_null_iter().collect());
     }
 

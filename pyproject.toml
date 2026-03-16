@@ -9,6 +9,7 @@ description = "High-performance insurance price optimisation via Lagrangian dual
 requires-python = ">=3.10"
 dependencies = [
     "polars>=0.20",
+    "pre-commit>=4.5.1",
     "pyarrow>=23.0.1",
 ]
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import polars as pl
-import pytest
 
 import price_contour as pc
 from price_contour.frontier import frontier_summary
@@ -152,8 +151,8 @@ class TestFrontierMonotonicity:
                 f"Frontier non-monotonic at point {i}: "
                 f"objective {objectives[i]:.2f} at threshold "
                 f"{pts['threshold_volume'][i]:.3f} < "
-                f"objective {objectives[i+1]:.2f} at threshold "
-                f"{pts['threshold_volume'][i+1]:.3f}"
+                f"objective {objectives[i + 1]:.2f} at threshold "
+                f"{pts['threshold_volume'][i + 1]:.3f}"
             )
 
     def test_1d_constraint_totals_increase_with_threshold(self):
@@ -179,8 +178,8 @@ class TestFrontierMonotonicity:
                 f"Total volume decreased at point {i}: "
                 f"volume {volumes[i]:.2f} at threshold "
                 f"{pts['threshold_volume'][i]:.3f} > "
-                f"volume {volumes[i+1]:.2f} at threshold "
-                f"{pts['threshold_volume'][i+1]:.3f}"
+                f"volume {volumes[i + 1]:.2f} at threshold "
+                f"{pts['threshold_volume'][i + 1]:.3f}"
             )
 
     def test_2d_monotonicity_single_slice(self):
@@ -220,8 +219,8 @@ class TestFrontierMonotonicity:
                 f"at point {i}: "
                 f"objective {objectives[i]:.2f} at threshold "
                 f"{slice_pts['threshold_volume'][i]:.3f} < "
-                f"objective {objectives[i+1]:.2f} at threshold "
-                f"{slice_pts['threshold_volume'][i+1]:.3f}"
+                f"objective {objectives[i + 1]:.2f} at threshold "
+                f"{slice_pts['threshold_volume'][i + 1]:.3f}"
             )
 
     def test_frontier_loosest_point_matches_unconstrained(self):

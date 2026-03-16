@@ -7,10 +7,11 @@ use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
 use price_contour_core::{
-    ConstraintDirection, ConstraintSpec, QuoteGrid, SolveResult, SolverConfig, solve_online,
+    solve_online, ConstraintDirection, ConstraintSpec, QuoteGrid, SolveResult, SolverConfig,
 };
 
 use crate::grid_py::PyQuoteGrid;
+use crate::utils::{order_lambdas, zip_to_dict};
 
 /// Check if a DataFrame is already sorted by (col1, col2) where col1 is Utf8
 /// and col2 is Int32. Returns false on any error or null values.
@@ -133,6 +134,12 @@ pub(crate) fn ingest_dataframe(
     let obj_ca = obj_series
         .f32()
         .map_err(|_| PyValueError::new_err(format!("{objective_col} must be Float32")))?;
+    if obj_ca.null_count() > 0 {
+        return Err(PyValueError::new_err(format!(
+            "Column '{}' contains null values",
+            objective_col
+        )));
+    }
     let objective: Vec<f32> = obj_ca.into_no_null_iter().collect();
 
     // Extract constraints
@@ -144,6 +151,12 @@ pub(crate) fn ingest_dataframe(
         let ca = series
             .f32()
             .map_err(|_| PyValueError::new_err(format!("{col_name} must be Float32")))?;
+        if ca.null_count() > 0 {
+            return Err(PyValueError::new_err(format!(
+                "Column '{}' contains null values",
+                col_name
+            )));
+        }
         constraints.push(ca.into_no_null_iter().collect());
     }
 
@@ -154,27 +167,24 @@ pub(crate) fn ingest_dataframe(
             qid_ca
                 .get(row)
                 .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    PyValueError::new_err(format!("Null {quote_id_col} at row {row}"))
-                })
+                .ok_or_else(|| PyValueError::new_err(format!("Null {quote_id_col} at row {row}")))
         })
         .collect::<PyResult<Vec<String>>>()?;
 
     // Validate step sequence (first 10 quotes only, for performance on large grids)
-    for q in 0..n_quotes.min(10) {
+    for (q, qid) in quote_ids.iter().enumerate().take(n_quotes.min(10)) {
         for j in 0..n_steps {
             let idx = q * n_steps + j;
             let step_val = steps_ca.get(idx).unwrap_or(-1);
             if step_val != j as i32 {
                 return Err(PyValueError::new_err(format!(
-                    "Quote {} step {} has scenario_index={}, expected {}",
-                    quote_ids[q], j, step_val, j
+                    "Quote {qid} step {j} has scenario_index={step_val}, expected {j}",
                 )));
             }
         }
     }
 
-    Ok(QuoteGrid {
+    let grid = QuoteGrid {
         n_quotes,
         n_steps,
         scenario_values,
@@ -182,7 +192,10 @@ pub(crate) fn ingest_dataframe(
         constraints,
         constraint_names: constraint_cols.to_vec(),
         quote_ids,
-    })
+    };
+    grid.validate()
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    Ok(grid)
 }
 
 /// Build result DataFrame from optimal_steps + QuoteGrid.
@@ -200,8 +213,8 @@ pub(crate) fn build_result_dataframe(
     let mut opt_constraint_vals: Vec<Vec<f32>> =
         vec![Vec::with_capacity(n); grid.constraint_names.len()];
 
-    for q in 0..n {
-        let step = optimal_steps[q] as usize;
+    for (q, &opt_step) in optimal_steps.iter().enumerate().take(n) {
+        let step = opt_step as usize;
         let idx = q * m + step;
         opt_scenario_values.push(grid.scenario_values[step]);
         opt_objectives.push(grid.objective[idx]);
@@ -230,7 +243,8 @@ pub(crate) fn build_result_dataframe(
         ));
     }
 
-    DataFrame::new(columns).map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))
+    DataFrame::new(columns)
+        .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))
 }
 
 /// Python-visible solve result wrapping the core SolveResult.
@@ -246,11 +260,7 @@ pub struct PySolveResult {
 impl PySolveResult {
     #[getter]
     fn lambdas(&self) -> HashMap<String, f64> {
-        self.constraint_names
-            .iter()
-            .zip(self.inner.lambdas.iter())
-            .map(|(name, &lam)| (name.clone(), lam))
-            .collect()
+        zip_to_dict(&self.constraint_names, &self.inner.lambdas)
     }
 
     #[getter]
@@ -270,11 +280,7 @@ impl PySolveResult {
 
     #[getter]
     fn total_constraints(&self) -> HashMap<String, f64> {
-        self.constraint_names
-            .iter()
-            .zip(self.inner.total_constraints.iter())
-            .map(|(name, &val)| (name.clone(), val))
-            .collect()
+        zip_to_dict(&self.constraint_names, &self.inner.total_constraints)
     }
 
     #[getter]
@@ -295,11 +301,7 @@ impl PySolveResult {
 
     #[getter]
     fn baseline_constraints(&self) -> HashMap<String, f64> {
-        self.constraint_names
-            .iter()
-            .zip(self.inner.baseline_constraints.iter())
-            .map(|(name, &val)| (name.clone(), val))
-            .collect()
+        zip_to_dict(&self.constraint_names, &self.inner.baseline_constraints)
     }
 
     #[getter]
@@ -309,24 +311,47 @@ impl PySolveResult {
                 .iter()
                 .map(|rec| {
                     let mut d: HashMap<String, Py<PyAny>> = HashMap::new();
-                    d.insert("iteration".into(), rec.iteration.into_pyobject(py).unwrap().unbind().into());
-                    d.insert("total_objective".into(), rec.total_objective.into_pyobject(py).unwrap().unbind().into());
-                    d.insert("max_lambda_change".into(), rec.max_lambda_change.into_pyobject(py).unwrap().unbind().into());
-                    d.insert("all_constraints_satisfied".into(), rec.all_constraints_satisfied.into_pyobject(py).unwrap().to_owned().unbind().into());
+                    d.insert(
+                        "iteration".into(),
+                        rec.iteration.into_pyobject(py).unwrap().unbind().into(),
+                    );
+                    d.insert(
+                        "total_objective".into(),
+                        rec.total_objective
+                            .into_pyobject(py)
+                            .unwrap()
+                            .unbind()
+                            .into(),
+                    );
+                    d.insert(
+                        "max_lambda_change".into(),
+                        rec.max_lambda_change
+                            .into_pyobject(py)
+                            .unwrap()
+                            .unbind()
+                            .into(),
+                    );
+                    d.insert(
+                        "all_constraints_satisfied".into(),
+                        rec.all_constraints_satisfied
+                            .into_pyobject(py)
+                            .unwrap()
+                            .to_owned()
+                            .unbind()
+                            .into(),
+                    );
 
-                    let lam_dict: HashMap<String, f64> = self.constraint_names
-                        .iter()
-                        .zip(rec.lambdas.iter())
-                        .map(|(name, &v)| (name.clone(), v))
-                        .collect();
-                    d.insert("lambdas".into(), lam_dict.into_pyobject(py).unwrap().unbind().into());
+                    let lam_dict = zip_to_dict(&self.constraint_names, &rec.lambdas);
+                    d.insert(
+                        "lambdas".into(),
+                        lam_dict.into_pyobject(py).unwrap().unbind().into(),
+                    );
 
-                    let con_dict: HashMap<String, f64> = self.constraint_names
-                        .iter()
-                        .zip(rec.total_constraints.iter())
-                        .map(|(name, &v)| (name.clone(), v))
-                        .collect();
-                    d.insert("total_constraints".into(), con_dict.into_pyobject(py).unwrap().unbind().into());
+                    let con_dict = zip_to_dict(&self.constraint_names, &rec.total_constraints);
+                    d.insert(
+                        "total_constraints".into(),
+                        con_dict.into_pyobject(py).unwrap().unbind().into(),
+                    );
 
                     d
                 })
@@ -352,7 +377,9 @@ impl PySolveResult {
     /// Return the underlying QuoteGrid (Arc-shared, zero-copy).
     #[getter]
     fn grid(&self) -> PyQuoteGrid {
-        PyQuoteGrid { inner: Arc::clone(&self.grid) }
+        PyQuoteGrid {
+            inner: Arc::clone(&self.grid),
+        }
     }
 }
 
@@ -420,11 +447,13 @@ pub(crate) fn parse_constraints(
     constraints = None,
     max_iter = 50,
     chunk_size = 500_000,
-    tolerance = 1e-6,
+    tolerance = 1e-5,
     lambdas = None,
     record_history = false,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn solve_online_py(
+    py: Python<'_>,
     df: PyDataFrame,
     quote_id: &str,
     scenario_index: &str,
@@ -439,7 +468,8 @@ pub fn solve_online_py(
 ) -> PyResult<PySolveResult> {
     let constraints = constraints.unwrap_or_default();
 
-    let constraint_cols: Vec<String> = constraints.keys().cloned().collect();
+    let mut constraint_cols: Vec<String> = constraints.keys().cloned().collect();
+    constraint_cols.sort();
 
     let grid = Arc::new(ingest_dataframe(
         &df.0,
@@ -460,18 +490,15 @@ pub fn solve_online_py(
         ..Default::default()
     };
 
+    let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+
     // Build initial_lambdas from the dict, ordered to match specs
-    let initial_lambdas: Option<Vec<f64>> = lambdas.map(|lam_dict| {
-        specs
-            .iter()
-            .map(|spec| *lam_dict.get(&spec.name).unwrap_or(&0.0))
-            .collect()
-    });
+    let initial_lambdas: Option<Vec<f64>> =
+        lambdas.map(|lam_dict| order_lambdas(&lam_dict, &constraint_names));
 
-    let result = solve_online(&grid, &specs, &config, initial_lambdas.as_deref())
+    let result = py
+        .detach(|| solve_online(&grid, &specs, &config, initial_lambdas.as_deref()))
         .map_err(|e| PyValueError::new_err(format!("Solver error: {e}")))?;
-
-    let constraint_names = specs.iter().map(|s| s.name.clone()).collect();
 
     Ok(PySolveResult {
         inner: result,
@@ -488,12 +515,14 @@ pub fn solve_online_py(
     constraints = None,
     max_iter = 50,
     chunk_size = 500_000,
-    tolerance = 1e-6,
+    tolerance = 1e-5,
     lambdas = None,
     record_history = false,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn solve_from_grid_py(
-    grid: &mut PyQuoteGrid,
+    py: Python<'_>,
+    grid: &PyQuoteGrid,
     constraints: Option<HashMap<String, HashMap<String, f64>>>,
     max_iter: usize,
     chunk_size: usize,
@@ -513,17 +542,15 @@ pub fn solve_from_grid_py(
         ..Default::default()
     };
 
-    let initial_lambdas: Option<Vec<f64>> = lambdas.map(|lam_dict| {
-        specs
-            .iter()
-            .map(|spec| *lam_dict.get(&spec.name).unwrap_or(&0.0))
-            .collect()
-    });
+    let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
-    let result = solve_online(&grid.inner, &specs, &config, initial_lambdas.as_deref())
+    let initial_lambdas: Option<Vec<f64>> =
+        lambdas.map(|lam_dict| order_lambdas(&lam_dict, &constraint_names));
+
+    let grid_arc = Arc::clone(&grid.inner);
+    let result = py
+        .detach(|| solve_online(&grid_arc, &specs, &config, initial_lambdas.as_deref()))
         .map_err(|e| PyValueError::new_err(format!("Solver error: {e}")))?;
-
-    let constraint_names = specs.iter().map(|s| s.name.clone()).collect();
 
     Ok(PySolveResult {
         inner: result,

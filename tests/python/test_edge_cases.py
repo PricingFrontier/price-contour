@@ -60,13 +60,15 @@ class TestDegenerateShapes:
         rows = []
         for q in range(n_quotes):
             for j in range(n_steps):
-                rows.append({
-                    "quote_id": f"Q{q:04d}",
-                    "scenario_index": j,
-                    "scenario_value": 0.8 + 0.1 * j,
-                    "expected_income": 100.0,
-                    "volume": 0.5,
-                })
+                rows.append(
+                    {
+                        "quote_id": f"Q{q:04d}",
+                        "scenario_index": j,
+                        "scenario_value": 0.8 + 0.1 * j,
+                        "expected_income": 100.0,
+                        "volume": 0.5,
+                    }
+                )
         df = pl.DataFrame(
             rows,
             schema={
@@ -195,9 +197,7 @@ class TestNegativeObjectives:
         Unconstrained solve should pick the argmax (least negative) per quote.
         """
         df = make_small_df(n_quotes=20, n_steps=5)
-        df = df.with_columns(
-            (pl.col("expected_income") * -1).alias("expected_income")
-        )
+        df = df.with_columns((pl.col("expected_income") * -1).alias("expected_income"))
 
         solver = pc.OnlineOptimiser(objective="expected_income")
         result = solver.solve(df)

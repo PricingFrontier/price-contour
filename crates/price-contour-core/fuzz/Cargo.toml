@@ -1,0 +1,47 @@
+[package]
+name = "price-contour-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.price-contour-core]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_validate_and_solve"
+path = "fuzz_targets/fuzz_validate_and_solve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_solve_grouped"
+path = "fuzz_targets/fuzz_solve_grouped.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_argmax_pass"
+path = "fuzz_targets/fuzz_argmax_pass.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_baseline_totals"
+path = "fuzz_targets/fuzz_baseline_totals.rs"
+test = false
+doc = false
+bench = false

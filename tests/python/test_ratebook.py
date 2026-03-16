@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import polars as pl
-import pytest
 
 import price_contour as pc
 from price_contour.ratebook import RatebookOptimiser, RatebookResult
@@ -163,15 +161,15 @@ class TestRatebook:
         n_factors = 2
         objectives_per_cd = []
         for i in range(0, len(result.per_factor_results), n_factors):
-            sweep = result.per_factor_results[i:i + n_factors]
+            sweep = result.per_factor_results[i : i + n_factors]
             if sweep:
                 objectives_per_cd.append(sweep[-1].total_objective)
 
         # Each CD sweep should produce an objective no worse than the previous
         for i in range(len(objectives_per_cd) - 1):
             assert objectives_per_cd[i] <= objectives_per_cd[i + 1] + 1e-3, (
-                f"CD objective decreased at iteration {i+1}: "
-                f"{objectives_per_cd[i]:.4f} > {objectives_per_cd[i+1]:.4f}"
+                f"CD objective decreased at iteration {i + 1}: "
+                f"{objectives_per_cd[i]:.4f} > {objectives_per_cd[i + 1]:.4f}"
             )
 
     def test_factor_values_within_candidate_range(self):
@@ -196,6 +194,31 @@ class TestRatebook:
                     f"factor {factor_name!r} level {level!r} has value {value}, "
                     f"outside candidate range [0.80, 1.20]"
                 )
+
+    def test_interaction_factor_solve(self):
+        """Solving with an interaction factor should converge."""
+        n = 50
+        df = make_small_df(n_quotes=n)
+        factors = make_factors(n)
+
+        solver = RatebookOptimiser(
+            objective="expected_income",
+            constraints={"volume": {"min": 0.90}},
+            factor_columns=[["region", "age_band"]],  # interaction
+            max_cd_iterations=2,
+            max_iter=100,
+        )
+        result = solver.solve(df, factors)
+
+        assert isinstance(result, RatebookResult)
+        # Interaction factor table should have a single key like "region:age_band"
+        assert len(result.factor_tables) == 1
+        key = list(result.factor_tables.keys())[0]
+        # The interaction key is formed by joining the column names with ":"
+        assert "region" in key and "age_band" in key
+        # Should have entries (the interaction levels)
+        assert len(result.factor_tables[key]) > 0
+        assert result.total_objective > 0
 
     def test_ratebook_to_apply_roundtrip(self):
         """Ratebook lambdas can be used with ApplyOptimiser on the same data."""

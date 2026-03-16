@@ -8,12 +8,6 @@ pub enum PriceContourError {
     #[error("Invalid value: {0}")]
     InvalidValue(String),
 
-    #[error("Missing column: {0}")]
-    MissingColumn(String),
-
-    #[error("Convergence failure after {iterations} iterations: {message}")]
-    ConvergenceFailure { iterations: usize, message: String },
-
     #[error("Data validation: {0}")]
     DataValidation(String),
 }

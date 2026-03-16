@@ -9,12 +9,15 @@ from typing import Any
 
 import polars as pl
 
+from price_contour._grid_utils import build_grid
 from price_contour._price_contour import (
     FrontierResult,
     GroupedSolveResult,
     QuoteGrid,
-    QuoteGridBuilder,
+    build_interaction_labels_py,
+    compute_residuals_py,
     solve_grouped_py,
+    update_multipliers_py,
 )
 
 
@@ -56,22 +59,20 @@ class RatebookResult:
 
         config = {
             "lambdas": self.lambdas,
-            "constraints": {
-                name: val
-                for name, val in zip(
-                    self.total_constraints.keys(), self.total_constraints.values()
-                )
-            } if isinstance(self.total_constraints, dict) else {},
-            "factors": factor_order,
+            "constraints": dict(self.total_constraints.items())
+            if isinstance(self.total_constraints, dict)
+            else {},
             "factor_order": factor_order,
         }
         (path / "config.json").write_text(json.dumps(config, indent=2))
 
         for factor_name, table in self.factor_tables.items():
             cols = factor_name.split(":")
+            # Convert unit separator in keys to colon for JSON serialisation
+            serialised_table = {k.replace("\x1f", ":"): v for k, v in table.items()}
             factor_data = {
                 "columns": cols,
-                "table": table,
+                "table": serialised_table,
             }
             filename = factor_name.replace(":", "_") + ".json"
             (path / filename).write_text(json.dumps(factor_data, indent=2))
@@ -89,19 +90,62 @@ class RatebookResult:
                 # Single column factor
                 levels = list(table.keys())
                 values = [table[k] for k in levels]
-                result[factor_name] = pl.DataFrame(
-                    {cols[0]: levels, "factor": values}
-                )
+                result[factor_name] = pl.DataFrame({cols[0]: levels, "factor": values})
             else:
-                # Interaction factor: keys are "val1:val2:..."
+                # Interaction factor: keys use unit separator (\x1f) between
+                # values, falling back to colon for backward compatibility
                 rows = []
                 for key, val in table.items():
-                    parts = key.split(":")
+                    if "\x1f" in key:
+                        parts = key.split("\x1f")
+                    else:
+                        parts = key.split(":")
                     row = {c: p for c, p in zip(cols, parts)}
                     row["factor"] = val
                     rows.append(row)
                 result[factor_name] = pl.DataFrame(rows)
         return result
+
+    @classmethod
+    def load(cls, path: str | Path) -> "RatebookResult":
+        """Load a RatebookResult from a saved parameters folder.
+
+        Parameters
+        ----------
+        path : str | Path
+            Directory containing config.json and per-factor JSON files.
+
+        Returns
+        -------
+        RatebookResult
+        """
+        path = Path(path)
+        config_path = path / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        config = json.loads(config_path.read_text())
+
+        factor_tables = {}
+        factor_order = config.get("factor_order", config.get("factors", []))
+        for factor_name in factor_order:
+            filename = factor_name.replace(":", "_") + ".json"
+            factor_path = path / filename
+            if factor_path.exists():
+                factor_data = json.loads(factor_path.read_text())
+                factor_tables[factor_name] = factor_data.get("table", {})
+
+        return cls(
+            factor_tables=factor_tables,
+            lambdas=config.get("lambdas", {}),
+            total_objective=config.get("total_objective", 0.0),
+            total_constraints=config.get("constraints", {}),
+            baseline_objective=config.get("baseline_objective", 0.0),
+            baseline_constraints=config.get("baseline_constraints", {}),
+            converged=config.get("converged", False),
+            cd_iterations=config.get("cd_iterations", 0),
+            clamp_rate=config.get("clamp_rate", 0.0),
+            per_factor_results=[],
+        )
 
 
 class RatebookOptimiser:
@@ -153,7 +197,7 @@ class RatebookOptimiser:
         cd_tolerance: float = 1e-3,
         max_iter: int = 50,
         chunk_size: int = 500_000,
-        tolerance: float = 1e-6,
+        tolerance: float = 1e-5,
     ) -> None:
         self.objective = objective
         self.constraints = constraints or {}
@@ -170,6 +214,16 @@ class RatebookOptimiser:
         self.chunk_size = chunk_size
         self.tolerance = tolerance
 
+    def _build_candidates(self) -> list[float]:
+        """Build the evenly-spaced candidate factor values."""
+        return [
+            self.candidate_min
+            + (self.candidate_max - self.candidate_min)
+            * i
+            / max(self.candidate_steps - 1, 1)
+            for i in range(self.candidate_steps)
+        ]
+
     def solve(
         self,
         df_or_grid: pl.DataFrame | QuoteGrid,
@@ -177,6 +231,7 @@ class RatebookOptimiser:
         *,
         factor_columns: list[list[str]] | None = None,
         lambdas: dict[str, float] | None = None,
+        _constraints_override: dict[str, dict[str, float]] | None = None,
     ) -> RatebookResult:
         """Run ratebook optimisation.
 
@@ -197,32 +252,54 @@ class RatebookOptimiser:
         -------
         RatebookResult
         """
+        constraints = (
+            _constraints_override
+            if _constraints_override is not None
+            else self.constraints
+        )
+
         factor_specs = factor_columns or self.factor_columns
         if factor_specs is None:
             factor_specs = self._discover_structure(df_or_grid, factors)
 
+        # Validate factors DataFrame
+        if isinstance(df_or_grid, pl.DataFrame):
+            n_steps = _count_steps(df_or_grid, self.quote_id)
+            if n_steps > 0:
+                expected_quotes = df_or_grid.shape[0] // n_steps
+                if factors.shape[0] != expected_quotes:
+                    raise ValueError(
+                        f"factors row count {factors.shape[0]} != "
+                        f"DataFrame quote count {expected_quotes} "
+                        f"(rows={df_or_grid.shape[0]} / n_steps={n_steps})"
+                    )
+
+        # Validate factor_columns reference columns that exist in factors
+        for spec in factor_specs:
+            for col in spec:
+                if col not in factors.columns:
+                    raise ValueError(
+                        f"Factor column '{col}' not found in factors DataFrame. "
+                        f"Available: {list(factors.columns)}"
+                    )
+
         # Build grid if needed
         if isinstance(df_or_grid, pl.DataFrame):
-            builder = QuoteGridBuilder(
-                list(self.constraints.keys()),
+            grid = build_grid(
+                df_or_grid,
+                constraint_columns=list(constraints.keys()),
                 quote_id=self.quote_id,
                 scenario_index=self.scenario_index,
-                scenario_value_col=self.scenario_value,
+                scenario_value=self.scenario_value,
                 objective=self.objective,
             )
-            builder.append(df_or_grid)
-            grid = builder.build()
         else:
             grid = df_or_grid
 
         n_quotes = grid.n_quotes
 
         # Build candidates
-        candidates = [
-            self.candidate_min
-            + (self.candidate_max - self.candidate_min) * i / max(self.candidate_steps - 1, 1)
-            for i in range(self.candidate_steps)
-        ]
+        candidates = self._build_candidates()
 
         # Build per-factor group labels from the factors DataFrame
         factor_group_labels: list[list[str]] = []
@@ -230,12 +307,10 @@ class RatebookOptimiser:
             if len(spec) == 1:
                 labels = factors[spec[0]].cast(pl.Utf8).to_list()
             else:
-                # Interaction: concatenate column values
-                label_cols = [factors[c].cast(pl.Utf8) for c in spec]
-                labels = [
-                    ":".join(str(col[i]) for col in label_cols)
-                    for i in range(n_quotes)
-                ]
+                # Interaction: concatenate column values using unit separator
+                # (ASCII 31) to avoid collisions with colons in data values
+                label_cols = [factors[c].cast(pl.Utf8).to_list() for c in spec]
+                labels = build_interaction_labels_py(label_cols, "\x1f")
             factor_group_labels.append(labels)
 
         # Initialise factor tables: each group level → 1.0
@@ -260,17 +335,14 @@ class RatebookOptimiser:
             ):
                 # Compute residuals: overall_mult / current_factor_value_for_this_quote
                 old_table = factor_tables[f_idx]
-                residuals = []
-                for i in range(n_quotes):
-                    fv = old_table[labels[i]]
-                    residuals.append(overall_mult[i] / fv if fv != 0.0 else 1.0)
+                residuals = compute_residuals_py(overall_mult, labels, old_table)
 
                 result = solve_grouped_py(
                     grid,
                     group_labels=labels,
                     residuals=residuals,
                     candidates=candidates,
-                    constraints=self.constraints if self.constraints else None,
+                    constraints=constraints if constraints else None,
                     max_iter=self.max_iter,
                     chunk_size=self.chunk_size,
                     tolerance=self.tolerance,
@@ -293,14 +365,10 @@ class RatebookOptimiser:
 
                 factor_tables[f_idx] = new_table
 
-                # Update overall_mult
-                for i in range(n_quotes):
-                    fv_old = old_table[labels[i]]
-                    fv_new = new_table[labels[i]]
-                    if fv_old != 0.0:
-                        overall_mult[i] = overall_mult[i] / fv_old * fv_new
-                    else:
-                        overall_mult[i] = fv_new
+                # Update overall_mult via Rust helper
+                overall_mult = update_multipliers_py(
+                    overall_mult, labels, old_table, new_table
+                )
 
             if max_change < self.cd_tolerance:
                 cd_converged = True
@@ -309,8 +377,7 @@ class RatebookOptimiser:
         # Get final metrics from last result
         last = per_factor_results[-1] if per_factor_results else None
         named_tables = {
-            ":".join(spec): table
-            for spec, table in zip(factor_specs, factor_tables)
+            ":".join(spec): table for spec, table in zip(factor_specs, factor_tables)
         }
 
         # Compute final clamp rate as average across per-factor results
@@ -345,24 +412,19 @@ class RatebookOptimiser:
         """
         # Build grid if needed
         if isinstance(df_or_grid, pl.DataFrame):
-            builder = QuoteGridBuilder(
-                list(self.constraints.keys()),
+            grid = build_grid(
+                df_or_grid,
+                constraint_columns=list(self.constraints.keys()),
                 quote_id=self.quote_id,
                 scenario_index=self.scenario_index,
-                scenario_value_col=self.scenario_value,
+                scenario_value=self.scenario_value,
                 objective=self.objective,
             )
-            builder.append(df_or_grid)
-            grid = builder.build()
         else:
             grid = df_or_grid
 
         n_quotes = grid.n_quotes
-        candidates = [
-            self.candidate_min
-            + (self.candidate_max - self.candidate_min) * i / max(self.candidate_steps - 1, 1)
-            for i in range(self.candidate_steps)
-        ]
+        candidates = self._build_candidates()
 
         lifts: list[tuple[str, float]] = []
         for col in factors.columns:
@@ -392,6 +454,12 @@ class RatebookOptimiser:
 
         if not selected:
             # Fallback: use all columns
+            import warnings
+
+            warnings.warn(
+                "No factor column showed positive objective lift. "
+                "Using all columns as factors."
+            )
             selected = list(factors.columns)
 
         return [[col] for col in selected]
@@ -405,6 +473,8 @@ class RatebookOptimiser:
         n_points_per_dim: int = 5,
         factor_columns: list[list[str]] | None = None,
         initial_lambdas: dict[str, float] | None = None,
+        max_total_points: int = 10_000,
+        parallel: bool = False,
     ) -> FrontierResult:
         """Sweep the efficient frontier by running coordinate descent at each threshold.
 
@@ -428,6 +498,10 @@ class RatebookOptimiser:
             Override factor_columns from init.
         initial_lambdas : dict[str, float], optional
             Lambdas to warm-start the first frontier point.
+        parallel : bool
+            Accepted for API consistency with ``OnlineOptimiser.frontier()``,
+            but has no effect. Ratebook frontier is Python-orchestrated and
+            always runs sequentially with warm-starting.
 
         Returns
         -------
@@ -436,15 +510,14 @@ class RatebookOptimiser:
         """
         # Build grid once for all frontier points
         if isinstance(df_or_grid, pl.DataFrame):
-            builder = QuoteGridBuilder(
-                list(self.constraints.keys()),
+            grid = build_grid(
+                df_or_grid,
+                constraint_columns=list(self.constraints.keys()),
                 quote_id=self.quote_id,
                 scenario_index=self.scenario_index,
-                scenario_value_col=self.scenario_value,
+                scenario_value=self.scenario_value,
                 objective=self.objective,
             )
-            builder.append(df_or_grid)
-            grid = builder.build()
         else:
             grid = df_or_grid
 
@@ -468,9 +541,7 @@ class RatebookOptimiser:
             if n <= 1:
                 dim_grids.append([lo])
             else:
-                dim_grids.append(
-                    [lo + (hi - lo) * i / (n - 1) for i in range(n)]
-                )
+                dim_grids.append([lo + (hi - lo) * i / (n - 1) for i in range(n)])
 
         # Cartesian product
         combos: list[list[float]] = [[]]
@@ -479,6 +550,13 @@ class RatebookOptimiser:
 
         if not combos:
             raise ValueError("Empty threshold grid")
+
+        if len(combos) > max_total_points:
+            raise ValueError(
+                f"Frontier would generate {len(combos)} points "
+                f"(exceeds max_total_points={max_total_points}). "
+                f"Reduce n_points_per_dim or increase max_total_points."
+            )
 
         # Nearest-neighbour ordering for warm-start efficiency
         order = _nn_order(combos, [threshold_ranges[n] for n in constraint_names])
@@ -504,29 +582,30 @@ class RatebookOptimiser:
                 elif "max_abs" in spec:
                     modified_constraints[name] = {"max_abs": thresholds[k]}
 
-            # Temporarily override constraints for this solve
-            saved_constraints = self.constraints
-            self.constraints = modified_constraints
-            try:
-                result = self.solve(
-                    grid, factors,
-                    factor_columns=factor_columns,
-                    lambdas=prev_lambdas,
-                )
-            finally:
-                self.constraints = saved_constraints
+            result = self.solve(
+                grid,
+                factors,
+                factor_columns=factor_columns,
+                lambdas=prev_lambdas,
+                _constraints_override=modified_constraints,
+            )
 
             prev_lambdas = result.lambdas
 
-            points.append((idx, {
-                "thresholds": thresholds,
-                "total_objective": result.total_objective,
-                "total_constraints": result.total_constraints,
-                "lambdas": result.lambdas,
-                "cd_iterations": result.cd_iterations,
-                "converged": result.converged,
-                "clamp_rate": result.clamp_rate,
-            }))
+            points.append(
+                (
+                    idx,
+                    {
+                        "thresholds": thresholds,
+                        "total_objective": result.total_objective,
+                        "total_constraints": result.total_constraints,
+                        "lambdas": result.lambdas,
+                        "cd_iterations": result.cd_iterations,
+                        "converged": result.converged,
+                        "clamp_rate": result.clamp_rate,
+                    },
+                )
+            )
 
         # Sort back to original (cartesian product) order
         points.sort(key=lambda x: x[0])
@@ -544,9 +623,7 @@ class RatebookOptimiser:
             ]
 
         for name in constraint_names:
-            columns[f"lambda_{name}"] = [
-                p[1]["lambdas"].get(name, 0.0) for p in points
-            ]
+            columns[f"lambda_{name}"] = [p[1]["lambdas"].get(name, 0.0) for p in points]
 
         columns["iterations"] = [p[1]["cd_iterations"] for p in points]
         columns["converged"] = [p[1]["converged"] for p in points]
@@ -640,10 +717,7 @@ def _nn_order(
         for j in range(n):
             if visited[j]:
                 continue
-            dist = sum(
-                (a - b) ** 2
-                for a, b in zip(normalised[current], normalised[j])
-            )
+            dist = sum((a - b) ** 2 for a, b in zip(normalised[current], normalised[j]))
             if dist < best_dist:
                 best_dist = dist
                 best_next = j
@@ -674,3 +748,11 @@ class _RatebookFrontierResult:
     @property
     def constraint_names(self) -> list[str]:
         return self._constraint_names
+
+
+def _count_steps(df: pl.DataFrame, quote_id_col: str) -> int:
+    """Count the number of steps for the first quote in a sorted DataFrame."""
+    if df.shape[0] == 0 or quote_id_col not in df.columns:
+        return 0
+    first_qid = df[quote_id_col][0]
+    return int((df[quote_id_col] == first_qid).sum())

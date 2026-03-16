@@ -9,6 +9,7 @@ use price_contour_core::{apply_lambdas, ApplyResult, QuoteGrid};
 
 use crate::grid_py::PyQuoteGrid;
 use crate::solver_py::{build_result_dataframe, ingest_dataframe, parse_constraints};
+use crate::utils::{order_lambdas, zip_to_dict};
 
 /// Python-visible apply result.
 #[pyclass(name = "ApplyResult")]
@@ -23,11 +24,7 @@ pub struct PyApplyResult {
 impl PyApplyResult {
     #[getter]
     fn lambdas(&self) -> HashMap<String, f64> {
-        self.constraint_names
-            .iter()
-            .zip(self.inner.lambdas.iter())
-            .map(|(name, &lam)| (name.clone(), lam))
-            .collect()
+        zip_to_dict(&self.constraint_names, &self.inner.lambdas)
     }
 
     #[getter]
@@ -37,11 +34,7 @@ impl PyApplyResult {
 
     #[getter]
     fn total_constraints(&self) -> HashMap<String, f64> {
-        self.constraint_names
-            .iter()
-            .zip(self.inner.total_constraints.iter())
-            .map(|(name, &val)| (name.clone(), val))
-            .collect()
+        zip_to_dict(&self.constraint_names, &self.inner.total_constraints)
     }
 
     #[getter]
@@ -51,11 +44,7 @@ impl PyApplyResult {
 
     #[getter]
     fn baseline_constraints(&self) -> HashMap<String, f64> {
-        self.constraint_names
-            .iter()
-            .zip(self.inner.baseline_constraints.iter())
-            .map(|(name, &val)| (name.clone(), val))
-            .collect()
+        zip_to_dict(&self.constraint_names, &self.inner.baseline_constraints)
     }
 
     #[getter]
@@ -81,7 +70,9 @@ impl PyApplyResult {
     constraints = None,
     chunk_size = 500_000,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn apply_lambdas_py(
+    py: Python<'_>,
     df: PyDataFrame,
     lambdas: HashMap<String, f64>,
     quote_id: &str,
@@ -92,7 +83,8 @@ pub fn apply_lambdas_py(
     chunk_size: usize,
 ) -> PyResult<PyApplyResult> {
     let constraints = constraints.unwrap_or_default();
-    let constraint_cols: Vec<String> = constraints.keys().cloned().collect();
+    let mut constraint_cols: Vec<String> = constraints.keys().cloned().collect();
+    constraint_cols.sort();
 
     let grid = Arc::new(ingest_dataframe(
         &df.0,
@@ -104,17 +96,14 @@ pub fn apply_lambdas_py(
     )?);
 
     let specs = parse_constraints(constraints, &grid)?;
+    let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
     // Order lambdas to match specs
-    let lambda_vec: Vec<f64> = specs
-        .iter()
-        .map(|spec| *lambdas.get(&spec.name).unwrap_or(&0.0))
-        .collect();
+    let lambda_vec = order_lambdas(&lambdas, &constraint_names);
 
-    let result = apply_lambdas(&grid, &specs, &lambda_vec, Some(chunk_size))
+    let result = py
+        .detach(|| apply_lambdas(&grid, &specs, &lambda_vec, Some(chunk_size)))
         .map_err(|e| PyValueError::new_err(format!("Apply error: {e}")))?;
-
-    let constraint_names = specs.iter().map(|s| s.name.clone()).collect();
 
     Ok(PyApplyResult {
         inner: result,
@@ -131,22 +120,21 @@ pub fn apply_lambdas_py(
 #[pyfunction]
 #[pyo3(signature = (grid, lambdas, constraints, chunk_size = 500_000))]
 pub fn apply_from_grid_py(
+    py: Python<'_>,
     grid: &PyQuoteGrid,
     lambdas: HashMap<String, f64>,
     constraints: HashMap<String, HashMap<String, f64>>,
     chunk_size: usize,
 ) -> PyResult<PyApplyResult> {
     let specs = parse_constraints(constraints, &grid.inner)?;
+    let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
-    let lambda_vec: Vec<f64> = specs
-        .iter()
-        .map(|spec| *lambdas.get(&spec.name).unwrap_or(&0.0))
-        .collect();
+    let lambda_vec = order_lambdas(&lambdas, &constraint_names);
 
-    let result = apply_lambdas(&grid.inner, &specs, &lambda_vec, Some(chunk_size))
+    let grid_arc = Arc::clone(&grid.inner);
+    let result = py
+        .detach(|| apply_lambdas(&grid_arc, &specs, &lambda_vec, Some(chunk_size)))
         .map_err(|e| PyValueError::new_err(format!("Apply error: {e}")))?;
-
-    let constraint_names = specs.iter().map(|s| s.name.clone()).collect();
 
     Ok(PyApplyResult {
         inner: result,

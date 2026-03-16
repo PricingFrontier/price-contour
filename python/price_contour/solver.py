@@ -7,10 +7,10 @@ from typing import Any
 
 import polars as pl
 
+from price_contour._grid_utils import build_grid
 from price_contour._price_contour import (
     FrontierResult,
     QuoteGrid,
-    QuoteGridBuilder,
     SolveResult,
     solve_from_grid_py,
     solve_online_py,
@@ -38,7 +38,8 @@ class OnlineOptimiser:
     max_iter : int
         Maximum solver iterations.
     chunk_size : int
-        Quotes per memory chunk for parallel processing.
+        Deprecated: no longer used by the solver. Retained for API
+        compatibility. Internal parallelism is managed by rayon grain sizes.
     tolerance : float
         Convergence tolerance.
     record_history : bool
@@ -55,7 +56,7 @@ class OnlineOptimiser:
         scenario_value: str = "scenario_value",
         max_iter: int = 50,
         chunk_size: int = 500_000,
-        tolerance: float = 1e-6,
+        tolerance: float = 1e-5,
         record_history: bool = False,
     ) -> None:
         self.quote_id = quote_id
@@ -67,6 +68,7 @@ class OnlineOptimiser:
         self.chunk_size = chunk_size
         self.tolerance = tolerance
         self.record_history = record_history
+        _validate_constraint_dict(self.constraints)
 
     def solve(
         self,
@@ -99,6 +101,18 @@ class OnlineOptimiser:
                 lambdas=lambdas,
                 record_history=self.record_history,
             )
+        if not isinstance(df_or_grid, pl.DataFrame):
+            raise TypeError(
+                f"Expected pl.DataFrame or QuoteGrid, got {type(df_or_grid).__name__}"
+            )
+        _validate_dataframe(
+            df_or_grid,
+            quote_id=self.quote_id,
+            scenario_index=self.scenario_index,
+            scenario_value=self.scenario_value,
+            objective=self.objective,
+            constraint_cols=list(self.constraints.keys()),
+        )
         return solve_online_py(
             df_or_grid,
             quote_id=self.quote_id,
@@ -120,6 +134,8 @@ class OnlineOptimiser:
         threshold_ranges: dict[str, tuple[float, float]],
         n_points_per_dim: int = 10,
         initial_lambdas: dict[str, float] | None = None,
+        max_total_points: int = 10_000,
+        parallel: bool = False,
     ) -> FrontierResult:
         """Sweep the efficient frontier over constraint threshold ranges.
 
@@ -143,15 +159,14 @@ class OnlineOptimiser:
             Result with .points (DataFrame) and .n_points.
         """
         if isinstance(df_or_grid, pl.DataFrame):
-            builder = QuoteGridBuilder(
-                list(self.constraints.keys()),
+            grid = build_grid(
+                df_or_grid,
+                constraint_columns=list(self.constraints.keys()),
                 quote_id=self.quote_id,
                 scenario_index=self.scenario_index,
-                scenario_value_col=self.scenario_value,
+                scenario_value=self.scenario_value,
                 objective=self.objective,
             )
-            builder.append(df_or_grid)
-            grid = builder.build()
         else:
             grid = df_or_grid
 
@@ -164,6 +179,8 @@ class OnlineOptimiser:
             chunk_size=self.chunk_size,
             tolerance=self.tolerance,
             initial_lambdas=initial_lambdas,
+            max_total_points=max_total_points,
+            parallel=parallel,
         )
 
     def config_dict(self) -> dict[str, Any]:
@@ -247,11 +264,10 @@ class OnlineOptimiser:
             metrics[f"lambda_{name}"] = lam
 
         metrics["scenario_value_mean"] = float(opt_mults.mean())
-        metrics["scenario_value_std"] = float(opt_mults.std())
+        sv_std = float(opt_mults.std()) if len(opt_mults) > 1 else 0.0
+        metrics["scenario_value_std"] = sv_std
         for pct in (5, 25, 50, 75, 95):
-            metrics[f"scenario_value_p{pct}"] = float(
-                opt_mults.quantile(pct / 100)
-            )
+            metrics[f"scenario_value_p{pct}"] = float(opt_mults.quantile(pct / 100))
 
         # --- artifacts ---
         # Human-readable summary
@@ -299,9 +315,7 @@ class OnlineOptimiser:
                     "iteration": rec["iteration"],
                     "total_objective": rec["total_objective"],
                     "max_lambda_change": rec["max_lambda_change"],
-                    "all_constraints_satisfied": rec[
-                        "all_constraints_satisfied"
-                    ],
+                    "all_constraints_satisfied": rec["all_constraints_satisfied"],
                 }
                 for cname, val in rec["lambdas"].items():
                     row[f"lambda_{cname}"] = val
@@ -322,3 +336,52 @@ class OnlineOptimiser:
             "metrics": metrics,
             "artifacts": artifacts,
         }
+
+
+def _validate_constraint_dict(
+    constraints: dict[str, dict[str, float]],
+) -> None:
+    """Validate constraint specification dict structure and values."""
+    valid_keys = {"min", "max", "min_abs", "max_abs"}
+    for name, spec in constraints.items():
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"Constraint '{name}' value must be a dict, got {type(spec).__name__}"
+            )
+        if len(spec) != 1:
+            raise ValueError(
+                f"Constraint '{name}' must have exactly one key from "
+                f"{valid_keys}, got {set(spec.keys())}"
+            )
+        key = next(iter(spec))
+        if key not in valid_keys:
+            raise ValueError(
+                f"Constraint '{name}' has invalid key '{key}'. "
+                f"Must be one of: {valid_keys}"
+            )
+        value = spec[key]
+        if not isinstance(value, (int, float)):
+            raise ValueError(
+                f"Constraint '{name}' value for '{key}' must be numeric, "
+                f"got {type(value).__name__}"
+            )
+
+
+def _validate_dataframe(
+    df: pl.DataFrame,
+    *,
+    quote_id: str,
+    scenario_index: str,
+    scenario_value: str,
+    objective: str,
+    constraint_cols: list[str],
+) -> None:
+    """Validate DataFrame schema before passing to Rust layer."""
+    required = [quote_id, scenario_index, scenario_value, objective] + constraint_cols
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    # Check for nulls in objective and constraint columns
+    for col_name in [objective] + constraint_cols:
+        if df[col_name].null_count() > 0:
+            raise ValueError(f"Column '{col_name}' contains null values")

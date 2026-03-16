@@ -1,5 +1,6 @@
 use rayon::prelude::*;
 
+use crate::constants::ARGMAX_PAR_GRAIN;
 use crate::data::{ConstraintDirection, ConstraintSpec, QuoteGrid};
 
 /// Pre-compute signed lambdas in f32.
@@ -41,22 +42,24 @@ pub fn lagrangian_argmax_pass(
 
     let mut steps = vec![0u32; chunk_size];
 
-    const PAR_GRAIN: usize = 4096;
-
     // fold+reduce: each rayon partition accumulates into its own (obj, cons),
     // then reduce merges them. No intermediate Vec<(f64, Vec<f64>)> allocated.
     let (total_obj, total_cons) = steps
-        .par_chunks_mut(PAR_GRAIN)
+        .par_chunks_mut(ARGMAX_PAR_GRAIN)
         .enumerate()
         .fold(
             || (0.0f64, vec![0.0f64; n_constraints]),
             |(mut partial_obj, mut partial_cons), (chunk_idx, step_slice)| {
-                let sub_start = quote_start + chunk_idx * PAR_GRAIN;
+                let sub_start = quote_start + chunk_idx * ARGMAX_PAR_GRAIN;
                 let sub_len = step_slice.len();
                 // Reusable buffer for per-quote Lagrangian values (n_steps × 4 bytes).
                 // Allocated once per rayon partition, reused across all quotes in the grain.
                 let mut lagrangians = vec![0.0f32; n_steps];
 
+                // Index-based loops are intentional here: they produce the exact
+                // memory access pattern LLVM needs for SIMD auto-vectorization.
+                // Converting to iterator chains would obscure the axpy pattern.
+                #[allow(clippy::needless_range_loop)]
                 for local_i in 0..sub_len {
                     let q = sub_start + local_i;
                     let base = q * n_steps;
@@ -114,6 +117,7 @@ pub fn lagrangian_argmax_pass(
 mod tests {
     use super::*;
     use crate::data::QuoteGrid;
+    use approx::assert_abs_diff_eq;
 
     fn make_test_grid() -> QuoteGrid {
         // 3 quotes, 4 steps
@@ -139,12 +143,12 @@ mod tests {
     #[test]
     fn test_zero_lambdas_picks_max_objective() {
         let grid = make_test_grid();
-        let lambda_signs = vec![0.0f32]; // zero lambda → no constraint influence
+        let lambda_signs = vec![0.0f32]; // zero lambda -> no constraint influence
 
         let (steps, obj, _cons) = lagrangian_argmax_pass(&grid, &lambda_signs, 0, 3);
 
         assert_eq!(steps, vec![1, 0, 3]); // max objective per quote
-        assert!((obj - (3.0 + 5.0 + 0.9)).abs() < 1e-6);
+        assert_abs_diff_eq!(obj, 3.0 + 5.0 + 0.9, epsilon = 1e-6);
     }
 
     #[test]
@@ -157,7 +161,7 @@ mod tests {
 
         assert_eq!(steps.len(), 2);
         assert_eq!(steps, vec![0, 3]); // quote 1 best at 0, quote 2 best at 3
-        assert!((obj - (5.0 + 0.9)).abs() < 1e-6);
+        assert_abs_diff_eq!(obj, 5.0 + 0.9, epsilon = 1e-6);
     }
 
     #[test]

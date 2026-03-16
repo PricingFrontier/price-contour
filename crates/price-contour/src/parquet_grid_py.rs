@@ -14,6 +14,17 @@ use crate::solver_py::ingest_dataframe;
 /// (typically haute) sinks its lazy plan to parquet first, then passes
 /// the path here so the entire pipeline avoids materialising a large
 /// DataFrame in Python.
+///
+/// **Note:** This loads the entire Parquet file into memory at once. For very
+/// large files that may exceed available memory, use ``QuoteGridBuilder`` with
+/// chunked reading instead:
+///
+/// ```python
+/// builder = QuoteGridBuilder(...)
+/// for chunk in pl.scan_parquet(path).collect().iter_slices(chunk_size):
+///     builder.append(chunk)
+/// grid = builder.build()
+/// ```
 #[pyfunction]
 #[pyo3(signature = (
     path,

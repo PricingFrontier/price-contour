@@ -78,12 +78,14 @@ class TestBuildGridFromParquet:
     def test_custom_column_names(self, tmp_path: Path):
         """Works with custom column names."""
         df = make_small_df(n_quotes=10, n_steps=5)
-        df = df.rename({
-            "quote_id": "policy_id",
-            "scenario_index": "step",
-            "scenario_value": "price_factor",
-            "expected_income": "revenue",
-        })
+        df = df.rename(
+            {
+                "quote_id": "policy_id",
+                "scenario_index": "step",
+                "scenario_value": "price_factor",
+                "expected_income": "revenue",
+            }
+        )
         pq_path = str(tmp_path / "test.parquet")
         df.write_parquet(pq_path)
 

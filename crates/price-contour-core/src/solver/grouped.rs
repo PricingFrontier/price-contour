@@ -5,7 +5,8 @@ use crate::data::{
     ConstraintDirection, ConstraintSpec, GroupMapping, GroupedSolveResult, IterationHistory,
     IterationRecord, QuoteGrid, SolverConfig,
 };
-use crate::error::Result;
+use crate::error::{PriceContourError, Result};
+use crate::solver::convergence::{all_constraints_satisfied, select_final_lambdas};
 use crate::solver::lambda::update_lambdas_subgradient;
 
 /// Find the step index whose scenario_value is nearest to `target`.
@@ -19,7 +20,7 @@ fn nearest_step(scenario_values: &[f32], target: f32) -> (usize, bool) {
         return (n - 1, target > scenario_values[n - 1]);
     }
     // Binary search for nearest
-    match scenario_values.binary_search_by(|m| m.partial_cmp(&target).unwrap()) {
+    match scenario_values.binary_search_by(|m| m.total_cmp(&target)) {
         Ok(i) => (i, false),
         Err(i) => {
             // i is insertion point; compare i-1 and i
@@ -76,11 +77,11 @@ fn accumulate_group_lagrangians(
         let mut clamp_count = 0u64;
         let mut total_remaps = 0u64;
 
-        for i in 0..n_quotes {
+        for (i, &res) in residuals.iter().enumerate().take(n_quotes) {
             let g = group_mapping.group_of[i] as usize;
             let base = i * n_steps;
             for (j, &cand) in candidates.iter().enumerate() {
-                let target = residuals[i] * cand;
+                let target = res * cand;
                 let (k, clamped) = nearest_step(&grid.scenario_values, target);
                 if clamped {
                     clamp_count += 1;
@@ -98,11 +99,9 @@ fn accumulate_group_lagrangians(
         (group_l, clamp_count, total_remaps)
     } else {
         // Parallel: each thread gets its own group_l matrix
-        const PAR_GRAIN: usize = 1024;
-
         (0..n_quotes)
             .into_par_iter()
-            .with_min_len(PAR_GRAIN)
+            .with_min_len(GROUPED_PAR_GRAIN)
             .fold(
                 || (vec![0.0f64; n_groups * n_candidates], 0u64, 0u64),
                 |(mut local_gl, mut local_clamp, mut local_remaps), i| {
@@ -144,7 +143,7 @@ fn argmax_groups(
     n_candidates: usize,
     group_best_candidate: &mut [usize],
 ) {
-    for g in 0..n_groups {
+    for (g, best_cand) in group_best_candidate.iter_mut().enumerate().take(n_groups) {
         let mut best_j = 0;
         let mut best_val = f64::NEG_INFINITY;
         let row_offset = g * n_candidates;
@@ -154,7 +153,7 @@ fn argmax_groups(
                 best_j = j;
             }
         }
-        group_best_candidate[g] = best_j;
+        *best_cand = best_j;
     }
 }
 
@@ -170,15 +169,13 @@ fn reconstruct_and_accumulate(
     let n_constraints = grid.constraints.len();
     let n_steps = grid.n_steps;
 
-    const PAR_GRAIN: usize = 4096;
-
     optimal_steps
-        .par_chunks_mut(PAR_GRAIN)
+        .par_chunks_mut(RECONSTRUCT_PAR_GRAIN)
         .enumerate()
         .fold(
             || (0.0f64, vec![0.0f64; n_constraints]),
             |(mut obj, mut cons), (chunk_idx, step_slice)| {
-                let start = chunk_idx * PAR_GRAIN;
+                let start = chunk_idx * RECONSTRUCT_PAR_GRAIN;
                 for (local_i, step_out) in step_slice.iter_mut().enumerate() {
                     let i = start + local_i;
                     let g = group_mapping.group_of[i] as usize;
@@ -188,8 +185,8 @@ fn reconstruct_and_accumulate(
                     *step_out = k as u32;
                     let idx = i * n_steps + k;
                     obj += grid.objective[idx] as f64;
-                    for c in 0..n_constraints {
-                        cons[c] += grid.constraints[c][idx] as f64;
+                    for (c, con_total) in cons.iter_mut().enumerate().take(n_constraints) {
+                        *con_total += grid.constraints[c][idx] as f64;
                     }
                 }
                 (obj, cons)
@@ -220,21 +217,45 @@ pub fn solve_grouped(
 ) -> Result<GroupedSolveResult> {
     grid.validate()?;
 
+    if specs.len() != grid.constraints.len() {
+        return Err(PriceContourError::DimensionMismatch(format!(
+            "specs count {} != grid constraints count {}",
+            specs.len(),
+            grid.constraints.len()
+        )));
+    }
+    if residuals.len() != grid.n_quotes {
+        return Err(PriceContourError::DimensionMismatch(format!(
+            "residuals length {} != n_quotes {}",
+            residuals.len(),
+            grid.n_quotes
+        )));
+    }
+    if group_mapping.group_of.len() != grid.n_quotes {
+        return Err(PriceContourError::DimensionMismatch(format!(
+            "group_mapping.group_of length {} != n_quotes {}",
+            group_mapping.group_of.len(),
+            grid.n_quotes
+        )));
+    }
+    if candidates.is_empty() {
+        return Err(PriceContourError::InvalidValue(
+            "candidates must not be empty".into(),
+        ));
+    }
+    if config.chunk_size == 0 {
+        return Err(PriceContourError::InvalidValue(
+            "chunk_size must be > 0".into(),
+        ));
+    }
+
     let n_quotes = grid.n_quotes;
     let n_constraints = specs.len();
     let n_groups = group_mapping.n_groups;
     let n_candidates = candidates.len();
 
     // Compute baselines and scale factors
-    let (baseline_obj, baseline_cons) = grid.baseline_totals();
-    let obj_per_quote = baseline_obj / n_quotes.max(1) as f64;
-    let scale_factors: Vec<f64> = baseline_cons
-        .iter()
-        .map(|&bc| {
-            let con_per_quote = bc / n_quotes.max(1) as f64;
-            obj_per_quote / (con_per_quote.abs() + 1e-10)
-        })
-        .collect();
+    let (baseline_obj, baseline_cons, scale_factors) = grid.compute_scale_factors();
 
     // Initialise lambdas
     let mut lambdas = match initial_lambdas {
@@ -291,18 +312,25 @@ pub fn solve_grouped(
         total_constraints = iter_cons;
 
         // Check constraint satisfaction
-        let all_satisfied = specs.iter().enumerate().all(|(k, spec)| {
-            let tol = spec.threshold.abs() * CONSTRAINT_SATISFACTION_TOL;
-            match spec.direction {
-                ConstraintDirection::Min => total_constraints[k] >= spec.threshold - tol,
-                ConstraintDirection::Max => total_constraints[k] <= spec.threshold + tol,
-            }
-        });
+        let all_satisfied = all_constraints_satisfied(specs, &total_constraints, config.tolerance);
 
         if all_satisfied && total_objective > best_feasible_obj {
             best_feasible_obj = total_objective;
             best_lambdas = lambdas.clone();
         }
+
+        // Accumulate for averaging (before update, so we average the lambdas
+        // that were actually used for this iteration's argmax pass)
+        for k in 0..n_constraints {
+            lambda_sum[k] += lambdas[k];
+        }
+
+        // Clone lambdas before update for history recording
+        let pre_update_lambdas = if config.record_history {
+            Some(lambdas.clone())
+        } else {
+            None
+        };
 
         // Update lambdas
         let max_lambda_change = update_lambdas_subgradient(
@@ -313,10 +341,10 @@ pub fn solve_grouped(
             iter,
         );
 
-        if config.record_history {
+        if let Some(hist_lambdas) = pre_update_lambdas {
             history_records.push(IterationRecord {
                 iteration: iter,
-                lambdas: lambdas.clone(),
+                lambdas: hist_lambdas,
                 total_objective,
                 total_constraints: total_constraints.clone(),
                 max_lambda_change,
@@ -324,13 +352,9 @@ pub fn solve_grouped(
             });
         }
 
-        for k in 0..n_constraints {
-            lambda_sum[k] += lambdas[k];
-        }
-
         iterations = iter + 1;
 
-        if all_satisfied && max_lambda_change < LAMBDA_CONVERGENCE_TOL {
+        if all_satisfied && max_lambda_change < config.tolerance {
             converged = true;
             break;
         }
@@ -338,18 +362,12 @@ pub fn solve_grouped(
 
     // If not converged, do a final pass with best/averaged lambdas
     if !converged {
-        let final_lambdas = if best_feasible_obj > f64::NEG_INFINITY {
-            best_lambdas.clone()
-        } else {
-            lambda_sum
-                .iter()
-                .map(|&s| s / iterations.max(1) as f64)
-                .collect()
-        };
+        let final_lambdas =
+            select_final_lambdas(best_feasible_obj, best_lambdas, &lambda_sum, iterations);
 
         let lambda_signs = compute_lambda_signs(specs, &final_lambdas);
 
-        let (group_l, _, _) = accumulate_group_lagrangians(
+        let (group_l, final_clamp, final_remaps) = accumulate_group_lagrangians(
             grid,
             group_mapping,
             residuals,
@@ -357,6 +375,8 @@ pub fn solve_grouped(
             &lambda_signs,
             n_groups,
         );
+        clamp_count = final_clamp;
+        total_remaps = final_remaps;
 
         argmax_groups(&group_l, n_groups, n_candidates, &mut group_best_candidate);
 
@@ -414,6 +434,7 @@ mod tests {
     use super::*;
     use crate::data::*;
     use crate::solver::solve_online;
+    use approx::assert_abs_diff_eq;
 
     fn make_heterogeneous_grid(n: usize, m: usize) -> QuoteGrid {
         let mut obj = vec![0.0f32; n * m];
@@ -445,14 +466,17 @@ mod tests {
     #[test]
     fn test_nearest_step() {
         let mults = vec![0.8f32, 0.9, 1.0, 1.1, 1.2];
-        assert_eq!(nearest_step(&mults, 1.0), (2, false));  // exact match
-        assert_eq!(nearest_step(&mults, 0.87), (1, false));  // closer to 0.9
-        assert_eq!(nearest_step(&mults, 0.7), (0, true));   // clamped below
-        assert_eq!(nearest_step(&mults, 1.3), (4, true));   // clamped above
-        assert_eq!(nearest_step(&mults, 0.97), (2, false));  // closer to 1.0
-        // Equidistant case: just check it returns a valid index
+        assert_eq!(nearest_step(&mults, 1.0), (2, false)); // exact match
+        assert_eq!(nearest_step(&mults, 0.87), (1, false)); // closer to 0.9
+        assert_eq!(nearest_step(&mults, 0.7), (0, true)); // clamped below
+        assert_eq!(nearest_step(&mults, 1.3), (4, true)); // clamped above
+        assert_eq!(nearest_step(&mults, 0.97), (2, false)); // closer to 1.0
+                                                            // Equidistant case: just check it returns a valid index
         let (idx, _) = nearest_step(&mults, 0.85);
-        assert!(idx == 0 || idx == 1, "equidistant should pick adjacent index");
+        assert!(
+            idx == 0 || idx == 1,
+            "equidistant should pick adjacent index"
+        );
     }
 
     #[test]
@@ -480,9 +504,16 @@ mod tests {
             ..Default::default()
         };
 
-        let grouped_result =
-            solve_grouped(&grid, &group_mapping, &residuals, &candidates, &specs, &config, None)
-                .unwrap();
+        let grouped_result = solve_grouped(
+            &grid,
+            &group_mapping,
+            &residuals,
+            &candidates,
+            &specs,
+            &config,
+            None,
+        )
+        .unwrap();
         let online_result = solve_online(&grid, &specs, &config, None).unwrap();
 
         // Both should produce similar objectives (may not be exactly equal due to
@@ -497,12 +528,37 @@ mod tests {
         );
     }
 
+    fn make_unconstrained_grid(n: usize, m: usize) -> QuoteGrid {
+        let mut obj = vec![0.0f32; n * m];
+        let mults: Vec<f32> = (0..m).map(|j| 0.8 + 0.1 * j as f32).collect();
+
+        for q in 0..n {
+            let elasticity = 1.0 + 4.0 * (q as f32) / (n as f32);
+            let base = 50.0 + 100.0 * (q as f32) / (n as f32);
+            for j in 0..m {
+                let mult = mults[j];
+                let conversion = 1.0 / (1.0 + (elasticity * (mult - 1.0)).exp());
+                obj[q * m + j] = base * mult * conversion;
+            }
+        }
+
+        QuoteGrid {
+            n_quotes: n,
+            n_steps: m,
+            scenario_values: mults,
+            objective: obj,
+            constraints: vec![],
+            constraint_names: vec![],
+            quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+        }
+    }
+
     #[test]
     fn test_single_group() {
         // All quotes in one group: should pick a single factor for the whole portfolio
         let n = 20;
         let m = 5;
-        let grid = make_heterogeneous_grid(n, m);
+        let grid = make_unconstrained_grid(n, m);
 
         let labels = vec!["ALL".to_string(); n];
         let group_mapping = build_group_mapping(&labels);
@@ -514,21 +570,28 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            solve_grouped(&grid, &group_mapping, &residuals, &candidates, &[], &config, None)
-                .unwrap();
+        let result = solve_grouped(
+            &grid,
+            &group_mapping,
+            &residuals,
+            &candidates,
+            &[],
+            &config,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.optimal_factor_values.len(), 1);
         // All quotes should have the same factor value
         let fv = result.optimal_factor_values[0];
-        assert!(fv >= 0.8 && fv <= 1.2, "factor value out of range: {fv}");
+        assert!((0.8..=1.2).contains(&fv), "factor value out of range: {fv}");
     }
 
     #[test]
     fn test_clamp_rate_with_extreme_residuals() {
         let n = 10;
         let m = 5;
-        let grid = make_heterogeneous_grid(n, m);
+        let grid = make_unconstrained_grid(n, m);
 
         let labels: Vec<String> = (0..n).map(|i| format!("G{i}")).collect();
         let group_mapping = build_group_mapping(&labels);
@@ -541,9 +604,16 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            solve_grouped(&grid, &group_mapping, &residuals, &candidates, &[], &config, None)
-                .unwrap();
+        let result = solve_grouped(
+            &grid,
+            &group_mapping,
+            &residuals,
+            &candidates,
+            &[],
+            &config,
+            None,
+        )
+        .unwrap();
 
         assert!(
             result.clamp_rate > 0.0,
@@ -556,7 +626,7 @@ mod tests {
     fn test_clamp_rate_zero_with_wide_grid() {
         let n = 10;
         let m = 5;
-        let grid = make_heterogeneous_grid(n, m);
+        let grid = make_unconstrained_grid(n, m);
 
         let labels: Vec<String> = (0..n).map(|i| format!("G{i}")).collect();
         let group_mapping = build_group_mapping(&labels);
@@ -569,14 +639,93 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            solve_grouped(&grid, &group_mapping, &residuals, &candidates, &[], &config, None)
-                .unwrap();
+        let result = solve_grouped(
+            &grid,
+            &group_mapping,
+            &residuals,
+            &candidates,
+            &[],
+            &config,
+            None,
+        )
+        .unwrap();
 
+        assert_abs_diff_eq!(result.clamp_rate, 0.0, epsilon = 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 33: Error path tests for solve_grouped
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_grouped_rejects_empty_candidates() {
+        let n = 10;
+        let m = 5;
+        let grid = make_heterogeneous_grid(n, m);
+
+        let labels: Vec<String> = (0..n).map(|i| format!("G{i}")).collect();
+        let group_mapping = build_group_mapping(&labels);
+        let residuals = vec![1.0f32; n];
+        let candidates: Vec<f32> = vec![]; // empty!
+
+        let (_, bc) = grid.baseline_totals();
+        let specs = vec![ConstraintSpec {
+            name: "volume".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold: bc[0] * 0.90,
+        }];
+
+        let config = SolverConfig::default();
+        let err = solve_grouped(
+            &grid,
+            &group_mapping,
+            &residuals,
+            &candidates,
+            &specs,
+            &config,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
         assert!(
-            (result.clamp_rate - 0.0).abs() < 1e-6,
-            "expected zero clamp rate, got {}",
-            result.clamp_rate
+            msg.contains("candidates") || msg.contains("empty"),
+            "error should mention empty candidates: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_grouped_rejects_residuals_length_mismatch() {
+        let n = 10;
+        let m = 5;
+        let grid = make_heterogeneous_grid(n, m);
+
+        let labels: Vec<String> = (0..n).map(|i| format!("G{i}")).collect();
+        let group_mapping = build_group_mapping(&labels);
+        let residuals = vec![1.0f32; n + 5]; // wrong length
+        let candidates = vec![1.0f32];
+
+        let (_, bc) = grid.baseline_totals();
+        let specs = vec![ConstraintSpec {
+            name: "volume".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold: bc[0] * 0.90,
+        }];
+
+        let config = SolverConfig::default();
+        let err = solve_grouped(
+            &grid,
+            &group_mapping,
+            &residuals,
+            &candidates,
+            &specs,
+            &config,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("residuals") || msg.contains("n_quotes"),
+            "error should mention residuals length mismatch: {msg}"
         );
     }
 }

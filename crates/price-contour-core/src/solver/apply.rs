@@ -1,47 +1,44 @@
-use crate::constants::*;
 use crate::data::{ApplyResult, ConstraintSpec, QuoteGrid};
-use crate::error::Result;
+use crate::error::{PriceContourError, Result};
 
 use super::argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
 
 /// Single-pass Lagrangian argmax with fixed lambdas (no iteration).
 ///
-/// Same parallel pattern as the solve loop, but just one forward pass —
-/// no lambda updates.
+/// One forward pass with rayon-parallel argmax — no lambda updates.
+/// The `chunk_size` parameter is accepted for API compatibility but ignored;
+/// internal parallelism is handled by rayon grain sizes.
 pub fn apply_lambdas(
     grid: &QuoteGrid,
     specs: &[ConstraintSpec],
     lambdas: &[f64],
     chunk_size: Option<usize>,
 ) -> Result<ApplyResult> {
+    let _ = chunk_size; // ignored — rayon handles parallelism internally
     grid.validate()?;
 
+    if lambdas.len() != specs.len() {
+        return Err(PriceContourError::DimensionMismatch(format!(
+            "lambdas length {} != specs count {}",
+            lambdas.len(),
+            specs.len()
+        )));
+    }
+    if specs.len() != grid.constraints.len() {
+        return Err(PriceContourError::DimensionMismatch(format!(
+            "specs count {} != grid constraints count {}",
+            specs.len(),
+            grid.constraints.len()
+        )));
+    }
+
     let n_quotes = grid.n_quotes;
-    let n_constraints = specs.len();
-    let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
 
     let lambda_signs_f32 = compute_lambda_signs_f32(specs, lambdas);
 
-    let mut optimal_steps = vec![0u32; n_quotes];
-    let mut total_objective: f64 = 0.0;
-    let mut total_constraints = vec![0.0f64; n_constraints];
-
-    // Process quotes in chunks
-    let mut quote_offset = 0;
-    while quote_offset < n_quotes {
-        let chunk_end = (quote_offset + chunk_size).min(n_quotes);
-
-        let (chunk_steps, chunk_obj, chunk_cons) =
-            lagrangian_argmax_pass(grid, &lambda_signs_f32, quote_offset, chunk_end);
-
-        total_objective += chunk_obj;
-        for k in 0..n_constraints {
-            total_constraints[k] += chunk_cons[k];
-        }
-
-        optimal_steps[quote_offset..chunk_end].copy_from_slice(&chunk_steps);
-        quote_offset = chunk_end;
-    }
+    // Single-pass argmax over all quotes (rayon parallelism inside)
+    let (optimal_steps, total_objective, total_constraints) =
+        lagrangian_argmax_pass(grid, &lambda_signs_f32, 0, n_quotes);
 
     let (baseline_objective, baseline_constraints) = grid.baseline_totals();
 
@@ -60,6 +57,7 @@ mod tests {
     use super::*;
     use crate::data::*;
     use crate::solver::solve_online;
+    use approx::assert_abs_diff_eq;
 
     fn make_test_grid() -> (QuoteGrid, Vec<ConstraintSpec>) {
         let n = 200;
@@ -127,21 +125,45 @@ mod tests {
         };
         let solve_result = solve_online(&grid, &specs, &config, None).unwrap();
 
-        let apply_result =
-            apply_lambdas(&grid, &specs, &solve_result.lambdas, None).unwrap();
+        let apply_result = apply_lambdas(&grid, &specs, &solve_result.lambdas, None).unwrap();
 
         // Same lambdas → same optimal steps
         assert_eq!(apply_result.optimal_steps, solve_result.optimal_steps);
-        assert!((apply_result.total_objective - solve_result.total_objective).abs() < 1e-6);
+        assert_abs_diff_eq!(
+            apply_result.total_objective,
+            solve_result.total_objective,
+            epsilon = 1e-6
+        );
     }
 
     #[test]
     fn test_apply_has_baselines() {
         let (grid, specs) = make_test_grid();
-        let result = apply_lambdas(&grid, &specs, &vec![0.0], None).unwrap();
+        let result = apply_lambdas(&grid, &specs, &[0.0], None).unwrap();
 
         let (expected_obj, expected_cons) = grid.baseline_totals();
-        assert!((result.baseline_objective - expected_obj).abs() < 1e-6);
-        assert!((result.baseline_constraints[0] - expected_cons[0]).abs() < 1e-6);
+        assert_abs_diff_eq!(result.baseline_objective, expected_obj, epsilon = 1e-6);
+        assert_abs_diff_eq!(
+            result.baseline_constraints[0],
+            expected_cons[0],
+            epsilon = 1e-6
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 33: Error path tests for apply_lambdas
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_rejects_lambdas_specs_mismatch() {
+        // lambdas.len() != specs.len() should error
+        let (grid, specs) = make_test_grid();
+        // Pass 2 lambdas but only 1 constraint spec
+        let err = apply_lambdas(&grid, &specs, &[0.0, 0.0], None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lambdas") || msg.contains("length") || msg.contains("specs"),
+            "error should mention lambdas/specs mismatch: {msg}"
+        );
     }
 }

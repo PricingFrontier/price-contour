@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 
 import polars as pl
-import pytest
 
 import price_contour as pc
 from helpers import make_small_df, CONSTRAINT_RTOL
@@ -45,7 +44,9 @@ class TestNumericalStability:
         # Constraint approximately satisfied
         baseline_vol = result.baseline_constraints["volume"]
         threshold = baseline_vol * 0.90
-        assert result.total_constraints["volume"] >= threshold * (1 - CONSTRAINT_RTOL), (
+        assert result.total_constraints["volume"] >= threshold * (
+            1 - CONSTRAINT_RTOL
+        ), (
             f"volume {result.total_constraints['volume']} < "
             f"{threshold * (1 - CONSTRAINT_RTOL)} "
             f"(threshold {threshold} with {CONSTRAINT_RTOL:.0%} slack)"
@@ -103,7 +104,9 @@ class TestNumericalStability:
         # Constraint satisfaction within tolerance
         baseline_vol = result.baseline_constraints["volume"]
         threshold = baseline_vol * 0.90
-        assert result.total_constraints["volume"] >= threshold * (1 - CONSTRAINT_RTOL), (
+        assert result.total_constraints["volume"] >= threshold * (
+            1 - CONSTRAINT_RTOL
+        ), (
             f"volume {result.total_constraints['volume']} < "
             f"{threshold * (1 - CONSTRAINT_RTOL)} "
             f"(threshold {threshold} with {CONSTRAINT_RTOL:.0%} slack)"

@@ -261,13 +261,13 @@ class TestApplySerialisationErrors:
     def test_load_missing_lambdas_key_raises(self, tmp_path):
         bad = tmp_path / "bad.json"
         bad.write_text('{"objective": "x"}')
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError, match="missing 'lambdas' key"):
             pc.ApplyOptimiser.load(bad)
 
     def test_load_empty_json_raises(self, tmp_path):
         bad = tmp_path / "bad.json"
         bad.write_text("{}")
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError, match="missing 'lambdas' key"):
             pc.ApplyOptimiser.load(bad)
 
     def test_save_creates_parent_dirs(self, tmp_path):
@@ -295,4 +295,6 @@ class TestApplySerialisationErrors:
         # Both should behave as unconstrained since effective lambda=0
         result_mismatched = mismatched.apply(df)
         result_zero = zero.apply(df)
-        assert abs(result_mismatched.total_objective - result_zero.total_objective) < 1e-3
+        assert (
+            abs(result_mismatched.total_objective - result_zero.total_objective) < 1e-3
+        )

@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import polars as pl
-import pytest
 
 import price_contour as pc
 from price_contour._price_contour import (
     QuoteGrid,
     QuoteGridBuilder,
-    GroupedSolveResult,
     solve_grouped_py,
 )
 from helpers import make_small_df, CONSTRAINT_RTOL
 
 
-def _build_grid(df: pl.DataFrame) -> QuoteGrid:
-    builder = QuoteGridBuilder(["volume"])
+def _build_grid(
+    df: pl.DataFrame, constraint_cols: list[str] | None = None
+) -> QuoteGrid:
+    if constraint_cols is None:
+        constraint_cols = ["volume"]
+    builder = QuoteGridBuilder(constraint_cols)
     builder.append(df)
     return builder.build()
 
@@ -62,7 +64,7 @@ class TestGroupedSolver:
         """All quotes in one group: a single factor for the whole portfolio."""
         n = 20
         df = make_small_df(n_quotes=n, n_steps=5)
-        grid = _build_grid(df)
+        grid = _build_grid(df, constraint_cols=[])
 
         group_labels = ["ALL"] * n
         residuals = [1.0] * n
@@ -85,7 +87,7 @@ class TestGroupedSolver:
         """3-quote, 2-group problem with known structure."""
         n = 3
         df = make_small_df(n_quotes=n, n_steps=5)
-        grid = _build_grid(df)
+        grid = _build_grid(df, constraint_cols=[])
 
         # Group 0: quotes 0,1; Group 1: quote 2
         group_labels = ["A", "A", "B"]
@@ -109,7 +111,7 @@ class TestGroupedSolver:
         """Extreme residuals push targets outside grid."""
         n = 20
         df = make_small_df(n_quotes=n, n_steps=5)
-        grid = _build_grid(df)
+        grid = _build_grid(df, constraint_cols=[])
 
         group_labels = [f"G{i}" for i in range(n)]
         residuals = [3.0] * n  # will push targets above grid max
@@ -129,7 +131,7 @@ class TestGroupedSolver:
         """Normal residuals within grid range."""
         n = 20
         df = make_small_df(n_quotes=n, n_steps=5)
-        grid = _build_grid(df)
+        grid = _build_grid(df, constraint_cols=[])
 
         group_labels = [f"G{i}" for i in range(n)]
         residuals = [1.0] * n
@@ -196,7 +198,9 @@ class TestGroupedSolver:
 
         baseline_vol = result.baseline_constraints["volume"]
         threshold = baseline_vol * 0.90
-        assert result.total_constraints["volume"] >= threshold * (1 - CONSTRAINT_RTOL), (
+        assert result.total_constraints["volume"] >= threshold * (
+            1 - CONSTRAINT_RTOL
+        ), (
             f"grouped volume {result.total_constraints['volume']} < "
             f"threshold {threshold} with {CONSTRAINT_RTOL:.0%} slack"
         )
@@ -210,7 +214,7 @@ class TestGroupedSolver:
         """All optimal_steps_per_quote values are valid step indices."""
         n = 20
         df = make_small_df(n_quotes=n, n_steps=5)
-        grid = _build_grid(df)
+        grid = _build_grid(df, constraint_cols=[])
 
         group_labels = ["A"] * 10 + ["B"] * 10
         residuals = [1.0] * n
@@ -227,6 +231,4 @@ class TestGroupedSolver:
         steps = result.optimal_steps_per_quote
         assert len(steps) == n, f"expected {n} steps, got {len(steps)}"
         for i, step in enumerate(steps):
-            assert 0 <= step < 5, (
-                f"quote {i}: optimal_step {step} out of range [0, 5)"
-            )
+            assert 0 <= step < 5, f"quote {i}: optimal_step {step} out of range [0, 5)"
