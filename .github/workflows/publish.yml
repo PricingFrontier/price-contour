@@ -48,16 +48,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            maturin-args: "--release --strip"
           - os: macos-latest
             target: x86_64-apple-darwin
-            maturin-args: "--release --strip"
           - os: macos-latest
             target: aarch64-apple-darwin
-            maturin-args: "--release --strip"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            maturin-args: "--release --strip"
     steps:
       - uses: actions/checkout@v4
 
@@ -69,7 +65,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: ${{ matrix.maturin-args }} --out dist
+          args: --release --strip --out dist --interpreter 3.10 3.11 3.12 3.13
           manylinux: auto
 
       - name: Upload wheel
