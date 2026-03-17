@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "price-contour"
-version = "0.2.4"
+version = "0.2.5"
 description = "High-performance insurance price optimisation via Lagrangian dual decomposition"
 readme = "README.md"
 license = "AGPL-3.0-only"
