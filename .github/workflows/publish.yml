@@ -57,15 +57,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           args: --release --strip --out dist --interpreter 3.10 3.11 3.12 3.13
+          sccache: "true"
           manylinux: auto
 
       - name: Upload wheel
