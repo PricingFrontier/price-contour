@@ -165,8 +165,6 @@ pub enum LambdaStrategy {
 pub struct SolverConfig {
     /// Maximum number of subgradient iterations.
     pub max_iter: usize,
-    /// Deprecated: no longer used by online or apply solvers. Retained for API compatibility.
-    pub chunk_size: usize,
     /// Convergence tolerance for lambda changes and constraint satisfaction.
     pub tolerance: f64,
     /// Lambda update strategy (currently only Subgradient).
@@ -179,7 +177,6 @@ impl Default for SolverConfig {
     fn default() -> Self {
         Self {
             max_iter: DEFAULT_MAX_ITER,
-            chunk_size: DEFAULT_CHUNK_SIZE,
             tolerance: DEFAULT_TOLERANCE,
             lambda_strategy: LambdaStrategy::Subgradient,
             record_history: false,

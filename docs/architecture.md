@@ -667,12 +667,12 @@ The primary constraint type. The constraint is on the portfolio aggregate:
 
 ### Threshold modes
 
-**Relative (default)**: The threshold is a fraction of the baseline value (portfolio total at scenario_value=1.0, or the nearest step). The library computes the baseline from the input data automatically.
+**Relative**: The threshold is a fraction of the baseline value (portfolio total at scenario_value=1.0, or the nearest step). The library computes the baseline from the input data automatically.
 
 ```python
 constraints={
-    "volume": {"min": 0.90},          # portfolio volume ≥ 90% of baseline
-    "loss_ratio": {"max": 1.05},      # portfolio loss ratio ≤ 105% of baseline
+    "volume": {"min_pct": 0.90},      # portfolio volume ≥ 90% of baseline
+    "loss_ratio": {"max_pct": 1.05},  # portfolio loss ratio ≤ 105% of baseline
 }
 ```
 
@@ -680,8 +680,8 @@ constraints={
 
 ```python
 constraints={
-    "volume": {"min_abs": 45000},     # portfolio volume ≥ 45,000
-    "loss_ratio": {"max_abs": 0.65},  # portfolio loss ratio ≤ 0.65
+    "volume": {"min": 45000},         # portfolio volume ≥ 45,000
+    "loss_ratio": {"max": 0.65},      # portfolio loss ratio ≤ 0.65
 }
 ```
 

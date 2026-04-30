@@ -32,11 +32,6 @@ pub fn solve_online(
             )));
         }
     }
-    if config.chunk_size == 0 {
-        return Err(PriceContourError::InvalidValue(
-            "chunk_size must be > 0".into(),
-        ));
-    }
 
     let (baseline_obj, baseline_cons, scale_factors) = grid.compute_scale_factors();
     solve_online_with_precomputed(
@@ -107,7 +102,12 @@ pub(crate) fn solve_online_with_precomputed(
         total_constraints = iter_cons;
 
         // Track best feasible solution
-        let all_satisfied = all_constraints_satisfied(specs, &total_constraints, config.tolerance);
+        let all_satisfied = all_constraints_satisfied(
+            specs,
+            &total_constraints,
+            &baseline_constraints,
+            config.tolerance,
+        );
 
         if all_satisfied && total_objective > best_feasible_obj {
             best_feasible_obj = total_objective;
@@ -132,6 +132,7 @@ pub(crate) fn solve_online_with_precomputed(
             &mut lambdas,
             specs,
             &total_constraints,
+            &baseline_constraints,
             &scale_factors,
             iter,
         );
@@ -580,29 +581,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_solve_rejects_zero_chunk_size() {
-        // chunk_size = 0 should error
-        let grid = QuoteGrid {
-            n_quotes: 3,
-            n_steps: 3,
-            scenario_values: vec![0.9, 1.0, 1.1],
-            objective: vec![1.0; 9],
-            constraints: vec![],
-            constraint_names: vec![],
-            quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
-        };
-
-        let config = SolverConfig {
-            chunk_size: 0,
-            ..Default::default()
-        };
-
-        let err = solve_online(&grid, &[], &config, None).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("chunk_size"),
-            "error should mention chunk_size: {msg}"
-        );
-    }
 }

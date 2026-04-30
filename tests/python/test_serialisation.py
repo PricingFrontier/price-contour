@@ -22,7 +22,7 @@ class TestApplySerialisation:
         # Solve to get lambdas
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         solve_result = solver.solve(df)
@@ -31,7 +31,7 @@ class TestApplySerialisation:
         applier = pc.ApplyOptimiser(
             lambdas=solve_result.lambdas,
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         result_before = applier.apply(df)
 
@@ -52,11 +52,10 @@ class TestApplySerialisation:
         applier = pc.ApplyOptimiser(
             lambdas={"volume": 0.5, "loss_ratio": 0.3},
             objective="my_obj",
-            constraints={"volume": {"min": 0.9}, "loss_ratio": {"max": 1.05}},
+            constraints={"volume": {"min_pct": 0.9}, "loss_ratio": {"max_pct": 1.05}},
             quote_id="qid",
             scenario_index="step",
             scenario_value="mult",
-            chunk_size=100_000,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -67,13 +66,12 @@ class TestApplySerialisation:
         assert loaded.lambdas == {"volume": 0.5, "loss_ratio": 0.3}
         assert loaded.objective == "my_obj"
         assert loaded.constraints == {
-            "volume": {"min": 0.9},
-            "loss_ratio": {"max": 1.05},
+            "volume": {"min_pct": 0.9},
+            "loss_ratio": {"max_pct": 1.05},
         }
         assert loaded.quote_id == "qid"
         assert loaded.scenario_index == "step"
         assert loaded.scenario_value == "mult"
-        assert loaded.chunk_size == 100_000
 
 
 class TestFrontierSummary:
@@ -82,7 +80,7 @@ class TestFrontierSummary:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -118,7 +116,7 @@ class TestRatebookSummary:
         )
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=50,
@@ -146,7 +144,7 @@ class TestRatebookSave:
         )
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"], ["age_band"]],
             max_cd_iterations=1,
             max_iter=50,
@@ -166,7 +164,9 @@ class TestRatebookSave:
             assert (out / "age_band.json").exists()
 
     def test_save_config_contents(self):
-        """config.json has factor_order and lambdas, no metrics."""
+        """config.json has factor_order, lambdas, and metrics so
+        ``RatebookResult.load`` can reconstruct the result without
+        defaulting required fields."""
         result = self._solve_ratebook()
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -178,10 +178,13 @@ class TestRatebookSave:
             config = json.loads((out / "config.json").read_text())
             assert config["factor_order"] == ["region", "age_band"]
             assert isinstance(config["lambdas"], dict)
-            # No metrics in config
-            assert "total_objective" not in config
-            assert "uplift_pct" not in config
-            assert "clamp_rate" not in config
+            # Metrics are required by ``load`` — fail loud rather than
+            # silently default to 0.0 when a saved file is incomplete.
+            assert "total_objective" in config
+            assert "baseline_objective" in config
+            assert "cd_iterations" in config
+            assert "converged" in config
+            assert "clamp_rate" in config
 
     def test_save_factor_json_contents(self):
         """Each factor JSON has columns list and table dict."""
@@ -227,7 +230,7 @@ class TestRatebookSave:
         )
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region", "age"]],
             max_cd_iterations=1,
             max_iter=50,
@@ -274,27 +277,18 @@ class TestApplySerialisationErrors:
         applier = pc.ApplyOptimiser(
             lambdas={"volume": 0.5},
             objective="expected_income",
+            constraints={"volume": {"min_pct": 0.9}},
         )
         deep = tmp_path / "deep" / "nested" / "config.json"
         applier.save(deep)
         assert deep.exists()
 
     def test_apply_mismatched_lambda_keys(self):
-        """Lambdas for wrong constraint name should behave like zero lambdas."""
-        df = make_small_df(n_quotes=20, n_steps=5)
-        mismatched = pc.ApplyOptimiser(
-            lambdas={"wrong_name": 1.0},
-            objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
-        )
-        zero = pc.ApplyOptimiser(
-            lambdas={"volume": 0.0},
-            objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
-        )
-        # Both should behave as unconstrained since effective lambda=0
-        result_mismatched = mismatched.apply(df)
-        result_zero = zero.apply(df)
-        assert (
-            abs(result_mismatched.total_objective - result_zero.total_objective) < 1e-3
-        )
+        """Lambdas keyed by an unknown constraint name must raise at
+        construction time (fail-loud over silent-ignore)."""
+        with pytest.raises(ValueError, match="wrong_name"):
+            pc.ApplyOptimiser(
+                lambdas={"wrong_name": 1.0},
+                objective="expected_income",
+                constraints={"volume": {"min_pct": 0.90}},
+            )

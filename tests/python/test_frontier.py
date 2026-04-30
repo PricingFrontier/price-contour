@@ -15,7 +15,7 @@ class TestFrontier:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -42,7 +42,7 @@ class TestFrontier:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -61,8 +61,8 @@ class TestFrontier:
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.90},
-                "loss_ratio": {"max": 1.05},
+                "volume": {"min_pct": 0.90},
+                "loss_ratio": {"max_pct": 1.05},
             },
             max_iter=100,
         )
@@ -87,7 +87,7 @@ class TestFrontier:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -111,7 +111,7 @@ class TestFrontier:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -134,7 +134,7 @@ class TestFrontierMonotonicity:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.frontier(
@@ -160,7 +160,7 @@ class TestFrontierMonotonicity:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.frontier(
@@ -188,8 +188,8 @@ class TestFrontierMonotonicity:
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.90},
-                "loss_ratio": {"max": 1.05},
+                "volume": {"min_pct": 0.90},
+                "loss_ratio": {"max_pct": 1.05},
             },
             max_iter=200,
         )
@@ -230,7 +230,7 @@ class TestFrontierMonotonicity:
         # Unconstrained solve
         unconstrained_solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.50}},
+            constraints={"volume": {"min_pct": 0.50}},
             max_iter=200,
         )
         unconstrained_result = unconstrained_solver.solve(df)
@@ -239,7 +239,7 @@ class TestFrontierMonotonicity:
         # Frontier solve with a loose lower bound
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.50}},
+            constraints={"volume": {"min_pct": 0.50}},
             max_iter=200,
         )
         result = solver.frontier(

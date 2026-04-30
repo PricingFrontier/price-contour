@@ -15,7 +15,7 @@ class TestApply:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         solve_result = solver.solve(df)
@@ -23,7 +23,7 @@ class TestApply:
         applier = pc.ApplyOptimiser(
             lambdas=solve_result.lambdas,
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         apply_result = applier.apply(df)
 
@@ -34,7 +34,7 @@ class TestApply:
         applier = pc.ApplyOptimiser(
             lambdas={"volume": 0.0},
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         apply_result = applier.apply(df)
 
@@ -48,7 +48,7 @@ class TestApply:
         applier = pc.ApplyOptimiser(
             lambdas={"volume": 0.0},
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         apply_result = applier.apply(df)
 
@@ -66,7 +66,7 @@ class TestApply:
         applier = pc.ApplyOptimiser(
             lambdas={"volume": 0.0},
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         apply_result = applier.apply(df)
         out = apply_result.dataframe
@@ -82,8 +82,8 @@ class TestApply:
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.92},
-                "loss_ratio": {"max": 1.05},
+                "volume": {"min_pct": 0.92},
+                "loss_ratio": {"max_pct": 1.05},
             },
             max_iter=200,
         )
@@ -93,8 +93,8 @@ class TestApply:
             lambdas=solve_result.lambdas,
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.92},
-                "loss_ratio": {"max": 1.05},
+                "volume": {"min_pct": 0.92},
+                "loss_ratio": {"max_pct": 1.05},
             },
         )
         apply_result = applier.apply(df)
@@ -135,7 +135,7 @@ class TestSolveResultNewGetters:
         df = make_small_df(n_quotes=20, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         result = solver.solve(df)
         assert isinstance(result.baseline_objective, float)
@@ -145,7 +145,7 @@ class TestSolveResultNewGetters:
         df = make_small_df(n_quotes=20, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         result = solver.solve(df)
         assert isinstance(result.baseline_constraints, dict)
@@ -169,7 +169,7 @@ class TestSolveResultNewGetters:
         df = make_small_df(n_quotes=20, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         result = solver.solve(df)
         assert result.history is None
@@ -178,7 +178,7 @@ class TestSolveResultNewGetters:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
             record_history=True,
         )
@@ -201,7 +201,7 @@ class TestSummary:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.solve(df)
@@ -213,7 +213,7 @@ class TestSummary:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.solve(df)
@@ -229,7 +229,7 @@ class TestSummary:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.solve(df)
@@ -251,7 +251,7 @@ class TestSummary:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.solve(df)
@@ -266,7 +266,7 @@ class TestSummary:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
             record_history=True,
         )
@@ -285,7 +285,7 @@ class TestSummary:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.solve(df)
@@ -322,7 +322,7 @@ class TestSummary:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.solve(df)
@@ -362,7 +362,7 @@ class TestConvergenceBehavior:
         df = make_small_df(n_quotes=200, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"max": 0.80}},
+            constraints={"volume": {"max_pct": 0.80}},
             max_iter=200,
             record_history=True,
         )

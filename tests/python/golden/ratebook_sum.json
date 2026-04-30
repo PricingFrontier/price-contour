@@ -1,0 +1,51 @@
+{
+  "constraints": {
+    "volume": {
+      "min_pct": 0.95
+    }
+  },
+  "expected": {
+    "baseline_constraints": {
+      "volume": 25.0
+    },
+    "baseline_objective": 2395.059501647949,
+    "cd_iterations": 2,
+    "converged": true,
+    "factor_tables": {
+      "age_band": {
+        "18-25": 1.0,
+        "26-35": 1.0,
+        "36-50": 1.0,
+        "51+": 1.0
+      },
+      "region": {
+        "A": 0.8571428656578064,
+        "B": 0.9571428298950195,
+        "C": 0.9571428298950195,
+        "D": 0.9571428298950195
+      }
+    },
+    "lambdas": {
+      "volume": 0.0
+    },
+    "total_constraints": {
+      "volume": 25.764248251914978
+    },
+    "total_objective": 2399.401054382324
+  },
+  "factor_columns": [
+    [
+      "region"
+    ],
+    [
+      "age_band"
+    ]
+  ],
+  "fixture_n_quotes": 50,
+  "fixture_n_steps": 5,
+  "fixture_seed": 42,
+  "tolerance": {
+    "absolute": 1e-09,
+    "relative": 1e-09
+  }
+}

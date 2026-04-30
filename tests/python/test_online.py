@@ -47,7 +47,7 @@ class TestBasicSolve:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.solve(df)
@@ -70,7 +70,7 @@ class TestBasicSolve:
         df = make_small_df(n_quotes=200, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"loss_ratio": {"max": 1.05}},
+            constraints={"loss_ratio": {"max_pct": 1.05}},
             max_iter=500,
         )
         result = solver.solve(df)
@@ -92,7 +92,7 @@ class TestBasicSolve:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
 
@@ -109,8 +109,8 @@ class TestBasicSolve:
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.92},
-                "loss_ratio": {"max": 1.05},
+                "volume": {"min_pct": 0.92},
+                "loss_ratio": {"max_pct": 1.05},
             },
             max_iter=200,
         )
@@ -159,7 +159,7 @@ class TestBasicSolve:
         df = make_small_df(n_quotes=20, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.solve(df)
@@ -181,9 +181,9 @@ class TestBasicSolve:
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.90},
-                "loss_ratio": {"max": 1.10},
-                "expected_income": {"min": 0.85},
+                "volume": {"min_pct": 0.90},
+                "loss_ratio": {"max_pct": 1.10},
+                "expected_income": {"min_pct": 0.85},
             },
             max_iter=200,
         )
@@ -213,7 +213,7 @@ class TestFullPortfolio:
     def test_basic_solve_shape(self, df):
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         result = solver.solve(df)
         out = result.dataframe
@@ -223,7 +223,7 @@ class TestFullPortfolio:
         """1M quotes should solve in < 10s (generous bound for CI)."""
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         t0 = time.perf_counter()
         result = solver.solve(df)
@@ -238,8 +238,8 @@ class TestFullPortfolio:
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.90},
-                "loss_ratio": {"max": 1.05},
+                "volume": {"min_pct": 0.90},
+                "loss_ratio": {"max_pct": 1.05},
             },
         )
         result = solver.solve(df)
@@ -249,7 +249,7 @@ class TestFullPortfolio:
     def test_warm_start_full(self, df):
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         cold = solver.solve(df)
         warm = solver.solve(df, lambdas=cold.lambdas)

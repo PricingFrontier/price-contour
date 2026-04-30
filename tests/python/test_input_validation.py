@@ -49,7 +49,7 @@ class TestMissingColumns:
         df = make_small_df(n_quotes=10, n_steps=3)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"nonexistent_col": {"min": 0.9}},
+            constraints={"nonexistent_col": {"min_pct": 0.9}},
         )
         with pytest.raises((ValueError, Exception)):
             solver.solve(df)
@@ -103,7 +103,7 @@ class TestInvalidData:
         )
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.9}},
+            constraints={"volume": {"min_pct": 0.9}},
         )
         with pytest.raises((ValueError, Exception)):
             solver.solve(df)
@@ -141,7 +141,7 @@ class TestInvalidConstraintSpec:
     """Verify that malformed constraint dicts are rejected."""
 
     def test_invalid_constraint_key_raises(self) -> None:
-        """Constraint dicts must use one of min, max, min_abs, max_abs.
+        """Constraint dicts must use one of min, max, min_pct, max_pct.
         An unrecognised key like 'invalid_key' should raise ValueError."""
         with pytest.raises((ValueError, Exception)):
             pc.OnlineOptimiser(
@@ -183,7 +183,7 @@ class TestSortedOptimization:
         df = make_small_df(n_quotes=50)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result1 = solver.solve(df)

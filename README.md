@@ -37,7 +37,7 @@ df = pl.read_parquet("scored_quotes.parquet")
 
 optimiser = pc.OnlineOptimiser(
     objective="income",
-    constraints={"volume": {"min": 0.90}},  # retain at least 90% of baseline volume
+    constraints={"volume": {"min_pct": 0.90}},  # retain at least 90% of baseline volume
     quote_id="quote_id",
     scenario_index="scenario_index",
     scenario_value="scenario_value",
@@ -90,10 +90,21 @@ Find the optimal scenario value per individual quote. Each quote independently p
 ```python
 optimiser = pc.OnlineOptimiser(
     objective="income",
-    constraints={"volume": {"min": 0.90}},
+    constraints={
+        "volume": {"min_pct": 0.90},                # sum constraint
+        "loss_ratio": {                              # ratio constraint
+            "numerator":   "incurred",
+            "denominator": "premium",
+            "max":         0.65,
+        },
+    },
 )
 result = optimiser.solve(df)
+print(result.lambdas)            # {'volume': 0.147, 'loss_ratio': 1.21}
+print(result.total_constraints)  # {'volume': 5400.0, 'loss_ratio': 0.6498}
 ```
+
+Both sum and ratio constraints work in all three optimisation modes (online, ratebook, apply) and in the efficient-frontier sweep.
 
 ### Ratebook optimisation
 
@@ -102,7 +113,7 @@ Find optimal rating factors across rating dimensions. Instead of individual scen
 ```python
 optimiser = pc.RatebookOptimiser(
     objective="income",
-    constraints={"volume": {"min": 0.90}},
+    constraints={"volume": {"min_pct": 0.90}},
     factor_columns=[["age_band"], ["region"], ["vehicle_power"]],
 )
 
@@ -133,7 +144,7 @@ lambdas = result.lambdas
 applier = pc.ApplyOptimiser(
     lambdas=lambdas,
     objective="income",
-    constraints={"volume": {"min": 0.90}},
+    constraints={"volume": {"min_pct": 0.90}},
 )
 applier.save("config/applier.json")
 
@@ -169,19 +180,100 @@ print(frontier.points)
 
 Adjacent points are warm-started from each other (nearest-neighbour traversal of the threshold grid), so the full frontier solves much faster than running each point independently. Each point also includes scenario value distribution statistics (`sv_mean`, `sv_std`, percentiles, `sv_pct_increase`/`sv_pct_decrease`).
 
+**Sweeping a ratio target** — declare the constraint with `None` so the constructor doesn't fix it, then supply the range to `frontier()`:
+
+```python
+optimiser = pc.OnlineOptimiser(
+    objective="income",
+    constraints={
+        "loss_ratio": {
+            "numerator":   "incurred",
+            "denominator": "premium",
+            "max":         None,       # frontier supplies the target
+        },
+    },
+)
+frontier = optimiser.frontier(
+    df,
+    threshold_ranges={"loss_ratio": (0.55, 0.75)},
+    n_points_per_dim=10,
+)
+# points["threshold_loss_ratio"] = [0.55, 0.572, ..., 0.75]  (user units, verbatim)
+# points["total_loss_ratio"]     = actual Σ incurred / Σ premium at each optimum
+```
+
+**Mixed sweep** — sweep multiple constraints at once via the cartesian product:
+
+```python
+frontier = optimiser.frontier(
+    df,
+    threshold_ranges={
+        "volume":     (8000, 12000),    # absolute units
+        "loss_ratio": (0.55, 0.75),     # absolute ratio targets
+    },
+    n_points_per_dim=10,
+)
+# 10 × 10 = 100 frontier points
+```
+
+Constraints with numeric thresholds may be omitted from `threshold_ranges` — they are held fixed at the constructor value across the sweep. `None` thresholds *must* have a range entry.
+
 ---
 
 ## Constraint format
 
-Constraints are specified as a dictionary. Keys are column names in your DataFrame, values specify the direction and threshold relative to the baseline (the portfolio totals at scenario_value = 1.0):
+Constraints are specified as a dictionary. There are two shapes:
+
+**Sum constraints** apply to a single column. The dict key is the column name in your DataFrame, the value specifies direction and threshold. Use ``min`` / ``max`` for absolute thresholds and ``min_pct`` / ``max_pct`` for thresholds expressed as a fraction of baseline (the portfolio totals at scenario_value = 1.0):
 
 ```python
 constraints = {
-    "volume": {"min": 0.90},            # portfolio volume >= 90% of baseline
-    "loss_ratio": {"max": 1.05},        # portfolio loss ratio <= 105% of baseline
-    "premium": {"min_abs": 1_000_000},  # absolute: portfolio premium >= 1M
+    "volume":  {"min_pct": 0.90},     # portfolio volume >= 90% of baseline
+    "premium": {"min": 1_000_000},    # absolute: portfolio premium >= 1M
+    "claims":  {"max_pct": 1.05},     # portfolio claims <= 105% of baseline
 }
 ```
+
+**Ratio constraints** apply to a ratio of two summed columns (e.g. loss ratio = `Σ incurred / Σ premium`). The dict key is a display label (does NOT need to be a column); `numerator` and `denominator` name the columns:
+
+```python
+constraints = {
+    "loss_ratio": {
+        "numerator":   "incurred",
+        "denominator": "premium",
+        "max":         0.65,           # portfolio loss ratio <= 0.65
+    },
+    "combined_ratio": {
+        "numerator":   "claims_plus_expenses",
+        "denominator": "premium",
+        "max_pct":     1.10,           # <= 110% of baseline combined ratio
+    },
+}
+```
+
+Internally, ratio constraints are linearised as `Σ (num − L·denom) ≤ 0` and handed to the same Lagrangian solver. Setting `Σ_baseline denom == 0` raises `ValueError` for `_pct` modes (baseline ratio undefined). If `Σ_optimum denom == 0` at the chosen step set, the ratio reported in `total_constraints[label]` and `summary()` is `nan` (sentinel; the divide is undefined, not silently zero).
+
+**`None` thresholds** mark frontier-only constraints — the threshold is supplied by the sweep range:
+
+```python
+constraints = {
+    "loss_ratio": {
+        "numerator":   "incurred",
+        "denominator": "premium",
+        "max":         None,           # frontier supplies the target
+    },
+}
+
+frontier = optimiser.frontier(
+    df,
+    threshold_ranges={"loss_ratio": (0.55, 0.75)},
+    n_points_per_dim=10,
+)
+```
+
+`solve()` rejects `None` thresholds; `frontier()` requires a `threshold_ranges` entry for every `None` constraint. Numeric-threshold constraints are optional in `threshold_ranges` — omitted ones are held fixed at their constructor value across the sweep.
+
+`points["threshold_<name>"]` reports the user-supplied range value verbatim (absolute units for `min`/`max`, fractions of baseline for `min_pct`/`max_pct`); `points["total_<name>"]` reports the actual aggregate at the optimum (the actual ratio for ratio constraints).
 
 ---
 
@@ -267,8 +359,7 @@ The outer loop updates lambdas via the subgradient method with adaptive step siz
 The Rust core uses:
 
 - **Quote-major memory layout** - each quote's M scenario values are contiguous, optimising the per-quote argmax inner loop for cache locality
-- **Rayon parallelism** - the argmax across quotes is parallelised within chunks of 4096 quotes
-- **Chunked processing** - large portfolios are processed in chunks (default 500K quotes) to bound memory usage
+- **Rayon parallelism** - the argmax across quotes is parallelised in grain sizes of 4096 quotes
 - **Adaptive step scaling** - per-constraint scale factors normalise for differing magnitudes, so the algorithm works equally well for constraints ranging from 0.1 to 1,000,000
 - **Lambda averaging** - smooths the oscillations inherent in discrete Lagrangian relaxation where all quotes can flip simultaneously
 
@@ -306,11 +397,13 @@ price-contour/
 │           └── parquet_grid_py.rs # Parquet → QuoteGrid loader
 ├── python/
 │   └── price_contour/
-│       ├── solver.py              # OnlineOptimiser
+│       ├── solver.py              # OnlineOptimiser, ratio linearisation, validation
 │       ├── ratebook.py            # RatebookOptimiser + RatebookResult
 │       ├── apply.py               # ApplyOptimiser + apply_from_grid
 │       ├── frontier.py            # FrontierResult helpers + frontier_summary
-│       └── builder.py             # QuoteGridBuilder wrapper
+│       ├── builder.py             # QuoteGridBuilder wrapper
+│       ├── _ratio_results.py      # Shared ratio reporting (actual ratios + column stitching)
+│       └── _frontier_helpers.py   # Shared frontier orchestrator (used by online + ratebook)
 ├── tests/
 │   └── python/                    # Integration tests
 ├── notebooks/                     # Demo notebooks
@@ -353,8 +446,8 @@ maturin develop
 
 | Method | Description |
 |---|---|
-| `solve(df_or_grid, *, lambdas=None)` | Run full optimisation. Returns `SolveResult`. |
-| `frontier(df_or_grid, *, threshold_ranges, n_points_per_dim=10, initial_lambdas=None)` | Sweep the efficient frontier. Returns `FrontierResult`. |
+| `solve(df_or_grid, *, lambdas=None)` | Run full optimisation. Returns `SolveResult`. Ratio constraints require a DataFrame (the linearisation needs raw numerator/denominator columns); a pre-built `QuoteGrid` with ratio constraints raises `ValueError`. |
+| `frontier(df_or_grid, *, threshold_ranges, n_points_per_dim=10, initial_lambdas=None)` | Sweep the efficient frontier. Returns `FrontierResult`. Numeric thresholds are optional in `threshold_ranges` (held fixed if omitted); `None` thresholds require a range. |
 | `summary(result)` | Package result into MLflow-ready `params`, `metrics`, `artifacts` dicts. |
 | `config_dict()` | Serialisable solver configuration. |
 
@@ -370,9 +463,9 @@ maturin develop
 
 | Method | Description |
 |---|---|
-| `apply(df)` | Single-pass scoring with fixed lambdas. Returns `ApplyResult`. |
-| `save(path)` | Save config + lambdas to JSON. |
-| `ApplyOptimiser.load(path)` | Load from saved JSON. |
+| `apply(df)` | Single-pass scoring with fixed lambdas. Returns `ApplyResult`. For ratio constraints, `min_pct`/`max_pct` resolve `L = pct × baseline_LR` from the **apply-time** DataFrame (live-scoring contract), not the solve-time baseline. |
+| `save(path)` | Save config + lambdas to JSON. Ratio specs round-trip verbatim. |
+| `ApplyOptimiser.load(path)` | Load from saved JSON. Rejects unknown keys. |
 
 ### QuoteGridBuilder
 
@@ -438,8 +531,8 @@ maturin develop
 
 | Function | Description |
 |---|---|
-| `build_grid_from_parquet(path, *, constraint_columns, ...)` | Build a `QuoteGrid` directly from a Parquet file without materialising a DataFrame in Python. |
-| `apply_from_grid(grid, lambdas, constraints, *, chunk_size=500_000)` | Single-pass Lagrangian apply on an existing `QuoteGrid`. Returns `ApplyResult`. |
+| `build_grid_from_parquet(path, *, constraint_columns, ...)` | Build a `QuoteGrid` directly from a Parquet file without materialising a DataFrame in Python. Sum constraints only — ratio constraints require a DataFrame. |
+| `apply_from_grid(grid, lambdas, constraints)` | Single-pass Lagrangian apply on an existing `QuoteGrid`. Returns `ApplyResult`. Sum constraints only; ratio constraints raise `ValueError` (use `ApplyOptimiser.apply(df)` on a DataFrame instead — the grid path can't carry numerator/denominator columns for linearisation). |
 | `frontier_summary(frontier_result, selected_index)` | Package a frontier result into MLflow-ready `params`, `metrics`, `artifacts` dicts. |
 
 ---

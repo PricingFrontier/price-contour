@@ -13,6 +13,15 @@ from price_contour._price_contour import (
     apply_lambdas_py,
 )
 from price_contour.builder import QuoteGrid
+from price_contour.solver import (
+    _RatioApplyResultWrapper,
+    _linearise_ratio_constraints,
+    _none_threshold_constraints,
+    _ratio_constraint_names,
+    _reject_ratio_for_grid,
+    _validate_constraint_dict,
+    _validate_dataframe,
+)
 
 
 class ApplyOptimiser:
@@ -31,9 +40,6 @@ class ApplyOptimiser:
         Constraint specifications (same format as OnlineOptimiser).
     quote_id, scenario_index, scenario_value : str
         Column name overrides.
-    chunk_size : int
-        Deprecated: no longer used by the solver. Retained for API
-        compatibility. Internal parallelism is managed by rayon grain sizes.
     """
 
     def __init__(
@@ -45,26 +51,35 @@ class ApplyOptimiser:
         quote_id: str = "quote_id",
         scenario_index: str = "scenario_index",
         scenario_value: str = "scenario_value",
-        chunk_size: int = 500_000,
     ) -> None:
         self.lambdas = lambdas
         self.objective = objective
-        self.constraints = constraints or {}
+        self.constraints = {} if constraints is None else constraints
         self.quote_id = quote_id
         self.scenario_index = scenario_index
         self.scenario_value = scenario_value
-        self.chunk_size = chunk_size
         _validate_constraint_dict(self.constraints)
+        # Apply mode runs a fixed forward pass with a known threshold per
+        # constraint, so a ``None`` threshold has no meaning here. (Online
+        # and Ratebook accept None as a frontier-only marker; Apply doesn't
+        # have a frontier, so reject at construction with an apply-specific
+        # message that points at the only valid use.)
+        none_names = _none_threshold_constraints(self.constraints)
+        if none_names:
+            raise ValueError(
+                f"ApplyOptimiser does not support None thresholds; apply "
+                f"mode requires a fixed threshold per constraint. "
+                f"Offending constraint: '{none_names[0]}'."
+            )
         if self.lambdas:
             lambda_keys = set(self.lambdas.keys())
             constraint_keys = set(self.constraints.keys())
             extra = lambda_keys - constraint_keys
             if extra:
-                import warnings
-
-                warnings.warn(
-                    f"Lambda keys {extra} do not match any constraint. "
-                    f"They will be ignored."
+                raise ValueError(
+                    f"Lambda keys {sorted(extra)} do not match any "
+                    f"constraint. Valid constraint keys are "
+                    f"{sorted(constraint_keys)}."
                 )
 
     def apply(self, df: pl.DataFrame) -> ApplyResult:
@@ -83,6 +98,10 @@ class ApplyOptimiser:
         """
         if not isinstance(df, pl.DataFrame):
             raise TypeError(f"Expected pl.DataFrame, got {type(df).__name__}")
+        # DataFrame schema validation runs BEFORE the linearisation so
+        # that missing/null numerator/denominator columns surface the
+        # precise schema error naming the column and the constraint
+        # label, rather than crashing inside the linearisation expression.
         _validate_dataframe(
             df,
             quote_id=self.quote_id,
@@ -90,7 +109,51 @@ class ApplyOptimiser:
             scenario_value=self.scenario_value,
             objective=self.objective,
             constraint_cols=list(self.constraints.keys()),
+            constraints=self.constraints,
         )
+        # Ratio-constraint path (C6). Apply runs a fixed forward pass with
+        # stored lambdas; we linearise each ratio spec at apply time using
+        # the apply-time DataFrame's baseline LR (``min_pct`` / ``max_pct``
+        # are anchored on the scoring-time data, not on a frozen solve-time
+        # baseline). The synthetic linearised column is materialised on a
+        # working copy of the apply-time DataFrame; the existing Rust
+        # ``apply_lambdas_py`` runs with the linearised sum-shape
+        # constraints; the wrapper stitches ``optimal_<num>`` /
+        # ``optimal_<denom>`` onto the result and re-reports actual
+        # ratios in ``total_constraints`` / ``baseline_constraints``.
+        # Sum-only constraint dicts skip the linearisation entirely so
+        # the existing fast path is preserved bit-for-bit.
+        ratio_names = _ratio_constraint_names(self.constraints)
+        if ratio_names:
+            (
+                modified_df,
+                sum_constraints,
+                _grid_cols,
+                ratio_columns,
+                _threshold_shift,
+            ) = _linearise_ratio_constraints(
+                df,
+                self.constraints,
+                scenario_value_col=self.scenario_value,
+                quote_id_col=self.quote_id,
+            )
+            inner_result = apply_lambdas_py(
+                modified_df,
+                lambdas=self.lambdas,
+                quote_id=self.quote_id,
+                scenario_index=self.scenario_index,
+                scenario_value=self.scenario_value,
+                objective=self.objective,
+                constraints=sum_constraints,
+            )
+            return _RatioApplyResultWrapper(
+                inner_result,
+                original_df=df,
+                ratio_columns=ratio_columns,
+                quote_id=self.quote_id,
+                scenario_index=self.scenario_index,
+                scenario_value=self.scenario_value,
+            )
         return apply_lambdas_py(
             df,
             lambdas=self.lambdas,
@@ -99,7 +162,6 @@ class ApplyOptimiser:
             scenario_value=self.scenario_value,
             objective=self.objective,
             constraints=self.constraints,
-            chunk_size=self.chunk_size,
         )
 
     def save(self, path: str | Path) -> None:
@@ -120,7 +182,6 @@ class ApplyOptimiser:
             "quote_id": self.quote_id,
             "scenario_index": self.scenario_index,
             "scenario_value": self.scenario_value,
-            "chunk_size": self.chunk_size,
         }
         path.write_text(json.dumps(config, indent=2))
 
@@ -151,6 +212,23 @@ class ApplyOptimiser:
                 f"Config file version {version} is not supported by this "
                 f"version of price-contour (max supported: 1)"
             )
+        # Allowlist for known keys; unknown keys indicate either a
+        # corrupted file, a future-version config, or a hand-edited
+        # mistake — surface those rather than silently ignoring.
+        known_keys = {
+            "version",
+            "lambdas",
+            "objective",
+            "constraints",
+            "quote_id",
+            "scenario_index",
+            "scenario_value",
+        }
+        extras = set(config.keys()) - known_keys
+        if extras:
+            raise ValueError(
+                f"unknown keys in saved config: {sorted(extras)}"
+            )
         return cls(
             lambdas=config["lambdas"],
             objective=config.get("objective", "expected_income"),
@@ -158,7 +236,6 @@ class ApplyOptimiser:
             quote_id=config.get("quote_id", "quote_id"),
             scenario_index=config.get("scenario_index", "scenario_index"),
             scenario_value=config.get("scenario_value", "scenario_value"),
-            chunk_size=config.get("chunk_size", 500_000),
         )
 
 
@@ -166,7 +243,6 @@ def apply_from_grid(
     grid: QuoteGrid,
     lambdas: dict[str, float],
     constraints: dict[str, dict[str, float]],
-    chunk_size: int = 500_000,
 ) -> ApplyResult:
     """Single-pass Lagrangian apply on an existing QuoteGrid.
 
@@ -184,8 +260,6 @@ def apply_from_grid(
         Fixed Lagrange multipliers keyed by constraint name.
     constraints : dict[str, dict[str, float]]
         Constraint specifications (same format as ``OnlineOptimiser``).
-    chunk_size : int
-        Quotes per parallel chunk.
 
     Returns
     -------
@@ -194,52 +268,27 @@ def apply_from_grid(
         ``.baseline_objective``, ``.baseline_constraints``, ``.lambdas``,
         ``.dataframe``.
     """
-    return apply_from_grid_py(grid, lambdas, constraints, chunk_size)
-
-
-def _validate_constraint_dict(
-    constraints: dict[str, dict[str, float]],
-) -> None:
-    """Validate constraint specification dict structure and values."""
-    valid_keys = {"min", "max", "min_abs", "max_abs"}
-    for name, spec in constraints.items():
-        if not isinstance(spec, dict):
-            raise ValueError(
-                f"Constraint '{name}' value must be a dict, got {type(spec).__name__}"
-            )
-        if len(spec) != 1:
-            raise ValueError(
-                f"Constraint '{name}' must have exactly one key from "
-                f"{valid_keys}, got {set(spec.keys())}"
-            )
-        key = next(iter(spec))
-        if key not in valid_keys:
-            raise ValueError(
-                f"Constraint '{name}' has invalid key '{key}'. "
-                f"Must be one of: {valid_keys}"
-            )
-        value = spec[key]
-        if not isinstance(value, (int, float)):
-            raise ValueError(
-                f"Constraint '{name}' value for '{key}' must be numeric, "
-                f"got {type(value).__name__}"
-            )
-
-
-def _validate_dataframe(
-    df: pl.DataFrame,
-    *,
-    quote_id: str,
-    scenario_index: str,
-    scenario_value: str,
-    objective: str,
-    constraint_cols: list[str],
-) -> None:
-    """Validate DataFrame schema before passing to Rust layer."""
-    required = [quote_id, scenario_index, scenario_value, objective] + constraint_cols
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-    for col_name in [objective] + constraint_cols:
-        if df[col_name].null_count() > 0:
-            raise ValueError(f"Column '{col_name}' contains null values")
+    # Mirror ``ApplyOptimiser.__init__``'s rejection: apply mode runs a
+    # fixed forward pass with a known threshold per constraint, so a
+    # ``None`` threshold has no meaning. The Rust backstop in
+    # ``apply_from_grid_py`` would also reject, but with the generic
+    # ``solve()``/``frontier()`` wording — surface the apply-specific
+    # message here so the user-facing error names the actual mode.
+    none_names = _none_threshold_constraints(constraints)
+    if none_names:
+        raise ValueError(
+            f"ApplyOptimiser does not support None thresholds; apply "
+            f"mode requires a fixed threshold per constraint. "
+            f"Offending constraint: '{none_names[0]}'."
+        )
+    # Pre-built grid path: the linearisation needs raw numerator /
+    # denominator columns at apply time, but a frozen QuoteGrid does
+    # NOT carry them — they'd have had to be added at grid build time
+    # and even then the apply-time baseline LR for ``min_pct`` /
+    # ``max_pct`` cannot be recovered from the opaque grid. Mirror the
+    # solve_from_grid / frontier wording so the entry-point story is
+    # consistent across modes. We raise ``ValueError`` (NOT
+    # ``NotImplementedError`` — the feature is available, just not via
+    # this entry point) and point the user at the DataFrame-shape apply.
+    _reject_ratio_for_grid(constraints, mode="apply")
+    return apply_from_grid_py(grid, lambdas, constraints)

@@ -243,11 +243,6 @@ pub fn solve_grouped(
             "candidates must not be empty".into(),
         ));
     }
-    if config.chunk_size == 0 {
-        return Err(PriceContourError::InvalidValue(
-            "chunk_size must be > 0".into(),
-        ));
-    }
 
     let n_quotes = grid.n_quotes;
     let n_constraints = specs.len();
@@ -312,7 +307,12 @@ pub fn solve_grouped(
         total_constraints = iter_cons;
 
         // Check constraint satisfaction
-        let all_satisfied = all_constraints_satisfied(specs, &total_constraints, config.tolerance);
+        let all_satisfied = all_constraints_satisfied(
+            specs,
+            &total_constraints,
+            &baseline_cons,
+            config.tolerance,
+        );
 
         if all_satisfied && total_objective > best_feasible_obj {
             best_feasible_obj = total_objective;
@@ -337,6 +337,7 @@ pub fn solve_grouped(
             &mut lambdas,
             specs,
             &total_constraints,
+            &baseline_cons,
             &scale_factors,
             iter,
         );

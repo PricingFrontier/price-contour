@@ -19,6 +19,26 @@ from price_contour._price_contour import (
     solve_grouped_py,
     update_multipliers_py,
 )
+from price_contour._frontier_helpers import (
+    _cartesian_product,
+    _linspace,
+)
+from price_contour._ratio_results import (
+    _safe_ratio_from_columns,
+    _stitch_optimal_ratio_columns,
+)
+from price_contour.solver import (
+    _is_ratio_spec,
+    _linearise_ratio_constraints,
+    _override_thresholds,
+    _ratio_constraint_names,
+    _reject_none_for_solve,
+    _reject_ratio_for_grid,
+    _spec_numeric_threshold,
+    _spec_threshold_is_none,
+    _validate_constraint_dict,
+    _validate_dataframe,
+)
 
 
 @dataclass
@@ -62,6 +82,14 @@ class RatebookResult:
             "constraints": dict(self.total_constraints.items())
             if isinstance(self.total_constraints, dict)
             else {},
+            "baseline_constraints": dict(self.baseline_constraints.items())
+            if isinstance(self.baseline_constraints, dict)
+            else {},
+            "total_objective": self.total_objective,
+            "baseline_objective": self.baseline_objective,
+            "cd_iterations": self.cd_iterations,
+            "converged": self.converged,
+            "clamp_rate": self.clamp_rate,
             "factor_order": factor_order,
         }
         (path / "config.json").write_text(json.dumps(config, indent=2))
@@ -125,8 +153,18 @@ class RatebookResult:
             raise FileNotFoundError(f"Config file not found: {config_path}")
         config = json.loads(config_path.read_text())
 
-        factor_tables = {}
-        factor_order = config.get("factor_order", config.get("factors", []))
+        def _required(key: str) -> Any:
+            if key not in config:
+                raise ValueError(
+                    f"missing required field '{key}' in saved RatebookResult"
+                )
+            return config[key]
+
+        factor_tables: dict[str, dict[str, float]] = {}
+        # ``factor_order`` is required (the on-disk shape always writes it
+        # via :meth:`save`); the ``"factors"`` fallback was a transitional
+        # alias and is no longer supported.
+        factor_order = _required("factor_order")
         for factor_name in factor_order:
             filename = factor_name.replace(":", "_") + ".json"
             factor_path = path / filename
@@ -136,14 +174,14 @@ class RatebookResult:
 
         return cls(
             factor_tables=factor_tables,
-            lambdas=config.get("lambdas", {}),
-            total_objective=config.get("total_objective", 0.0),
-            total_constraints=config.get("constraints", {}),
-            baseline_objective=config.get("baseline_objective", 0.0),
-            baseline_constraints=config.get("baseline_constraints", {}),
-            converged=config.get("converged", False),
-            cd_iterations=config.get("cd_iterations", 0),
-            clamp_rate=config.get("clamp_rate", 0.0),
+            lambdas=_required("lambdas"),
+            total_objective=_required("total_objective"),
+            total_constraints=_required("constraints"),
+            baseline_objective=_required("baseline_objective"),
+            baseline_constraints=_required("baseline_constraints"),
+            converged=_required("converged"),
+            cd_iterations=_required("cd_iterations"),
+            clamp_rate=_required("clamp_rate"),
             per_factor_results=[],
         )
 
@@ -175,8 +213,6 @@ class RatebookOptimiser:
         CD convergence tolerance (max factor value change).
     max_iter : int
         Maximum Lagrangian iterations per inner solve.
-    chunk_size : int
-        Quotes per chunk for inner solver.
     tolerance : float
         Lagrangian convergence tolerance.
     """
@@ -196,11 +232,10 @@ class RatebookOptimiser:
         max_cd_iterations: int = 3,
         cd_tolerance: float = 1e-3,
         max_iter: int = 50,
-        chunk_size: int = 500_000,
         tolerance: float = 1e-5,
     ) -> None:
         self.objective = objective
-        self.constraints = constraints or {}
+        self.constraints = {} if constraints is None else constraints
         self.quote_id = quote_id
         self.scenario_index = scenario_index
         self.scenario_value = scenario_value
@@ -211,8 +246,8 @@ class RatebookOptimiser:
         self.max_cd_iterations = max_cd_iterations
         self.cd_tolerance = cd_tolerance
         self.max_iter = max_iter
-        self.chunk_size = chunk_size
         self.tolerance = tolerance
+        _validate_constraint_dict(self.constraints)
 
     def _build_candidates(self) -> list[float]:
         """Build the evenly-spaced candidate factor values."""
@@ -258,6 +293,25 @@ class RatebookOptimiser:
             else self.constraints
         )
 
+        # ``None`` thresholds are frontier-only markers (B1). Reject before
+        # any work so the user sees a clear, named-constraint message that
+        # mentions ``frontier()``. We check ``constraints`` (not
+        # ``self.constraints``) so the frontier path that passes a fully
+        # numeric ``_constraints_override`` is not blocked by a None left
+        # on the parent optimiser.
+        _reject_none_for_solve(constraints)
+
+        # Detect ratio constraints. The ratebook supports ratio constraints
+        # by linearising each ratio per (quote x scenario) into a synthetic
+        # sum constraint (same recipe as the online solver). The
+        # linearisation requires the raw numerator / denominator columns
+        # at solve time, so a ratio constraint paired with a pre-built
+        # QuoteGrid is a setup-time error (mirrors the online solver's
+        # rejection wording via the shared helper).
+        ratio_names = _ratio_constraint_names(constraints)
+        if ratio_names and not isinstance(df_or_grid, pl.DataFrame):
+            _reject_ratio_for_grid(constraints, mode="solve")
+
         factor_specs = factor_columns or self.factor_columns
         if factor_specs is None:
             factor_specs = self._discover_structure(df_or_grid, factors)
@@ -283,18 +337,63 @@ class RatebookOptimiser:
                         f"Available: {list(factors.columns)}"
                     )
 
-        # Build grid if needed
-        if isinstance(df_or_grid, pl.DataFrame):
-            grid = build_grid(
+        # When ratio constraints are present, validate the DataFrame
+        # schema (existence + non-null + non-NaN of numerator /
+        # denominator columns) BEFORE linearisation so missing columns
+        # surface a precise schema error rather than failing inside the
+        # Polars expression. Mirrors OnlineOptimiser.solve()'s ordering.
+        if ratio_names and isinstance(df_or_grid, pl.DataFrame):
+            _validate_dataframe(
                 df_or_grid,
-                constraint_columns=list(constraints.keys()),
+                quote_id=self.quote_id,
+                scenario_index=self.scenario_index,
+                scenario_value=self.scenario_value,
+                objective=self.objective,
+                constraint_cols=list(constraints.keys()),
+                constraints=constraints,
+            )
+
+        # Linearise ratio specs. ``original_df`` is preserved so the
+        # post-CD ratio reporting can recover ``Sigma_baseline num`` /
+        # ``Sigma_baseline denom`` and stitch ``optimal_<num>`` /
+        # ``optimal_<denom>`` columns onto the last grouped result.
+        # Sum-only constraint dicts skip the linearisation pass entirely
+        # so the existing fast path is preserved bit-for-bit.
+        original_df = df_or_grid if isinstance(df_or_grid, pl.DataFrame) else None
+        ratio_columns: list[tuple[str, str, str]] = []
+        if ratio_names and original_df is not None:
+            (
+                modified_df,
+                sum_constraints,
+                _grid_cols,
+                ratio_columns,
+                _threshold_shift,
+            ) = _linearise_ratio_constraints(
+                original_df,
+                constraints,
+                scenario_value_col=self.scenario_value,
+                quote_id_col=self.quote_id,
+            )
+            grid_input: pl.DataFrame | QuoteGrid = modified_df
+            cd_constraints: dict[str, dict[str, float]] = sum_constraints
+        else:
+            grid_input = df_or_grid
+            cd_constraints = constraints
+
+        # Build grid if needed. ``cd_constraints`` carries only sum-shape
+        # specs at this point (any ratio specs have been rewritten into
+        # synthetic sum specs whose key is the linearised column name).
+        if isinstance(grid_input, pl.DataFrame):
+            grid = build_grid(
+                grid_input,
+                constraint_columns=list(cd_constraints.keys()),
                 quote_id=self.quote_id,
                 scenario_index=self.scenario_index,
                 scenario_value=self.scenario_value,
                 objective=self.objective,
             )
         else:
-            grid = df_or_grid
+            grid = grid_input
 
         n_quotes = grid.n_quotes
 
@@ -342,9 +441,8 @@ class RatebookOptimiser:
                     group_labels=labels,
                     residuals=residuals,
                     candidates=candidates,
-                    constraints=constraints if constraints else None,
+                    constraints=cd_constraints if cd_constraints else None,
                     max_iter=self.max_iter,
-                    chunk_size=self.chunk_size,
                     tolerance=self.tolerance,
                     lambdas=last_lambdas,
                 )
@@ -387,13 +485,51 @@ class RatebookOptimiser:
             else 0.0
         )
 
+        # C5 (carries C3 reporting through to ratebook): each ratio
+        # label's ``total_constraints`` / ``baseline_constraints`` entry
+        # reports the **actual** ratio at the optimum / baseline rather
+        # than the linearised total. We recompute these from the original
+        # DataFrame at the last grouped result's optimal steps; sum
+        # entries pass through unchanged. ``RatebookResult`` is a
+        # Python-side dataclass so we populate the dicts directly here
+        # instead of wrapping a Rust object (no ``_RatioSolveResultWrapper``
+        # equivalent needed — it would only delegate ``__getattr__`` to
+        # fields the dataclass already owns).
+        total_constraints = dict(last.total_constraints) if last else {}
+        baseline_constraints = dict(last.baseline_constraints) if last else {}
+        if ratio_columns and original_df is not None and last is not None:
+            # Actual ratio at optimum: stitch ``optimal_<num>`` /
+            # ``optimal_<denom>`` columns onto the last grouped result's
+            # dataframe via a join on ``(quote_id, optimal_step)``, then
+            # sum and divide.
+            optimum_df = _stitch_optimal_ratio_columns(
+                base_df=last.dataframe,
+                original_df=original_df,
+                ratio_columns=ratio_columns,
+                quote_id_col=self.quote_id,
+                scenario_index_col=self.scenario_index,
+            )
+            for label, num_col, denom_col in ratio_columns:
+                total_constraints[label] = _safe_ratio_from_columns(
+                    optimum_df, f"optimal_{num_col}", f"optimal_{denom_col}"
+                )
+            # Actual baseline ratio: ``Sigma_baseline num / Sigma_baseline
+            # denom`` from rows where ``scenario_value == 1.0``.
+            baseline_slice = original_df.filter(
+                pl.col(self.scenario_value) == 1.0
+            )
+            for label, num_col, denom_col in ratio_columns:
+                baseline_constraints[label] = _safe_ratio_from_columns(
+                    baseline_slice, num_col, denom_col
+                )
+
         return RatebookResult(
             factor_tables=named_tables,
             lambdas=last.lambdas if last else {},
             total_objective=last.total_objective if last else 0.0,
-            total_constraints=last.total_constraints if last else {},
+            total_constraints=total_constraints,
             baseline_objective=last.baseline_objective if last else 0.0,
-            baseline_constraints=last.baseline_constraints if last else {},
+            baseline_constraints=baseline_constraints,
             cd_iterations=cd_iter,
             converged=cd_converged,
             clamp_rate=avg_clamp,
@@ -453,14 +589,13 @@ class RatebookOptimiser:
         selected = [col for col, lift in lifts if lift > 0.0]
 
         if not selected:
-            # Fallback: use all columns
-            import warnings
-
-            warnings.warn(
-                "No factor column showed positive objective lift. "
-                "Using all columns as factors."
+            screened = [col for col, _ in lifts]
+            raise ValueError(
+                f"No factor column showed positive objective lift. "
+                f"Screened columns: {screened}. Supply "
+                f"`factor_columns` explicitly or revisit the factors "
+                f"DataFrame — auto-discovery cannot pick a default."
             )
-            selected = list(factors.columns)
 
         return [[col] for col in selected]
 
@@ -489,8 +624,9 @@ class RatebookOptimiser:
         factors : pl.DataFrame
             Per-quote factors DataFrame (same as ``solve``).
         threshold_ranges : dict[str, tuple[float, float]]
-            Per-constraint (lo, hi) range. For relative constraints
-            (min/max), these are fractions of baseline.
+            Per-constraint (lo, hi) range. Units follow the constraint key:
+            absolute for ``min`` / ``max``; fractions of baseline for
+            ``min_pct`` / ``max_pct``.
         n_points_per_dim : int
             Number of points per constraint dimension. Default 5
             (lower than online frontier because each point is a full CD).
@@ -508,11 +644,82 @@ class RatebookOptimiser:
         FrontierResult
             Result with ``.points`` (DataFrame) and ``.n_points``.
         """
-        # Build grid once for all frontier points
-        if isinstance(df_or_grid, pl.DataFrame):
+        constraint_names = list(self.constraints.keys())
+        if not constraint_names:
+            raise ValueError("frontier requires at least one constraint")
+
+        # D1 contract: a ``None`` threshold MUST have a
+        # ``threshold_ranges`` entry (B1 marker rule preserved); a
+        # numeric threshold may omit its range (held fixed at the
+        # constructor value across every frontier point). Validate
+        # None-without-range first so the error message matches the B1
+        # wording. Fires BEFORE any grid build / linearisation so the
+        # user sees the failure mode immediately on dispatch.
+        for name in constraint_names:
+            if name in threshold_ranges:
+                continue
+            if _spec_threshold_is_none(self.constraints[name]):
+                raise ValueError(
+                    f"No threshold_range for constraint '{name}'. "
+                    f"Available: {list(threshold_ranges.keys())}"
+                )
+
+        swept_names = [n for n in constraint_names if n in threshold_ranges]
+        if not swept_names:
+            raise ValueError(
+                "No threshold_range entries supplied — frontier "
+                "requires at least one threshold_ranges entry"
+            )
+
+        # Per-axis reporting value for unswept constraints — the
+        # constructor threshold echoed verbatim into ``threshold_<name>``
+        # (user units: absolute for ``min`` / ``max``, fractional for
+        # ``min_pct`` / ``max_pct``).
+        unswept_thresholds = {
+            name: _spec_numeric_threshold(self.constraints[name])
+            for name in constraint_names
+            if name not in threshold_ranges
+        }
+
+        # Detect ratio constraints up front. When any are present we
+        # CANNOT pre-build the grid: each point's linearisation needs a
+        # per-point threshold ``L`` and materialises a new synthetic
+        # column. Pass the raw DataFrame through to ``solve()`` per
+        # point and let the linearisation run there. Sum-only constraint
+        # dicts keep the existing pre-built-grid fast path.
+        ratio_names = _ratio_constraint_names(self.constraints)
+        if ratio_names and not isinstance(df_or_grid, pl.DataFrame):
+            _reject_ratio_for_grid(self.constraints, mode="frontier")
+
+        if ratio_names:
+            # Validate the input DataFrame schema once. Per-point
+            # linearisation re-runs cheap pre-flight checks but a
+            # missing numerator / denominator column should surface here
+            # before any sweep work.
+            assert isinstance(df_or_grid, pl.DataFrame)
+            _validate_dataframe(
+                df_or_grid,
+                quote_id=self.quote_id,
+                scenario_index=self.scenario_index,
+                scenario_value=self.scenario_value,
+                objective=self.objective,
+                constraint_cols=list(self.constraints.keys()),
+                constraints=self.constraints,
+            )
+            grid: pl.DataFrame | QuoteGrid = df_or_grid
+        elif isinstance(df_or_grid, pl.DataFrame):
+            # The grid build needs every sum-constraint column
+            # (including unswept axes — they're enforced at the
+            # constructor value at every point). Ratio "constraints"
+            # use display labels rather than columns and are excluded.
+            sum_constraint_cols = [
+                c
+                for c in constraint_names
+                if not _is_ratio_spec(self.constraints[c])
+            ]
             grid = build_grid(
                 df_or_grid,
-                constraint_columns=list(self.constraints.keys()),
+                constraint_columns=sum_constraint_cols,
                 quote_id=self.quote_id,
                 scenario_index=self.scenario_index,
                 scenario_value=self.scenario_value,
@@ -521,32 +728,15 @@ class RatebookOptimiser:
         else:
             grid = df_or_grid
 
-        constraint_names = list(self.constraints.keys())
-        if not constraint_names:
-            raise ValueError("frontier requires at least one constraint")
-
-        # Validate threshold_ranges keys match constraints
-        for name in constraint_names:
-            if name not in threshold_ranges:
-                raise ValueError(
-                    f"No threshold_range for constraint '{name}'. "
-                    f"Available: {list(threshold_ranges.keys())}"
-                )
-
-        # Generate threshold grid
-        dim_grids = []
-        for name in constraint_names:
-            lo, hi = threshold_ranges[name]
-            n = n_points_per_dim
-            if n <= 1:
-                dim_grids.append([lo])
-            else:
-                dim_grids.append([lo + (hi - lo) * i / (n - 1) for i in range(n)])
-
-        # Cartesian product
-        combos: list[list[float]] = [[]]
-        for dim in dim_grids:
-            combos = [existing + [val] for existing in combos for val in dim]
+        # Generate threshold grid for the swept axes only via the shared
+        # ``_linspace`` / ``_cartesian_product`` helpers; unswept axes
+        # contribute one fixed value (the constructor threshold) to
+        # every output row but do not multiply the combo count.
+        dim_grids = [
+            _linspace(float(threshold_ranges[name][0]), float(threshold_ranges[name][1]), n_points_per_dim)
+            for name in swept_names
+        ]
+        combos = _cartesian_product(dim_grids)
 
         if not combos:
             raise ValueError("Empty threshold grid")
@@ -558,8 +748,11 @@ class RatebookOptimiser:
                 f"Reduce n_points_per_dim or increase max_total_points."
             )
 
-        # Nearest-neighbour ordering for warm-start efficiency
-        order = _nn_order(combos, [threshold_ranges[n] for n in constraint_names])
+        # Nearest-neighbour ordering for warm-start efficiency. The
+        # ranges fed to ``_nn_order`` mirror the swept axes only — the
+        # unswept axes are constant and would contribute zero distance,
+        # so omitting them is equivalent to including them.
+        order = _nn_order(combos, [threshold_ranges[n] for n in swept_names])
 
         # Sweep
         prev_lambdas = initial_lambdas
@@ -568,19 +761,17 @@ class RatebookOptimiser:
         for idx in order:
             thresholds = combos[idx]
 
-            # Build modified constraints with this point's thresholds
-            modified_constraints = {}
-            for k, name in enumerate(constraint_names):
-                spec = self.constraints[name]
-                # Replace the threshold value, keeping direction
-                if "min" in spec:
-                    modified_constraints[name] = {"min": thresholds[k]}
-                elif "max" in spec:
-                    modified_constraints[name] = {"max": thresholds[k]}
-                elif "min_abs" in spec:
-                    modified_constraints[name] = {"min_abs": thresholds[k]}
-                elif "max_abs" in spec:
-                    modified_constraints[name] = {"max_abs": thresholds[k]}
+            # Build per-point constraint dict by overriding only the
+            # swept axes' threshold values. Unswept axes copy their
+            # constructor spec verbatim so the inner solve enforces
+            # them at the constructor value at every point. Reuses the
+            # C4 helper so ratio specs preserve ``numerator`` /
+            # ``denominator`` and the direction key (``max_pct`` stays
+            # ``max_pct`` so the C2 linearisation scales by baseline_LR
+            # internally per point).
+            modified_constraints = _override_thresholds(
+                self.constraints, list(thresholds), swept_names
+            )
 
             result = self.solve(
                 grid,
@@ -610,10 +801,21 @@ class RatebookOptimiser:
         # Sort back to original (cartesian product) order
         points.sort(key=lambda x: x[0])
 
-        # Build a Polars DataFrame matching the FrontierResult.points format
+        # Build a Polars DataFrame matching the FrontierResult.points
+        # format. Threshold columns: swept axes echo per-point combo
+        # values; unswept axes echo the constructor threshold verbatim
+        # at every row.
         columns: dict[str, list[Any]] = {}
-        for k, name in enumerate(constraint_names):
-            columns[f"threshold_{name}"] = [p[1]["thresholds"][k] for p in points]
+        swept_index = {name: idx for idx, name in enumerate(swept_names)}
+        for name in constraint_names:
+            if name in swept_index:
+                k = swept_index[name]
+                columns[f"threshold_{name}"] = [
+                    p[1]["thresholds"][k] for p in points
+                ]
+            else:
+                fixed_val = unswept_thresholds[name]
+                columns[f"threshold_{name}"] = [fixed_val for _ in points]
 
         columns["total_objective"] = [p[1]["total_objective"] for p in points]
 

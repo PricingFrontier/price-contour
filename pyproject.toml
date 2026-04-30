@@ -21,6 +21,9 @@ dev = [
     "hypothesis>=6.0",
     "pre-commit>=4.0",
 ]
+test = [
+    "scipy>=1.10",
+]
 
 [tool.maturin]
 manifest-path = "crates/price-contour/Cargo.toml"
@@ -43,4 +46,7 @@ dev = [
     "maturin>=1.12.4",
     "nbclient>=0.10.4",
     "pytest>=9.0.2",
+]
+test = [
+    "scipy>=1.10",
 ]

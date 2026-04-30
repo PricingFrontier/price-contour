@@ -120,7 +120,7 @@ class TestImpossibleConstraints:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 2.0}},
+            constraints={"volume": {"min_pct": 2.0}},
             max_iter=50,
         )
         result = solver.solve(df)
@@ -135,7 +135,7 @@ class TestImpossibleConstraints:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"loss_ratio": {"max": 0.01}},
+            constraints={"loss_ratio": {"max_pct": 0.01}},
             max_iter=50,
         )
         result = solver.solve(df)
@@ -151,8 +151,8 @@ class TestImpossibleConstraints:
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.99},
-                "loss_ratio": {"max": 0.90},
+                "volume": {"min_pct": 0.99},
+                "loss_ratio": {"max_pct": 0.90},
             },
             max_iter=50,
         )
@@ -170,7 +170,7 @@ class TestImpossibleConstraints:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"max": 1.0}},
+            constraints={"volume": {"max_pct": 1.0}},
             max_iter=200,
         )
         result = solver.solve(df)

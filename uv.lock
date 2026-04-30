@@ -594,11 +594,10 @@ wheels = [
 
 [[package]]
 name = "price-contour"
-version = "0.1.0"
+version = "0.2.7"
 source = { editable = "." }
 dependencies = [
     { name = "polars" },
-    { name = "pre-commit" },
     { name = "pyarrow" },
 ]
 
@@ -606,6 +605,7 @@ dependencies = [
 dev = [
     { name = "hypothesis" },
     { name = "maturin" },
+    { name = "pre-commit" },
     { name = "pytest" },
 ]
 
@@ -623,7 +623,7 @@ requires-dist = [
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.4" },
     { name = "polars", specifier = ">=0.20" },
-    { name = "pre-commit", specifier = ">=4.5.1" },
+    { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "pyarrow", specifier = ">=23.0.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
 ]

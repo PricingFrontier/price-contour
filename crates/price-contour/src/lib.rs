@@ -1,5 +1,6 @@
 mod apply_py;
 mod builder_py;
+pub(crate) mod constraint_parsing;
 mod frontier_py;
 mod grid_py;
 mod grouped_py;

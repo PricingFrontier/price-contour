@@ -68,7 +68,6 @@ impl PyApplyResult {
     scenario_value = "scenario_value",
     objective = "expected_income",
     constraints = None,
-    chunk_size = 500_000,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn apply_lambdas_py(
@@ -79,8 +78,7 @@ pub fn apply_lambdas_py(
     scenario_index: &str,
     scenario_value: &str,
     objective: &str,
-    constraints: Option<HashMap<String, HashMap<String, f64>>>,
-    chunk_size: usize,
+    constraints: Option<HashMap<String, HashMap<String, Option<f64>>>>,
 ) -> PyResult<PyApplyResult> {
     let constraints = constraints.unwrap_or_default();
     let mut constraint_cols: Vec<String> = constraints.keys().cloned().collect();
@@ -102,7 +100,7 @@ pub fn apply_lambdas_py(
     let lambda_vec = order_lambdas(&lambdas, &constraint_names);
 
     let result = py
-        .detach(|| apply_lambdas(&grid, &specs, &lambda_vec, Some(chunk_size)))
+        .detach(|| apply_lambdas(&grid, &specs, &lambda_vec))
         .map_err(|e| PyValueError::new_err(format!("Apply error: {e}")))?;
 
     Ok(PyApplyResult {
@@ -118,13 +116,12 @@ pub fn apply_lambdas_py(
 /// This avoids re-building the grid from a DataFrame — useful when the grid
 /// is already in memory (e.g. after a `solve()` or `frontier()` call).
 #[pyfunction]
-#[pyo3(signature = (grid, lambdas, constraints, chunk_size = 500_000))]
+#[pyo3(signature = (grid, lambdas, constraints))]
 pub fn apply_from_grid_py(
     py: Python<'_>,
     grid: &PyQuoteGrid,
     lambdas: HashMap<String, f64>,
-    constraints: HashMap<String, HashMap<String, f64>>,
-    chunk_size: usize,
+    constraints: HashMap<String, HashMap<String, Option<f64>>>,
 ) -> PyResult<PyApplyResult> {
     let specs = parse_constraints(constraints, &grid.inner)?;
     let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
@@ -133,7 +130,7 @@ pub fn apply_from_grid_py(
 
     let grid_arc = Arc::clone(&grid.inner);
     let result = py
-        .detach(|| apply_lambdas(&grid_arc, &specs, &lambda_vec, Some(chunk_size)))
+        .detach(|| apply_lambdas(&grid_arc, &specs, &lambda_vec))
         .map_err(|e| PyValueError::new_err(format!("Apply error: {e}")))?;
 
     Ok(PyApplyResult {

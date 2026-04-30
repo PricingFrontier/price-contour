@@ -6,15 +6,12 @@ use super::argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
 /// Single-pass Lagrangian argmax with fixed lambdas (no iteration).
 ///
 /// One forward pass with rayon-parallel argmax — no lambda updates.
-/// The `chunk_size` parameter is accepted for API compatibility but ignored;
-/// internal parallelism is handled by rayon grain sizes.
+/// Internal parallelism is handled by rayon grain sizes.
 pub fn apply_lambdas(
     grid: &QuoteGrid,
     specs: &[ConstraintSpec],
     lambdas: &[f64],
-    chunk_size: Option<usize>,
 ) -> Result<ApplyResult> {
-    let _ = chunk_size; // ignored — rayon handles parallelism internally
     grid.validate()?;
 
     if lambdas.len() != specs.len() {
@@ -100,7 +97,7 @@ mod tests {
     fn test_apply_zero_lambdas_picks_max_objective() {
         let (grid, specs) = make_test_grid();
         let zero_lambdas = vec![0.0; specs.len()];
-        let result = apply_lambdas(&grid, &specs, &zero_lambdas, None).unwrap();
+        let result = apply_lambdas(&grid, &specs, &zero_lambdas).unwrap();
 
         // With zero lambdas, each quote picks max-objective step (same as unconstrained)
         for q in 0..grid.n_quotes {
@@ -125,7 +122,7 @@ mod tests {
         };
         let solve_result = solve_online(&grid, &specs, &config, None).unwrap();
 
-        let apply_result = apply_lambdas(&grid, &specs, &solve_result.lambdas, None).unwrap();
+        let apply_result = apply_lambdas(&grid, &specs, &solve_result.lambdas).unwrap();
 
         // Same lambdas → same optimal steps
         assert_eq!(apply_result.optimal_steps, solve_result.optimal_steps);
@@ -139,7 +136,7 @@ mod tests {
     #[test]
     fn test_apply_has_baselines() {
         let (grid, specs) = make_test_grid();
-        let result = apply_lambdas(&grid, &specs, &[0.0], None).unwrap();
+        let result = apply_lambdas(&grid, &specs, &[0.0]).unwrap();
 
         let (expected_obj, expected_cons) = grid.baseline_totals();
         assert_abs_diff_eq!(result.baseline_objective, expected_obj, epsilon = 1e-6);
@@ -159,7 +156,7 @@ mod tests {
         // lambdas.len() != specs.len() should error
         let (grid, specs) = make_test_grid();
         // Pass 2 lambdas but only 1 constraint spec
-        let err = apply_lambdas(&grid, &specs, &[0.0, 0.0], None).unwrap_err();
+        let err = apply_lambdas(&grid, &specs, &[0.0, 0.0]).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("lambdas") || msg.contains("length") || msg.contains("specs"),

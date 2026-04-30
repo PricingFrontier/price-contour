@@ -155,7 +155,6 @@ def solve_online_py(
     objective: str = "expected_income",
     constraints: dict[str, dict[str, float]] | None = None,
     max_iter: int = 50,
-    chunk_size: int = 500_000,
     tolerance: float = 1e-5,
     lambdas: dict[str, float] | None = None,
     record_history: bool = False,
@@ -164,7 +163,6 @@ def solve_from_grid_py(
     grid: QuoteGrid,
     constraints: dict[str, dict[str, float]] | None = None,
     max_iter: int = 50,
-    chunk_size: int = 500_000,
     tolerance: float = 1e-5,
     lambdas: dict[str, float] | None = None,
     record_history: bool = False,
@@ -177,13 +175,11 @@ def apply_lambdas_py(
     scenario_value: str = "scenario_value",
     objective: str = "expected_income",
     constraints: dict[str, dict[str, float]] | None = None,
-    chunk_size: int = 500_000,
 ) -> ApplyResult: ...
 def apply_from_grid_py(
     grid: QuoteGrid,
     lambdas: dict[str, float],
     constraints: dict[str, dict[str, float]],
-    chunk_size: int = 500_000,
 ) -> ApplyResult: ...
 def solve_grouped_py(
     grid: QuoteGrid,
@@ -192,7 +188,6 @@ def solve_grouped_py(
     candidates: list[float],
     constraints: dict[str, dict[str, float]] | None = None,
     max_iter: int = 50,
-    chunk_size: int = 500_000,
     tolerance: float = 1e-5,
     lambdas: dict[str, float] | None = None,
     record_history: bool = False,
@@ -203,7 +198,6 @@ def sweep_frontier_py(
     threshold_ranges: dict[str, tuple[float, float]],
     n_points_per_dim: int = 10,
     max_iter: int = 50,
-    chunk_size: int = 500_000,
     tolerance: float = 1e-5,
     initial_lambdas: dict[str, float] | None = None,
     max_total_points: int = 10_000,

@@ -30,7 +30,7 @@ class TestFrontierWarmStart:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         solve_result = solver.solve(df)
@@ -51,7 +51,7 @@ class TestFrontierWarmStart:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         solve_result = solver.solve(df)
@@ -84,7 +84,7 @@ class TestFrontierWarmStart:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
 
@@ -109,7 +109,7 @@ class TestFrontierWarmStart:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         solve_result = solver.solve(df)
@@ -150,7 +150,7 @@ class TestApplyFromGrid:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         solve_result = solver.solve(df)
@@ -160,14 +160,14 @@ class TestApplyFromGrid:
         grid_result = apply_from_grid(
             grid,
             lambdas=solve_result.lambdas,
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
 
         # ApplyOptimiser (re-ingests DataFrame)
         applier = pc.ApplyOptimiser(
             lambdas=solve_result.lambdas,
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         df_result = applier.apply(df)
 
@@ -186,7 +186,7 @@ class TestApplyFromGrid:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         solve_result = solver.solve(df)
@@ -194,7 +194,7 @@ class TestApplyFromGrid:
         grid_result = apply_from_grid(
             solve_result.grid,
             lambdas=solve_result.lambdas,
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
 
         assert abs(grid_result.total_objective - solve_result.total_objective) < 1e-3
@@ -204,14 +204,14 @@ class TestApplyFromGrid:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         solve_result = solver.solve(df)
 
         result = apply_from_grid(
             solve_result.grid,
             lambdas=solve_result.lambdas,
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
 
         assert result.baseline_objective > 0
@@ -224,14 +224,14 @@ class TestApplyFromGrid:
         df = make_small_df(n_quotes=n_quotes, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         solve_result = solver.solve(df)
 
         result = apply_from_grid(
             solve_result.grid,
             lambdas=solve_result.lambdas,
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
 
         out = result.dataframe
@@ -245,14 +245,14 @@ class TestApplyFromGrid:
         df = make_small_df(n_quotes=20, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         solve_result = solver.solve(df)
 
         result = apply_from_grid(
             solve_result.grid,
             lambdas={"volume": 0.0},
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
 
         out = result.dataframe
@@ -268,8 +268,8 @@ class TestApplyFromGrid:
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.92},
-                "loss_ratio": {"max": 1.05},
+                "volume": {"min_pct": 0.92},
+                "loss_ratio": {"max_pct": 1.05},
             },
             max_iter=200,
         )
@@ -279,8 +279,8 @@ class TestApplyFromGrid:
             solve_result.grid,
             lambdas=solve_result.lambdas,
             constraints={
-                "volume": {"min": 0.92},
-                "loss_ratio": {"max": 1.05},
+                "volume": {"min_pct": 0.92},
+                "loss_ratio": {"max_pct": 1.05},
             },
         )
 
@@ -307,7 +307,7 @@ class TestFrontierScenarioValueStats:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -338,7 +338,7 @@ class TestFrontierScenarioValueStats:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -361,7 +361,7 @@ class TestFrontierScenarioValueStats:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -381,7 +381,7 @@ class TestFrontierScenarioValueStats:
         df = make_small_df(n_quotes=100, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -400,7 +400,7 @@ class TestFrontierScenarioValueStats:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -417,8 +417,8 @@ class TestFrontierScenarioValueStats:
         solver = pc.OnlineOptimiser(
             objective="expected_income",
             constraints={
-                "volume": {"min": 0.90},
-                "loss_ratio": {"max": 1.05},
+                "volume": {"min_pct": 0.90},
+                "loss_ratio": {"max_pct": 1.05},
             },
             max_iter=100,
         )
@@ -439,7 +439,7 @@ class TestFrontierScenarioValueStats:
         df = make_small_df(n_quotes=50, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=100,
         )
         result = solver.frontier(
@@ -468,7 +468,7 @@ class TestRatebookFrontier:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=50,
@@ -499,7 +499,7 @@ class TestRatebookFrontier:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=50,
@@ -526,7 +526,7 @@ class TestRatebookFrontier:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=2,
             max_iter=100,
@@ -558,7 +558,7 @@ class TestRatebookFrontier:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=50,
@@ -584,7 +584,7 @@ class TestRatebookFrontier:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=50,
@@ -607,7 +607,7 @@ class TestRatebookFrontier:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=50,
@@ -655,7 +655,7 @@ class TestRatebookSolveWarmStart:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=50,

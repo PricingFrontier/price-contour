@@ -159,7 +159,6 @@ impl PyGroupedSolveResult {
     candidates,
     constraints = None,
     max_iter = 50,
-    chunk_size = 500_000,
     tolerance = 1e-5,
     lambdas = None,
     record_history = false,
@@ -171,9 +170,8 @@ pub fn solve_grouped_py(
     group_labels: Vec<String>,
     residuals: Vec<f32>,
     candidates: Vec<f32>,
-    constraints: Option<HashMap<String, HashMap<String, f64>>>,
+    constraints: Option<HashMap<String, HashMap<String, Option<f64>>>>,
     max_iter: usize,
-    chunk_size: usize,
     tolerance: f64,
     lambdas: Option<HashMap<String, f64>>,
     record_history: bool,
@@ -200,7 +198,6 @@ pub fn solve_grouped_py(
 
     let config = SolverConfig {
         max_iter,
-        chunk_size,
         tolerance,
         record_history,
         ..Default::default()

@@ -122,7 +122,7 @@ class TestProperties:
 
         constrained = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         constrained_result = constrained.solve(df)
@@ -145,7 +145,7 @@ class TestProperties:
 
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         solve_result = solver.solve(df)
@@ -153,7 +153,7 @@ class TestProperties:
         applier = pc.ApplyOptimiser(
             lambdas=solve_result.lambdas,
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         apply_result = applier.apply(df)
 
@@ -178,7 +178,7 @@ class TestProperties:
         applier = pc.ApplyOptimiser(
             lambdas={"volume": 0.0},
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         apply_result = applier.apply(df)
 
@@ -200,7 +200,7 @@ class TestProperties:
 
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
 
@@ -228,7 +228,7 @@ class TestProperties:
 
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result = solver.solve(df)

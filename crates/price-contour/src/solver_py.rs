@@ -10,6 +10,7 @@ use price_contour_core::{
     solve_online, ConstraintDirection, ConstraintSpec, QuoteGrid, SolveResult, SolverConfig,
 };
 
+use crate::constraint_parsing::validate_constraints_dict;
 use crate::grid_py::PyQuoteGrid;
 use crate::utils::{order_lambdas, zip_to_dict};
 
@@ -383,56 +384,84 @@ impl PySolveResult {
     }
 }
 
-/// Parse constraint dict from Python: {"volume": {"min": 0.9}, "loss_ratio": {"max": 1.05}}
+/// Parse constraint dict from Python.
+///
+/// New (post-A1) semantics:
+/// * ``min`` / ``max``         → absolute thresholds.
+/// * ``min_pct`` / ``max_pct`` → fraction-of-baseline thresholds.
+/// * ``min_abs`` / ``max_abs`` → removed; raises a migration ``ValueError``
+///   that names both the old and new key.
+///
+/// We walk `grid.constraint_names` (NOT the user `HashMap`) when
+/// emitting specs so `specs[k]` aligns with `grid.constraints[k]` —
+/// the inner solver in `argmax.rs` indexes by position. Iterating the
+/// `HashMap` directly would produce nondeterministic ordering and
+/// silently mix up which constraint each lambda controls.
+///
+/// Validation (migration errors, multi-key, NaN/inf, unknown name) is
+/// shared with `frontier_py::sweep_frontier_py` via
+/// `crate::constraint_parsing::validate_constraints_dict` so the two
+/// entry points can never drift.
 pub(crate) fn parse_constraints(
-    constraints: HashMap<String, HashMap<String, f64>>,
+    constraints: HashMap<String, HashMap<String, Option<f64>>>,
     grid: &QuoteGrid,
 ) -> PyResult<Vec<ConstraintSpec>> {
     let (_, baseline_totals) = grid.baseline_totals();
 
-    let mut specs = Vec::new();
-    for (name, spec_dict) in &constraints {
-        let constraint_idx = grid
-            .constraint_names
-            .iter()
-            .position(|n| n == name)
-            .ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "Constraint '{}' not found in DataFrame columns. Available: {:?}",
-                    name, grid.constraint_names
-                ))
-            })?;
+    validate_constraints_dict(&constraints, grid)?;
 
-        if let Some(&frac) = spec_dict.get("min") {
-            specs.push(ConstraintSpec {
-                name: name.clone(),
-                direction: ConstraintDirection::Min,
-                threshold: baseline_totals[constraint_idx] * frac,
-            });
-        } else if let Some(&frac) = spec_dict.get("max") {
-            specs.push(ConstraintSpec {
-                name: name.clone(),
-                direction: ConstraintDirection::Max,
-                threshold: baseline_totals[constraint_idx] * frac,
-            });
-        } else if let Some(&abs_val) = spec_dict.get("min_abs") {
-            specs.push(ConstraintSpec {
-                name: name.clone(),
-                direction: ConstraintDirection::Min,
-                threshold: abs_val,
-            });
-        } else if let Some(&abs_val) = spec_dict.get("max_abs") {
-            specs.push(ConstraintSpec {
-                name: name.clone(),
-                direction: ConstraintDirection::Max,
-                threshold: abs_val,
-            });
-        } else {
+    // Walk grid order so spec[k] aligns with grid.constraints[k].
+    // Extension point: ratio constraints (C1) detect via `numerator` /
+    // `denominator` keys before the direction-key match below.
+    //
+    // ``None`` values are frontier-only markers (B1); the from-grid solve
+    // path lands here, and solve() cannot pick a threshold from thin air,
+    // so we raise a ``ValueError`` that names the constraint and points
+    // the user at ``frontier()``. The Python ``OnlineOptimiser.solve()``
+    // shim catches this earlier for the DataFrame path; this is the
+    // belt-and-braces backstop for callers that bypass it.
+    let mut specs = Vec::with_capacity(constraints.len());
+    for (constraint_idx, name) in grid.constraint_names.iter().enumerate() {
+        let Some(spec_dict) = constraints.get(name) else {
+            continue;
+        };
+
+        let (direction, raw_threshold, is_pct) =
+            if let Some(value_opt) = spec_dict.get("min") {
+                (ConstraintDirection::Min, value_opt, false)
+            } else if let Some(value_opt) = spec_dict.get("max") {
+                (ConstraintDirection::Max, value_opt, false)
+            } else if let Some(value_opt) = spec_dict.get("min_pct") {
+                (ConstraintDirection::Min, value_opt, true)
+            } else if let Some(value_opt) = spec_dict.get("max_pct") {
+                (ConstraintDirection::Max, value_opt, true)
+            } else {
+                // validate_constraints_dict already requires exactly one
+                // direction key, so this branch is unreachable.
+                continue;
+            };
+
+        let Some(value) = raw_threshold else {
             return Err(PyValueError::new_err(format!(
-                "Constraint '{}' must specify one of: min, max, min_abs, max_abs",
+                "Constraint '{}' has no threshold (value is None); \
+                 solve() requires a numeric threshold per constraint. \
+                 Use frontier() with a matching threshold_ranges entry to sweep \
+                 this constraint, or supply a numeric threshold.",
                 name
             )));
-        }
+        };
+
+        let threshold = if is_pct {
+            baseline_totals[constraint_idx] * *value
+        } else {
+            *value
+        };
+
+        specs.push(ConstraintSpec {
+            name: name.clone(),
+            direction,
+            threshold,
+        });
     }
     Ok(specs)
 }
@@ -446,7 +475,6 @@ pub(crate) fn parse_constraints(
     objective = "expected_income",
     constraints = None,
     max_iter = 50,
-    chunk_size = 500_000,
     tolerance = 1e-5,
     lambdas = None,
     record_history = false,
@@ -459,9 +487,8 @@ pub fn solve_online_py(
     scenario_index: &str,
     scenario_value: &str,
     objective: &str,
-    constraints: Option<HashMap<String, HashMap<String, f64>>>,
+    constraints: Option<HashMap<String, HashMap<String, Option<f64>>>>,
     max_iter: usize,
-    chunk_size: usize,
     tolerance: f64,
     lambdas: Option<HashMap<String, f64>>,
     record_history: bool,
@@ -484,7 +511,6 @@ pub fn solve_online_py(
 
     let config = SolverConfig {
         max_iter,
-        chunk_size,
         tolerance,
         record_history,
         ..Default::default()
@@ -514,7 +540,6 @@ pub fn solve_online_py(
     grid,
     constraints = None,
     max_iter = 50,
-    chunk_size = 500_000,
     tolerance = 1e-5,
     lambdas = None,
     record_history = false,
@@ -523,9 +548,8 @@ pub fn solve_online_py(
 pub fn solve_from_grid_py(
     py: Python<'_>,
     grid: &PyQuoteGrid,
-    constraints: Option<HashMap<String, HashMap<String, f64>>>,
+    constraints: Option<HashMap<String, HashMap<String, Option<f64>>>>,
     max_iter: usize,
-    chunk_size: usize,
     tolerance: f64,
     lambdas: Option<HashMap<String, f64>>,
     record_history: bool,
@@ -536,7 +560,6 @@ pub fn solve_from_grid_py(
 
     let config = SolverConfig {
         max_iter,
-        chunk_size,
         tolerance,
         record_history,
         ..Default::default()

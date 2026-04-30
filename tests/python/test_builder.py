@@ -20,7 +20,7 @@ class TestQuoteGridBuilder:
         # One-shot via DataFrame
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result_df = solver.solve(df)
@@ -59,7 +59,7 @@ class TestQuoteGridBuilder:
         # Solve from grid
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         result_grid = solver.solve(grid)

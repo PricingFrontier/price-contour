@@ -17,7 +17,7 @@ class TestRatebook:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=100,
@@ -38,7 +38,7 @@ class TestRatebook:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"], ["age_band"]],
             max_cd_iterations=3,
             max_iter=100,
@@ -97,7 +97,7 @@ class TestRatebook:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_cd_iterations=1,
             max_iter=50,
         )
@@ -126,7 +126,7 @@ class TestRatebook:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=50,
@@ -148,7 +148,7 @@ class TestRatebook:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"], ["age_band"]],
             max_cd_iterations=3,
             max_iter=100,
@@ -203,7 +203,7 @@ class TestRatebook:
 
         solver = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region", "age_band"]],  # interaction
             max_cd_iterations=2,
             max_iter=100,
@@ -228,7 +228,7 @@ class TestRatebook:
 
         opt = RatebookOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             factor_columns=[["region"]],
             max_cd_iterations=1,
             max_iter=100,
@@ -239,7 +239,7 @@ class TestRatebook:
         applier = pc.ApplyOptimiser(
             lambdas=result.lambdas,
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
         )
         apply_result = applier.apply(df)
 

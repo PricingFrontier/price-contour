@@ -1,0 +1,66 @@
+{
+  "constraints": {
+    "volume": {
+      "min_pct": 0.9
+    }
+  },
+  "expected": {
+    "n_points": 5,
+    "rows": [
+      {
+        "converged": true,
+        "iterations": 1,
+        "lambda_volume": 0.0,
+        "threshold_volume": 0.9,
+        "total_objective": 2441.3049354553223,
+        "total_volume": 25.579409569501877
+      },
+      {
+        "converged": true,
+        "iterations": 1,
+        "lambda_volume": 0.0,
+        "threshold_volume": 0.9500000000000001,
+        "total_objective": 2441.3049354553223,
+        "total_volume": 25.579409569501877
+      },
+      {
+        "converged": true,
+        "iterations": 1,
+        "lambda_volume": 0.0,
+        "threshold_volume": 1.0,
+        "total_objective": 2441.3049354553223,
+        "total_volume": 25.579409569501877
+      },
+      {
+        "converged": false,
+        "iterations": 200,
+        "lambda_volume": 2.5848130114681447,
+        "threshold_volume": 1.0500000000000003,
+        "total_objective": 2440.574436187744,
+        "total_volume": 26.02577430009842
+      },
+      {
+        "converged": false,
+        "iterations": 200,
+        "lambda_volume": 8.38256826927415,
+        "threshold_volume": 1.1,
+        "total_objective": 2435.2458839416504,
+        "total_volume": 26.92672899365425
+      }
+    ]
+  },
+  "fixture_n_quotes": 50,
+  "fixture_n_steps": 5,
+  "fixture_seed": 42,
+  "n_points_per_dim": 5,
+  "threshold_ranges": {
+    "volume": [
+      0.9,
+      1.1
+    ]
+  },
+  "tolerance": {
+    "absolute": 1e-06,
+    "relative": 1e-07
+  }
+}

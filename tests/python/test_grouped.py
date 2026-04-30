@@ -40,14 +40,14 @@ class TestGroupedSolver:
             group_labels=group_labels,
             residuals=residuals,
             candidates=candidates,
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
 
         # Compare with online solver
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
         online_result = solver.solve(df)
@@ -162,7 +162,7 @@ class TestGroupedSolver:
             group_labels=group_labels,
             residuals=residuals,
             candidates=candidates,
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
 
@@ -192,7 +192,7 @@ class TestGroupedSolver:
             group_labels=group_labels,
             residuals=residuals,
             candidates=candidates,
-            constraints={"volume": {"min": 0.90}},
+            constraints={"volume": {"min_pct": 0.90}},
             max_iter=200,
         )
 
