@@ -17,8 +17,13 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solver_py::solve_online_py, m)?)?;
     m.add_function(wrap_pyfunction!(solver_py::solve_from_grid_py, m)?)?;
     m.add_class::<apply_py::PyApplyResult>()?;
+    m.add_class::<apply_py::PyChunkedApplyResult>()?;
     m.add_function(wrap_pyfunction!(apply_py::apply_lambdas_py, m)?)?;
     m.add_function(wrap_pyfunction!(apply_py::apply_from_grid_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        apply_py::apply_lambdas_to_parquet_chunked_py,
+        m
+    )?)?;
     m.add_class::<builder_py::PyQuoteGridBuilder>()?;
     m.add_class::<grid_py::PyQuoteGrid>()?;
     m.add_class::<grouped_py::PyGroupedSolveResult>()?;
@@ -27,6 +32,10 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(frontier_py::sweep_frontier_py, m)?)?;
     m.add_function(wrap_pyfunction!(
         parquet_grid_py::build_grid_from_parquet_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        parquet_grid_py::build_grid_from_parquet_chunked_py,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
@@ -39,6 +48,10 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         ratebook_helpers_py::build_interaction_labels_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        ratebook_helpers_py::extract_factor_labels_py,
         m
     )?)?;
     Ok(())

@@ -290,11 +290,26 @@ grid = pc.build_grid_from_parquet(
 result = optimiser.solve(grid)
 ```
 
+For parquets that exceed available memory in their raw form, use the streaming variant. The IO buffer is bounded by `chunk_size`; the file is read in row slices via Polars' `with_slice` pushdown so only the row groups overlapping each slice are deserialised, and column projection means only the four schema columns plus the requested constraint columns are decoded:
+
+```python
+grid = pc.build_grid_from_parquet_chunked(
+    "huge_scored_quotes.parquet",
+    constraint_columns=["volume", "loss_ratio"],
+    chunk_size=500_000,         # rows per IO slice; rounded down to a multiple of n_steps
+    objective="income",
+    # n_steps=20,               # optional: lock upfront if your first slice could be partial
+)
+result = optimiser.solve(grid)
+```
+
+The final `QuoteGrid` is still O(n_quotes × n_steps × n_columns × 4 bytes) — that's inherent to the solver's flat data layout — but the parquet decode buffer never exceeds `chunk_size` rows. Use this when the parquet itself doesn't fit in RAM, not as a way to avoid loading the grid.
+
 ---
 
 ## Incremental grid building
 
-For large datasets that don't fit in memory at once, build the internal grid incrementally:
+For datasets streamed from upstream pipelines (e.g. when chunks arrive out-of-order or before the full dataset is materialised anywhere), build the grid incrementally:
 
 ```python
 builder = pc.QuoteGridBuilder(
@@ -303,14 +318,48 @@ builder = pc.QuoteGridBuilder(
     scenario_index="scenario_index",
     scenario_value_col="scenario_value",
     objective="income",
+    # n_steps=20,               # optional: lock upfront for streaming sources
 )
 
-for chunk in data_source.iter_chunks(100_000):
+for chunk in upstream:          # any iterable of pl.DataFrame
     builder.append(chunk)
 
 grid = builder.build()
 result = optimiser.solve(grid)
 ```
+
+**Per-chunk contract:** each chunk's rows must already be grouped by `quote_id` (each quote occupies `n_steps` contiguous rows in `scenario_index` order). Within a chunk this is validated row-by-row (including a `scenario_value` consistency check against the canonical grid). Across chunks the order is arbitrary — the builder performs an in-place sort by `quote_id` at `build()` time using cycle-following permutation, so peak memory does not double during the sort. Duplicate `quote_id`s across all appended chunks are detected and reported with both append-order indices.
+
+The optional `n_steps` kwarg lets streaming pipelines that may receive a partial first chunk lock the contract upfront, skipping the auto-detection probe.
+
+---
+
+## Streaming apply to disk
+
+For live scoring on inputs too large to hold in RAM, stream a parquet through `apply` and write per-quote results to a parquet output one row group per chunk:
+
+```python
+result = pc.apply_lambdas_to_parquet_chunked(
+    parquet_in="huge_scored_quotes.parquet",
+    parquet_out="scored_results.parquet",
+    lambdas={"volume": 0.147, "loss_ratio": 1.21},
+    constraints={
+        "volume": {"min_pct": 0.90},
+        "loss_ratio": {"max_pct": 1.05},
+    },
+    chunk_size=500_000,
+)
+
+# Aggregate totals on the result; per-quote rows are in the output parquet.
+print(result.total_objective)         # 1_284_302.5
+print(result.total_constraints)       # {'volume': 5400.0, 'loss_ratio': 0.6498}
+print(result.output_path)             # 'scored_results.parquet'
+
+# Read back per-quote results lazily.
+opt = pl.scan_parquet(result.output_path)
+```
+
+The `optimal_steps` array is **never** held in memory — each chunk's mini-grid is built, scored, written to the output parquet, and dropped before the next chunk is read. Aggregate totals are accumulated in f64 across chunks. On any error the partial output is best-effort deleted so callers never observe a corrupt artefact, and the input/output paths are checked for equality so the input parquet can't be silently overwritten. Lambda keys not matching any constraint are rejected up front (matching `ApplyOptimiser`).
 
 ---
 
@@ -471,8 +520,9 @@ maturin develop
 
 | Method | Description |
 |---|---|
-| `append(df)` | Add a chunk of quotes. |
-| `build()` | Finalise and return a `QuoteGrid`. |
+| `QuoteGridBuilder(constraint_columns, *, quote_id, scenario_index, scenario_value_col, objective, n_steps=None)` | Construct a builder. `n_steps` may be passed upfront to skip auto-detection from the first chunk — useful for streaming sources where the first chunk may be partial. |
+| `append(df)` | Add a chunk of quotes. Rows must be grouped by `quote_id` with `scenario_index` running `0..n_steps` in order. Per-row validation rejects layout violations and `scenario_value` drift across chunks. |
+| `build()` | Finalise and return a `QuoteGrid`. Sorts by `quote_id` in-place via cycle-following permutation (no 2× memory peak). Rejects duplicate `quote_id`s with both append-order indices in the error. |
 
 ### SolveResult
 
@@ -503,6 +553,19 @@ maturin develop
 | `lambdas` | `dict[str, float]` | Applied Lagrange multipliers. |
 | `dataframe` | `pl.DataFrame` | Per-quote results with optimal scenario values. |
 
+### ChunkedApplyResult
+
+Returned by `apply_lambdas_to_parquet_chunked`. Carries the same aggregate totals as `ApplyResult` but the per-quote rows live only in the output parquet — `optimal_steps` is never held in memory.
+
+| Property | Type | Description |
+|---|---|---|
+| `total_objective` | `float` | Portfolio-level objective at the optimum (summed across chunks in f64). |
+| `total_constraints` | `dict[str, float]` | Portfolio-level constraint totals. |
+| `baseline_objective` | `float` | Objective at scenario_value = 1.0. |
+| `baseline_constraints` | `dict[str, float]` | Constraints at scenario_value = 1.0. |
+| `lambdas` | `dict[str, float]` | Applied Lagrange multipliers. |
+| `output_path` | `str` | Path to the streamed-output parquet. Read back via `pl.read_parquet` or `pl.scan_parquet`. |
+
 ### FrontierResult
 
 | Property | Type | Description |
@@ -531,7 +594,9 @@ maturin develop
 
 | Function | Description |
 |---|---|
-| `build_grid_from_parquet(path, *, constraint_columns, ...)` | Build a `QuoteGrid` directly from a Parquet file without materialising a DataFrame in Python. Sum constraints only — ratio constraints require a DataFrame. |
+| `build_grid_from_parquet(path, constraint_columns, *, ...)` | Build a `QuoteGrid` directly from a Parquet file. Loads the projected columns whole; column projection prunes everything outside `constraint_columns` + the four schema columns. Sum constraints only — ratio constraints require a DataFrame. |
+| `build_grid_from_parquet_chunked(path, constraint_columns, chunk_size, *, n_steps=None, ...)` | Stream a Parquet file in fixed-size row slices via Polars' `with_slice` pushdown. Memory peak for the parquet decode buffer is bounded by `chunk_size`; the final `QuoteGrid` is still O(total_rows). `chunk_size` is rounded down to a multiple of `n_steps` so every slice ends on a quote boundary. Use when the parquet itself doesn't fit in RAM. |
+| `apply_lambdas_to_parquet_chunked(parquet_in, parquet_out, lambdas, constraints, chunk_size, *, n_steps=None, ...)` | Stream a parquet through `apply` and write per-quote results to `parquet_out` one row group per chunk. Returns `ChunkedApplyResult` with aggregate totals; per-quote rows live in the output parquet. The input/output paths are checked for equality (refuses to overwrite the input), and any error best-effort-deletes the partial output. |
 | `apply_from_grid(grid, lambdas, constraints)` | Single-pass Lagrangian apply on an existing `QuoteGrid`. Returns `ApplyResult`. Sum constraints only; ratio constraints raise `ValueError` (use `ApplyOptimiser.apply(df)` on a DataFrame instead — the grid path can't carry numerator/denominator columns for linearisation). |
 | `frontier_summary(frontier_result, selected_index)` | Package a frontier result into MLflow-ready `params`, `metrics`, `artifacts` dicts. |
 

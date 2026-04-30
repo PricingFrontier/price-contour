@@ -333,7 +333,16 @@ impl QuoteGridBuilder {
         Ok(())
     }
 
-    /// Consume the builder and return a validated QuoteGrid.
+    /// Consume the builder and return a validated QuoteGrid sorted by `quote_id`.
+    ///
+    /// Sort happens here (not in `append`) because upstream pipelines often
+    /// stream chunks they cannot globally sort. The canonical sort point is
+    /// this builder, where the full set of quotes is finally unified.
+    ///
+    /// The sort is performed in-place via cycle decomposition over a
+    /// permutation of the `n_quotes` quote indices, so peak memory does not
+    /// double during the sort. Duplicate `quote_id`s across all appended
+    /// chunks are detected and reported.
     pub fn build(mut self) -> Result<QuoteGrid> {
         self.finalised = true;
         if self.n_quotes == 0 {
@@ -341,6 +350,38 @@ impl QuoteGridBuilder {
                 "no quotes appended to builder".into(),
             ));
         }
+
+        // Build a stable permutation of quote indices sorted by quote_id.
+        // `perm[i]` is the source index whose data should end up at position
+        // `i` of the final grid.
+        let mut perm: Vec<usize> = (0..self.n_quotes).collect();
+        perm.sort_by(|&a, &b| self.quote_ids[a].cmp(&self.quote_ids[b]));
+
+        // Reject duplicates: walk the sorted permutation, compare adjacent
+        // quote_ids. Reporting both append-order indices lets callers locate
+        // both occurrences in their pipeline.
+        for w in perm.windows(2) {
+            let a = w[0];
+            let b = w[1];
+            if self.quote_ids[a] == self.quote_ids[b] {
+                let (first, second) = if a < b { (a, b) } else { (b, a) };
+                return Err(PriceContourError::DataValidation(format!(
+                    "duplicate quote_id '{}' appears at append-order indices {first} and {second} \
+                     (each quote_id must be unique across all appended chunks)",
+                    self.quote_ids[a]
+                )));
+            }
+        }
+
+        // Apply the permutation in-place to all quote-aligned arrays.
+        apply_quote_permutation(
+            &perm,
+            self.n_steps,
+            &mut self.objective,
+            &mut self.constraints,
+            &mut self.quote_ids,
+        );
+
         let grid = QuoteGrid {
             n_quotes: self.n_quotes,
             n_steps: self.n_steps,
@@ -357,6 +398,95 @@ impl QuoteGridBuilder {
     /// Return the number of quotes appended so far.
     pub fn n_quotes(&self) -> usize {
         self.n_quotes
+    }
+}
+
+/// Apply a quote-index permutation to all parallel arrays in place.
+///
+/// `perm[i]` is the source quote index that should occupy slot `i` after
+/// reordering. Each f32 array is laid out quote-major with `n_steps` elements
+/// per quote; `quote_ids` has one element per quote.
+///
+/// The algorithm walks each cycle of the permutation exactly once. For a
+/// cycle `i → a → b → … → i`, it stages the data at `i` in scratch buffers,
+/// shifts each subsequent block back by one position, and finally writes the
+/// staged data into the cycle's last slot. Fixed points (`perm[i] == i`) are
+/// skipped without copying.
+///
+/// Memory overhead is O(n_steps × (1 + n_constraints)) f32s for the scratch
+/// buffers plus O(n_quotes / 8) bits for the visited bitset — independent of
+/// the grid size.
+fn apply_quote_permutation(
+    perm: &[usize],
+    n_steps: usize,
+    objective: &mut [f32],
+    constraints: &mut [Vec<f32>],
+    quote_ids: &mut [String],
+) {
+    let n = perm.len();
+    debug_assert_eq!(quote_ids.len(), n);
+    debug_assert_eq!(objective.len(), n * n_steps);
+    for con in constraints.iter() {
+        debug_assert_eq!(con.len(), n * n_steps);
+    }
+
+    // Visited bitset, one bit per quote. `n_words = ceil(n / 64)`.
+    let n_words = n.div_ceil(64);
+    let mut visited: Vec<u64> = vec![0u64; n_words];
+    let is_visited = |w: &[u64], i: usize| -> bool { w[i / 64] & (1u64 << (i % 64)) != 0 };
+    let mark_visited = |w: &mut [u64], i: usize| {
+        w[i / 64] |= 1u64 << (i % 64);
+    };
+
+    // Reusable scratch buffers — allocated once outside the cycle loop.
+    let mut tmp_obj = vec![0.0f32; n_steps];
+    let mut tmp_cons: Vec<Vec<f32>> = constraints.iter().map(|_| vec![0.0f32; n_steps]).collect();
+
+    for start in 0..n {
+        if is_visited(&visited, start) {
+            continue;
+        }
+        let src = perm[start];
+        if src == start {
+            // Fixed point — no work.
+            mark_visited(&mut visited, start);
+            continue;
+        }
+
+        // Stage the data currently at `start`; the cycle ends with this data
+        // landing at the cycle's last position.
+        let start_block = start * n_steps;
+        tmp_obj.copy_from_slice(&objective[start_block..start_block + n_steps]);
+        for (k, con) in constraints.iter().enumerate() {
+            tmp_cons[k].copy_from_slice(&con[start_block..start_block + n_steps]);
+        }
+        let tmp_qid = std::mem::take(&mut quote_ids[start]);
+
+        // Walk the cycle: position `cur` should receive the data currently at
+        // `next = perm[cur]`. When `next` returns to `start`, deposit the
+        // staged data and close the cycle.
+        let mut cur = start;
+        loop {
+            let next = perm[cur];
+            let cur_block = cur * n_steps;
+            if next == start {
+                objective[cur_block..cur_block + n_steps].copy_from_slice(&tmp_obj);
+                for (k, con) in constraints.iter_mut().enumerate() {
+                    con[cur_block..cur_block + n_steps].copy_from_slice(&tmp_cons[k]);
+                }
+                quote_ids[cur] = tmp_qid;
+                mark_visited(&mut visited, cur);
+                break;
+            }
+            let next_block = next * n_steps;
+            objective.copy_within(next_block..next_block + n_steps, cur_block);
+            for con in constraints.iter_mut() {
+                con.copy_within(next_block..next_block + n_steps, cur_block);
+            }
+            quote_ids[cur] = std::mem::take(&mut quote_ids[next]);
+            mark_visited(&mut visited, cur);
+            cur = next;
+        }
     }
 }
 
@@ -657,6 +787,365 @@ mod tests {
             msg.contains("no quotes"),
             "error should mention no quotes: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 1: build()-time sort by quote_id via in-place cycle permutation.
+    //
+    // Contract: append() preserves input order without sorting; build() sorts
+    // the entire grid by quote_id in-place. The motivation is that upstream
+    // pipelines feed chunks they cannot globally sort (they don't have the
+    // whole DataFrame materialised), so the canonical sort point is the
+    // QuoteGrid layer where the data is unified.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a grid where each quote's data uniquely identifies the
+    /// quote, so a permutation bug shows up as a data/id mismatch.
+    ///
+    /// Quote `Q{id}` step `j` has objective = id*100 + j and constraint =
+    /// id*1000 + j (where id is the integer parsed from the quote_id).
+    fn append_uniquely_tagged(
+        builder: &mut QuoteGridBuilder,
+        ids: &[u32], // numeric quote ids in append order
+        n_steps: usize,
+    ) {
+        let quote_ids: Vec<String> = ids.iter().map(|i| format!("Q{i:04}")).collect();
+        let mut objective: Vec<f32> = Vec::with_capacity(ids.len() * n_steps);
+        let mut constraint: Vec<f32> = Vec::with_capacity(ids.len() * n_steps);
+        for &id in ids {
+            for j in 0..n_steps {
+                objective.push((id as f32) * 100.0 + j as f32);
+                constraint.push((id as f32) * 1000.0 + j as f32);
+            }
+        }
+        builder
+            .append(&quote_ids, &objective, &[constraint])
+            .unwrap();
+    }
+
+    /// Helper: assert the grid is in canonical sorted order and each quote's
+    /// data matches its tagged value (per `append_uniquely_tagged`).
+    fn assert_sorted_with_tags(grid: &QuoteGrid, expected_ids: &[u32]) {
+        let n_steps = grid.n_steps;
+        assert_eq!(grid.n_quotes, expected_ids.len());
+        let expected_qids: Vec<String> = expected_ids.iter().map(|i| format!("Q{i:04}")).collect();
+        assert_eq!(grid.quote_ids, expected_qids);
+        for (q, &id) in expected_ids.iter().enumerate() {
+            for j in 0..n_steps {
+                let idx = q * n_steps + j;
+                assert!(
+                    (grid.objective[idx] - ((id as f32) * 100.0 + j as f32)).abs() < 1e-6,
+                    "objective[{q}][{j}] (quote Q{id:04}) wrong: got {}",
+                    grid.objective[idx],
+                );
+                assert!(
+                    (grid.constraints[0][idx] - ((id as f32) * 1000.0 + j as f32)).abs() < 1e-3,
+                    "constraint[{q}][{j}] (quote Q{id:04}) wrong: got {}",
+                    grid.constraints[0][idx],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_sorts_reverse_order_chunks() {
+        let mut builder =
+            QuoteGridBuilder::new(3, vec![0.9, 1.0, 1.1], vec!["volume".to_string()]).unwrap();
+        // Append in reverse: Q0003, Q0002, Q0001, Q0000.
+        append_uniquely_tagged(&mut builder, &[3, 2, 1, 0], 3);
+        let grid = builder.build().unwrap();
+        // After build(), expected order is Q0000, Q0001, Q0002, Q0003.
+        assert_sorted_with_tags(&grid, &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_build_sorts_interleaved_one_quote_chunks() {
+        // Many chunks of a single quote each, in random order.
+        let mut builder =
+            QuoteGridBuilder::new(3, vec![0.9, 1.0, 1.1], vec!["volume".to_string()]).unwrap();
+        // Order chosen to exercise multi-step cycles across chunks.
+        for &id in &[5u32, 2, 7, 0, 9, 1, 8, 3, 6, 4] {
+            append_uniquely_tagged(&mut builder, &[id], 3);
+        }
+        let grid = builder.build().unwrap();
+        assert_sorted_with_tags(&grid, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_build_sorts_multi_chunk_unsorted() {
+        // Multiple chunks, each internally unsorted, with cross-chunk overlap
+        // in lexicographic order.
+        let mut builder =
+            QuoteGridBuilder::new(2, vec![0.9, 1.1], vec!["volume".to_string()]).unwrap();
+        // Chunk 1: ids 5, 2, 7. Chunk 2: ids 3, 0, 9. Chunk 3: ids 8, 1, 4, 6.
+        append_uniquely_tagged(&mut builder, &[5, 2, 7], 2);
+        append_uniquely_tagged(&mut builder, &[3, 0, 9], 2);
+        append_uniquely_tagged(&mut builder, &[8, 1, 4, 6], 2);
+        let grid = builder.build().unwrap();
+        assert_sorted_with_tags(&grid, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_build_already_sorted_is_idempotent() {
+        // Already-sorted input must produce the same data, byte-for-byte
+        // (the cycle algorithm should detect fixed points and skip work).
+        let mut builder =
+            QuoteGridBuilder::new(3, vec![0.9, 1.0, 1.1], vec!["volume".to_string()]).unwrap();
+        append_uniquely_tagged(&mut builder, &[0, 1, 2, 3, 4], 3);
+        let grid = builder.build().unwrap();
+        assert_sorted_with_tags(&grid, &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_build_detects_duplicate_quote_id_within_chunk() {
+        let mut builder =
+            QuoteGridBuilder::new(2, vec![0.9, 1.1], vec!["volume".to_string()]).unwrap();
+        // Same quote id appears twice in one chunk: at append-order 0 and 2.
+        append_uniquely_tagged(&mut builder, &[3, 1, 3], 2);
+        let err = builder.build().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("duplicate"), "missing 'duplicate': {msg}");
+        assert!(msg.contains("Q0003"), "missing offending id Q0003: {msg}");
+        assert!(
+            msg.contains('0') && msg.contains('2'),
+            "should report both occurrences (indices 0 and 2): {msg}"
+        );
+    }
+
+    #[test]
+    fn test_build_detects_duplicate_quote_id_across_chunks() {
+        let mut builder =
+            QuoteGridBuilder::new(2, vec![0.9, 1.1], vec!["volume".to_string()]).unwrap();
+        append_uniquely_tagged(&mut builder, &[3, 1], 2);
+        append_uniquely_tagged(&mut builder, &[5, 1], 2); // Q0001 again, index 3
+        let err = builder.build().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("duplicate"), "missing 'duplicate': {msg}");
+        assert!(msg.contains("Q0001"), "missing offending id Q0001: {msg}");
+        // Q0001 appears at append-order indices 1 and 3.
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "should report both occurrences (indices 1 and 3): {msg}"
+        );
+    }
+
+    #[test]
+    fn test_build_single_quote() {
+        let mut builder =
+            QuoteGridBuilder::new(2, vec![0.9, 1.1], vec!["volume".to_string()]).unwrap();
+        append_uniquely_tagged(&mut builder, &[7], 2);
+        let grid = builder.build().unwrap();
+        assert_sorted_with_tags(&grid, &[7]);
+    }
+
+    #[test]
+    fn test_build_single_swap_two_quotes() {
+        // Two quotes in reverse — exercises a 2-cycle.
+        let mut builder =
+            QuoteGridBuilder::new(2, vec![0.9, 1.1], vec!["volume".to_string()]).unwrap();
+        append_uniquely_tagged(&mut builder, &[1, 0], 2);
+        let grid = builder.build().unwrap();
+        assert_sorted_with_tags(&grid, &[0, 1]);
+    }
+
+    #[test]
+    fn test_build_mixed_cycles_and_fixed_points() {
+        // Permutation: positions 0,3 are fixed; (1,2) is a swap; (4,5,6) is a 3-cycle.
+        // Append order such that after sorting by id, the source positions form
+        // exactly that permutation.
+        // ids in append order: 0, 2, 1, 3, 6, 4, 5
+        // sorted ids:           0, 1, 2, 3, 4, 5, 6
+        // perm[i] = position in source where sorted[i] lives:
+        //   sorted[0]=0 -> source 0
+        //   sorted[1]=1 -> source 2
+        //   sorted[2]=2 -> source 1
+        //   sorted[3]=3 -> source 3
+        //   sorted[4]=4 -> source 5
+        //   sorted[5]=5 -> source 6
+        //   sorted[6]=6 -> source 4
+        // Cycles: {0}, {1,2}, {3}, {4,5,6}.
+        let mut builder =
+            QuoteGridBuilder::new(3, vec![0.9, 1.0, 1.1], vec!["volume".to_string()]).unwrap();
+        append_uniquely_tagged(&mut builder, &[0, 2, 1, 3, 6, 4, 5], 3);
+        let grid = builder.build().unwrap();
+        assert_sorted_with_tags(&grid, &[0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_build_zero_constraints_still_sorts() {
+        // Edge: a builder created with no constraint columns should still sort
+        // objective + quote_ids correctly.
+        let mut builder = QuoteGridBuilder::new(2, vec![0.9, 1.1], vec![]).unwrap();
+        builder
+            .append(
+                &[
+                    "Q0002".to_string(),
+                    "Q0000".to_string(),
+                    "Q0001".to_string(),
+                ],
+                &[200.0, 201.0, 0.0, 1.0, 100.0, 101.0],
+                &[],
+            )
+            .unwrap();
+        let grid = builder.build().unwrap();
+        assert_eq!(grid.quote_ids, vec!["Q0000", "Q0001", "Q0002"]);
+        assert_eq!(grid.objective, vec![0.0, 1.0, 100.0, 101.0, 200.0, 201.0]);
+        assert!(grid.constraints.is_empty());
+    }
+
+    #[test]
+    fn test_build_multi_constraint_permutation() {
+        // Verify all constraint vectors are permuted consistently with objective.
+        let mut builder = QuoteGridBuilder::new(
+            2,
+            vec![0.9, 1.1],
+            vec!["volume".to_string(), "loss_ratio".to_string()],
+        )
+        .unwrap();
+        // Append Q0002, Q0000, Q0001 in that order. Each constraint encodes
+        // `id*1000 + step` (volume) and `id*-1000 - step` (loss_ratio) so a
+        // mis-permutation between constraints would be detectable.
+        let ids = ["Q0002", "Q0000", "Q0001"];
+        let mut obj = Vec::new();
+        let mut vol = Vec::new();
+        let mut lr = Vec::new();
+        for id_str in &ids {
+            let id: u32 = id_str[1..].parse().unwrap();
+            for j in 0..2 {
+                obj.push(id as f32 * 100.0 + j as f32);
+                vol.push(id as f32 * 1000.0 + j as f32);
+                lr.push(-(id as f32) * 1000.0 - j as f32);
+            }
+        }
+        builder
+            .append(
+                &ids.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &obj,
+                &[vol, lr],
+            )
+            .unwrap();
+        let grid = builder.build().unwrap();
+        assert_eq!(grid.quote_ids, vec!["Q0000", "Q0001", "Q0002"]);
+        for q in 0..3 {
+            let id: u32 = grid.quote_ids[q][1..].parse().unwrap();
+            for j in 0..2 {
+                let idx = q * 2 + j;
+                assert!((grid.objective[idx] - (id as f32 * 100.0 + j as f32)).abs() < 1e-6);
+                assert!((grid.constraints[0][idx] - (id as f32 * 1000.0 + j as f32)).abs() < 1e-3);
+                assert!(
+                    (grid.constraints[1][idx] - (-(id as f32) * 1000.0 - j as f32)).abs() < 1e-3
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_n_steps_one() {
+        // Edge: n_steps = 1 means each quote occupies a single row. Cycle
+        // permutation must still work; tmp_obj/tmp_cons are single-element.
+        let mut builder = QuoteGridBuilder::new(1, vec![1.0], vec!["volume".to_string()]).unwrap();
+        append_uniquely_tagged(&mut builder, &[5, 0, 3, 1, 2, 4], 1);
+        let grid = builder.build().unwrap();
+        assert_sorted_with_tags(&grid, &[0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_build_single_giant_cycle() {
+        // A permutation that's one cycle of length n_quotes (no fixed points,
+        // no smaller cycles). Constructed by appending in the order
+        // [n-1, 0, 1, 2, ..., n-2]: sorted index 0 needs source 1, sorted 1
+        // needs source 2, ..., sorted n-2 needs source n-1, sorted n-1 needs
+        // source 0 — a single n-cycle.
+        let n = 11;
+        let n_steps = 3;
+        let mut ids: Vec<u32> = vec![(n - 1) as u32];
+        ids.extend(0..(n - 1) as u32);
+        let mut builder =
+            QuoteGridBuilder::new(n_steps, vec![0.9, 1.0, 1.1], vec!["volume".to_string()])
+                .unwrap();
+        append_uniquely_tagged(&mut builder, &ids, n_steps);
+        let grid = builder.build().unwrap();
+        assert_sorted_with_tags(&grid, &(0..n as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_build_scenario_values_unaffected_by_sort() {
+        // Sort permutes per-quote arrays, but scenario_values is shared
+        // across all quotes (length n_steps) — it must NOT be permuted.
+        let mut builder =
+            QuoteGridBuilder::new(3, vec![0.7, 1.0, 1.3], vec!["volume".to_string()]).unwrap();
+        // Append in reverse so the sort actually moves data.
+        append_uniquely_tagged(&mut builder, &[9, 5, 1, 7, 3], 3);
+        let grid = builder.build().unwrap();
+        assert_eq!(grid.scenario_values, vec![0.7, 1.0, 1.3]);
+    }
+
+    #[test]
+    fn test_build_large_n_quotes_stresses_bitset() {
+        // n_quotes = 130 spans 3 u64 words in the visited bitset and is not
+        // a multiple of 64; exercises both word-boundary handling and the
+        // tail bits of the last word.
+        let n = 130;
+        let n_steps = 2;
+        let mut builder =
+            QuoteGridBuilder::new(n_steps, vec![0.95, 1.05], vec!["volume".to_string()]).unwrap();
+        // Reverse-append to force a non-trivial permutation across all bits.
+        let ids: Vec<u32> = (0..n as u32).rev().collect();
+        append_uniquely_tagged(&mut builder, &ids, n_steps);
+        let grid = builder.build().unwrap();
+        assert_sorted_with_tags(&grid, &(0..n as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_build_property_random_shuffles_match_naive_sort() {
+        // Property test: many random shuffles of a known grid should each
+        // produce the same canonical-sorted result. Verifies the cycle
+        // permutation against a naive copy-based sort.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let n_steps = 4;
+        let n_quotes = 23; // odd, prime — exercises odd-length and 1-cycles
+        let scenario_values = vec![0.85, 0.95, 1.05, 1.15];
+
+        // Build the canonical (sorted) reference via append-in-order.
+        let mut ref_builder =
+            QuoteGridBuilder::new(n_steps, scenario_values.clone(), vec!["volume".to_string()])
+                .unwrap();
+        let canonical_ids: Vec<u32> = (0..n_quotes as u32).collect();
+        append_uniquely_tagged(&mut ref_builder, &canonical_ids, n_steps);
+        let reference = ref_builder.build().unwrap();
+
+        // Try multiple deterministic shuffles via a tiny seeded hash-shuffle.
+        for seed in 0u64..16 {
+            let mut shuffled: Vec<u32> = canonical_ids.clone();
+            // Fisher-Yates with a deterministic PRNG built from the seed.
+            for i in (1..shuffled.len()).rev() {
+                let mut h = DefaultHasher::new();
+                (seed, i as u64).hash(&mut h);
+                let j = (h.finish() as usize) % (i + 1);
+                shuffled.swap(i, j);
+            }
+
+            let mut builder =
+                QuoteGridBuilder::new(n_steps, scenario_values.clone(), vec!["volume".to_string()])
+                    .unwrap();
+            append_uniquely_tagged(&mut builder, &shuffled, n_steps);
+            let grid = builder.build().unwrap();
+
+            assert_eq!(
+                grid.quote_ids, reference.quote_ids,
+                "seed {seed}: quote_ids mismatch (input shuffle: {shuffled:?})"
+            );
+            assert_eq!(
+                grid.objective, reference.objective,
+                "seed {seed}: objective mismatch"
+            );
+            assert_eq!(
+                grid.constraints, reference.constraints,
+                "seed {seed}: constraints mismatch"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

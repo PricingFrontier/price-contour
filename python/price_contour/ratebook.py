@@ -14,8 +14,8 @@ from price_contour._price_contour import (
     FrontierResult,
     GroupedSolveResult,
     QuoteGrid,
-    build_interaction_labels_py,
     compute_residuals_py,
+    extract_factor_labels_py,
     solve_grouped_py,
     update_multipliers_py,
 )
@@ -400,17 +400,18 @@ class RatebookOptimiser:
         # Build candidates
         candidates = self._build_candidates()
 
-        # Build per-factor group labels from the factors DataFrame
-        factor_group_labels: list[list[str]] = []
-        for spec in factor_specs:
-            if len(spec) == 1:
-                labels = factors[spec[0]].cast(pl.Utf8).to_list()
-            else:
-                # Interaction: concatenate column values using unit separator
-                # (ASCII 31) to avoid collisions with colons in data values
-                label_cols = [factors[c].cast(pl.Utf8).to_list() for c in spec]
-                labels = build_interaction_labels_py(label_cols, "\x1f")
-            factor_group_labels.append(labels)
+        # Build per-factor group labels from the factors DataFrame.
+        #
+        # `extract_factor_labels_py` casts each spec's columns to Utf8 inside
+        # Rust and emits the per-quote labels directly — skipping the
+        # `factors[col].to_list()` round-trip that previously materialised
+        # gigabytes of transient Python `list[str]` objects on large
+        # portfolios. ASCII 31 (unit separator) is the canonical interaction
+        # join character; it avoids collisions with colons that legitimately
+        # appear in factor values.
+        factor_group_labels: list[list[str]] = extract_factor_labels_py(
+            factors, factor_specs, "\x1f"
+        )
 
         # Initialise factor tables: each group level → 1.0
         factor_tables: list[dict[str, float]] = []
@@ -562,9 +563,15 @@ class RatebookOptimiser:
         n_quotes = grid.n_quotes
         candidates = self._build_candidates()
 
+        # Extract every column's labels in one Rust-side pass — same memory
+        # win as the main solve loop. Column order in `all_labels` matches
+        # `factors.columns` order.
+        all_labels = extract_factor_labels_py(
+            factors, [[col] for col in factors.columns], "\x1f"
+        )
+
         lifts: list[tuple[str, float]] = []
-        for col in factors.columns:
-            labels = factors[col].cast(pl.Utf8).to_list()
+        for col, labels in zip(factors.columns, all_labels):
             residuals = [1.0] * n_quotes
 
             result = solve_grouped_py(

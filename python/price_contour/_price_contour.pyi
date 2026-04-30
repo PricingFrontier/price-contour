@@ -33,6 +33,7 @@ class QuoteGridBuilder:
         scenario_index: str = "scenario_index",
         scenario_value_col: str = "scenario_value",
         objective: str = "expected_income",
+        n_steps: int | None = None,
     ) -> None: ...
     def append(self, df: pl.DataFrame) -> None: ...
     def build(self) -> QuoteGrid: ...
@@ -92,6 +93,23 @@ class ApplyResult:
     def baseline_constraints(self) -> dict[str, float]: ...
     @property
     def dataframe(self) -> pl.DataFrame: ...
+
+class ChunkedApplyResult:
+    """Aggregate result of `apply_lambdas_to_parquet_chunked` — per-quote
+    rows are streamed to `output_path`, not held in memory."""
+
+    @property
+    def lambdas(self) -> dict[str, float]: ...
+    @property
+    def total_objective(self) -> float: ...
+    @property
+    def total_constraints(self) -> dict[str, float]: ...
+    @property
+    def baseline_objective(self) -> float: ...
+    @property
+    def baseline_constraints(self) -> dict[str, float]: ...
+    @property
+    def output_path(self) -> str: ...
 
 # ---------------------------------------------------------------------------
 # GroupedSolveResult
@@ -181,6 +199,19 @@ def apply_from_grid_py(
     lambdas: dict[str, float],
     constraints: dict[str, dict[str, float]],
 ) -> ApplyResult: ...
+def apply_lambdas_to_parquet_chunked_py(
+    parquet_in: str,
+    parquet_out: str,
+    lambdas: dict[str, float],
+    constraints: dict[str, dict[str, float]],
+    chunk_size: int,
+    *,
+    quote_id: str = "quote_id",
+    scenario_index: str = "scenario_index",
+    scenario_value_col: str = "scenario_value",
+    objective: str = "expected_income",
+    n_steps: int | None = None,
+) -> ChunkedApplyResult: ...
 def solve_grouped_py(
     grid: QuoteGrid,
     group_labels: list[str],
@@ -212,3 +243,43 @@ def build_grid_from_parquet_py(
     scenario_value_col: str = "scenario_value",
     objective: str = "expected_income",
 ) -> QuoteGrid: ...
+def build_grid_from_parquet_chunked_py(
+    path: str,
+    constraint_columns: list[str],
+    chunk_size: int,
+    *,
+    quote_id: str = "quote_id",
+    scenario_index: str = "scenario_index",
+    scenario_value_col: str = "scenario_value",
+    objective: str = "expected_income",
+    n_steps: int | None = None,
+) -> QuoteGrid: ...
+
+# ---------------------------------------------------------------------------
+# Ratebook helpers
+# ---------------------------------------------------------------------------
+
+def compute_residuals_py(
+    overall_mult: list[float],
+    group_labels: list[str],
+    factor_table: dict[str, float],
+) -> list[float]: ...
+def update_multipliers_py(
+    overall_mult: list[float],
+    group_labels: list[str],
+    old_table: dict[str, float],
+    new_table: dict[str, float],
+) -> list[float]: ...
+def build_interaction_labels_py(
+    columns: list[list[str]],
+    separator: str,
+) -> list[str]:
+    """Deprecated: prefer ``extract_factor_labels_py`` which casts inside
+    Rust and avoids the per-element ``PyUnicode`` round-trip. Retained for
+    backwards compatibility with downstream callers."""
+    ...
+def extract_factor_labels_py(
+    factors: pl.DataFrame,
+    factor_specs: list[list[str]],
+    separator: str = "\x1f",
+) -> list[list[str]]: ...
