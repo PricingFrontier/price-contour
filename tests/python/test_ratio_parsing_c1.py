@@ -38,13 +38,11 @@ sees the ratio shape.
 
 from __future__ import annotations
 
-import math
 
 import polars as pl
 import pytest
 
 import price_contour as pc
-from price_contour.apply import apply_from_grid
 from price_contour.solver import _validate_constraint_dict, _validate_dataframe
 from helpers import make_small_df, make_factors
 

@@ -55,7 +55,6 @@ import polars as pl
 import pytest
 
 import price_contour as pc
-from price_contour.apply import apply_from_grid
 
 # Reuse the C2 fixture helpers so the test data is identical to the
 # linearisation-and-solve test file. The fixtures are parameterised on
@@ -64,7 +63,6 @@ from price_contour.apply import apply_from_grid
 from test_ratio_solve_c2 import (
     RATIO_ABS_SLACK,
     RATIO_RTOL,
-    actual_ratio_at_optimum,
     baseline_ratio,
     make_ratio_solve_df,
     make_retention_df,
@@ -900,21 +898,6 @@ class TestRatioFrontierEdgeCases:
         )
         baseline_volume = peek.solve(df).baseline_constraints["premium"]
 
-        # Mixed 2D: volume axis at single value, loss_ratio swept across 3.
-        n_lr = 3
-        solver = pc.OnlineOptimiser(
-            objective="income",
-            constraints={
-                "premium": {"min": None},
-                "loss_ratio": {
-                    "numerator": "incurred",
-                    "denominator": "premium",
-                    "max": None,
-                },
-            },
-            max_iter=200,
-            tolerance=1e-4,
-        )
         # We pass n_points_per_dim=3, but the volume range has lo == hi
         # so the volume axis has only one unique value (the same point
         # repeated). Total points = 3 (loss_ratio sweep) but n_points_per_dim

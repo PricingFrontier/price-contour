@@ -57,7 +57,6 @@ import polars as pl
 import pytest
 
 import price_contour as pc
-from price_contour.apply import apply_from_grid
 
 # Reuse the C2 fixture helpers so the linearisation path under test is
 # the same in shape as the online-solve tests: identical scenario grid,
@@ -67,7 +66,6 @@ from price_contour.apply import apply_from_grid
 from test_ratio_solve_c2 import (
     RATIO_ABS_SLACK,
     RATIO_RTOL,
-    actual_ratio_at_optimum,
     baseline_ratio,
     make_ratio_solve_df,
     make_retention_df,

@@ -56,7 +56,6 @@ import polars as pl
 import pytest
 
 import price_contour as pc
-from price_contour.apply import apply_from_grid
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +810,6 @@ class TestRatioSolveEdgeCases:
         """
         df = make_ratio_solve_df(n_quotes=20, n_steps=5)
         # Inject a NaN into the numerator column.
-        n_rows = df.shape[0]
         incurred_vals = df["incurred"].to_list()
         incurred_vals[0] = float("nan")
         df = df.with_columns(

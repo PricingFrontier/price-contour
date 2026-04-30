@@ -86,7 +86,6 @@ The natural shape mirrors C2 / C3 / C4:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import polars as pl
 import pytest
