@@ -171,9 +171,7 @@ pub fn sweep_frontier_py(
         if threshold_ranges.contains_key(name) {
             continue;
         }
-        let is_none_threshold = spec
-            .values()
-            .any(|v: &Option<f64>| v.is_none());
+        let is_none_threshold = spec.values().any(|v: &Option<f64>| v.is_none());
         if is_none_threshold {
             return Err(PyValueError::new_err(format!(
                 "No threshold_range for constraint '{}'",

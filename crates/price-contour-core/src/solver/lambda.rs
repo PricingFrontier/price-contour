@@ -73,8 +73,14 @@ mod tests {
             threshold: 100.0,
         }];
         let totals = vec![90.0];
-        let change =
-            update_lambdas_subgradient(&mut lambdas, &specs, &totals, &[100.0], &default_scales(1), 0);
+        let change = update_lambdas_subgradient(
+            &mut lambdas,
+            &specs,
+            &totals,
+            &[100.0],
+            &default_scales(1),
+            0,
+        );
         assert!(
             lambdas[0] > 0.0,
             "lambda should increase when min constraint is violated"
@@ -91,7 +97,14 @@ mod tests {
             threshold: 100.0,
         }];
         let totals = vec![110.0];
-        update_lambdas_subgradient(&mut lambdas, &specs, &totals, &[100.0], &default_scales(1), 0);
+        update_lambdas_subgradient(
+            &mut lambdas,
+            &specs,
+            &totals,
+            &[100.0],
+            &default_scales(1),
+            0,
+        );
         assert!(
             lambdas[0] < 1.0,
             "lambda should decrease when min constraint is satisfied"
@@ -107,7 +120,14 @@ mod tests {
             threshold: 100.0,
         }];
         let totals = vec![110.0];
-        update_lambdas_subgradient(&mut lambdas, &specs, &totals, &[100.0], &default_scales(1), 0);
+        update_lambdas_subgradient(
+            &mut lambdas,
+            &specs,
+            &totals,
+            &[100.0],
+            &default_scales(1),
+            0,
+        );
         assert!(
             lambdas[0] > 0.0,
             "lambda should increase when max constraint is violated"
@@ -123,7 +143,14 @@ mod tests {
             threshold: 100.0,
         }];
         let totals = vec![90.0];
-        update_lambdas_subgradient(&mut lambdas, &specs, &totals, &[100.0], &default_scales(1), 0);
+        update_lambdas_subgradient(
+            &mut lambdas,
+            &specs,
+            &totals,
+            &[100.0],
+            &default_scales(1),
+            0,
+        );
         assert!(lambdas[0] < 1.0);
     }
 
@@ -136,7 +163,14 @@ mod tests {
             threshold: 100.0,
         }];
         let totals = vec![1_000_000.0];
-        update_lambdas_subgradient(&mut lambdas, &specs, &totals, &[100.0], &default_scales(1), 0);
+        update_lambdas_subgradient(
+            &mut lambdas,
+            &specs,
+            &totals,
+            &[100.0],
+            &default_scales(1),
+            0,
+        );
         assert!(
             lambdas[0] >= 0.0,
             "lambda must be non-negative, got {}",
@@ -189,24 +223,10 @@ mod tests {
         let totals = vec![90.0];
 
         let mut lambdas_scaled = vec![0.0];
-        update_lambdas_subgradient(
-            &mut lambdas_scaled,
-            &specs,
-            &totals,
-            &[100.0],
-            &[10.0],
-            0,
-        );
+        update_lambdas_subgradient(&mut lambdas_scaled, &specs, &totals, &[100.0], &[10.0], 0);
 
         let mut lambdas_unscaled = vec![0.0];
-        update_lambdas_subgradient(
-            &mut lambdas_unscaled,
-            &specs,
-            &totals,
-            &[100.0],
-            &[1.0],
-            0,
-        );
+        update_lambdas_subgradient(&mut lambdas_unscaled, &specs, &totals, &[100.0], &[1.0], 0);
 
         assert!(
             lambdas_scaled[0] > lambdas_unscaled[0],

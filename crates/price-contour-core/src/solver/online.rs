@@ -580,5 +580,4 @@ mod tests {
             "error should mention initial_lambdas length: {msg}"
         );
     }
-
 }

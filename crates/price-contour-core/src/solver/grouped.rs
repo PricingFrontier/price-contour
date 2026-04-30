@@ -307,12 +307,8 @@ pub fn solve_grouped(
         total_constraints = iter_cons;
 
         // Check constraint satisfaction
-        let all_satisfied = all_constraints_satisfied(
-            specs,
-            &total_constraints,
-            &baseline_cons,
-            config.tolerance,
-        );
+        let all_satisfied =
+            all_constraints_satisfied(specs, &total_constraints, &baseline_cons, config.tolerance);
 
         if all_satisfied && total_objective > best_feasible_obj {
             best_feasible_obj = total_objective;

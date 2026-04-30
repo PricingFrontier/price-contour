@@ -426,20 +426,19 @@ pub(crate) fn parse_constraints(
             continue;
         };
 
-        let (direction, raw_threshold, is_pct) =
-            if let Some(value_opt) = spec_dict.get("min") {
-                (ConstraintDirection::Min, value_opt, false)
-            } else if let Some(value_opt) = spec_dict.get("max") {
-                (ConstraintDirection::Max, value_opt, false)
-            } else if let Some(value_opt) = spec_dict.get("min_pct") {
-                (ConstraintDirection::Min, value_opt, true)
-            } else if let Some(value_opt) = spec_dict.get("max_pct") {
-                (ConstraintDirection::Max, value_opt, true)
-            } else {
-                // validate_constraints_dict already requires exactly one
-                // direction key, so this branch is unreachable.
-                continue;
-            };
+        let (direction, raw_threshold, is_pct) = if let Some(value_opt) = spec_dict.get("min") {
+            (ConstraintDirection::Min, value_opt, false)
+        } else if let Some(value_opt) = spec_dict.get("max") {
+            (ConstraintDirection::Max, value_opt, false)
+        } else if let Some(value_opt) = spec_dict.get("min_pct") {
+            (ConstraintDirection::Min, value_opt, true)
+        } else if let Some(value_opt) = spec_dict.get("max_pct") {
+            (ConstraintDirection::Max, value_opt, true)
+        } else {
+            // validate_constraints_dict already requires exactly one
+            // direction key, so this branch is unreachable.
+            continue;
+        };
 
         let Some(value) = raw_threshold else {
             return Err(PyValueError::new_err(format!(

@@ -76,7 +76,12 @@ mod tests {
         }];
         let baseline = vec![100.0];
         // 99.5 is within tolerance (100 * 1e-5 * 10 = 0.01)
-        assert!(all_constraints_satisfied(&specs, &[99.995], &baseline, 1e-5));
+        assert!(all_constraints_satisfied(
+            &specs,
+            &[99.995],
+            &baseline,
+            1e-5
+        ));
         // 98 is NOT within tolerance
         assert!(!all_constraints_satisfied(&specs, &[98.0], &baseline, 1e-5));
     }
@@ -89,7 +94,12 @@ mod tests {
             threshold: 50.0,
         }];
         let baseline = vec![50.0];
-        assert!(all_constraints_satisfied(&specs, &[50.0004], &baseline, 1e-5));
+        assert!(all_constraints_satisfied(
+            &specs,
+            &[50.0004],
+            &baseline,
+            1e-5
+        ));
         assert!(!all_constraints_satisfied(&specs, &[51.0], &baseline, 1e-5));
     }
 
