@@ -43,7 +43,9 @@ jobs:
     if: needs.check-version.outputs.version_changed == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: true
+      # Don't cancel sibling jobs on first failure — keep good wheels from
+      # the OSes that finished while we debug the one that didn't.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -57,11 +59,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Ensure a 3.10 interpreter is available — abi3-py310 produces ONE
+      # wheel that works for 3.10..3.13 simultaneously, but maturin still
+      # needs a host interpreter to build against. Pinning 3.10 also makes
+      # the rust-cache key stable across runner Python upgrades.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # Cache `~/.cargo/registry` and the `target/` dir keyed on
+      # Cargo.lock + the matrix target. Cold first run after a lock change
+      # is unchanged; subsequent runs drop polars compilation entirely.
+      # Note: this runs natively on macOS/Windows. On the manylinux Linux
+      # build it has limited effect because maturin-action runs `cargo`
+      # inside a Docker container that doesn't see the runner's filesystem.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: ${{ matrix.target }}
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --strip --out dist --interpreter 3.10 3.11 3.12 3.13
+          # No `--interpreter` flag: maturin detects abi3 via the
+          # pyo3/abi3-py310 feature in pyproject.toml and produces a
+          # single wheel that works for Python 3.10+. `--strip` is a
+          # no-op on Windows (debug info lives in separate `.pdb` files)
+          # and adds time on macOS/Linux for negligible size savings;
+          # leaving it off keeps the wheel slightly larger but speeds
+          # the build.
+          args: --release --out dist
           sccache: "true"
           manylinux: auto
 

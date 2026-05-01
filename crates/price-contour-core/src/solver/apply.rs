@@ -3,17 +3,30 @@ use crate::error::{PriceContourError, Result};
 
 use super::argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
 
-/// Single-pass Lagrangian argmax with fixed lambdas (no iteration).
+/// Result of one Lagrangian argmax pass at fixed lambdas, without baselines.
 ///
-/// One forward pass with rayon-parallel argmax — no lambda updates.
-/// Internal parallelism is handled by rayon grain sizes.
-pub fn apply_lambdas(
+/// Returned by `apply_lambdas_no_baselines` so callers that already have
+/// the per-grid baselines (e.g. the frontier sweep) avoid re-running the
+/// O(n_quotes * n_constraints) baseline pass on every probe.
+pub struct ApplyPass {
+    pub optimal_steps: Vec<u32>,
+    pub total_objective: f64,
+    pub total_constraints: Vec<f64>,
+}
+
+/// Single-pass Lagrangian argmax with fixed lambdas — no baseline pass,
+/// no `grid.validate()`.
+///
+/// **Precondition**: caller must have validated the grid (via
+/// [`QuoteGrid::validate`] or by reaching here from a public entry point
+/// like [`apply_lambdas`] or `sweep_frontier` that validates at the
+/// boundary). Hot loops (frontier bisection, repeated probes) call this
+/// directly to skip the per-call validation pass.
+pub fn apply_lambdas_no_baselines(
     grid: &QuoteGrid,
     specs: &[ConstraintSpec],
     lambdas: &[f64],
-) -> Result<ApplyResult> {
-    grid.validate()?;
-
+) -> Result<ApplyPass> {
     if lambdas.len() != specs.len() {
         return Err(PriceContourError::DimensionMismatch(format!(
             "lambdas length {} != specs count {}",
@@ -30,20 +43,37 @@ pub fn apply_lambdas(
     }
 
     let n_quotes = grid.n_quotes;
-
     let lambda_signs_f32 = compute_lambda_signs_f32(specs, lambdas);
 
-    // Single-pass argmax over all quotes (rayon parallelism inside)
     let (optimal_steps, total_objective, total_constraints) =
         lagrangian_argmax_pass(grid, &lambda_signs_f32, 0, n_quotes);
 
+    Ok(ApplyPass {
+        optimal_steps,
+        total_objective,
+        total_constraints,
+    })
+}
+
+/// Single-pass Lagrangian argmax with fixed lambdas (no iteration).
+///
+/// One forward pass with rayon-parallel argmax — no lambda updates.
+/// Internal parallelism is handled by rayon grain sizes. Validates the
+/// grid at the public boundary so internals can skip per-call validation.
+pub fn apply_lambdas(
+    grid: &QuoteGrid,
+    specs: &[ConstraintSpec],
+    lambdas: &[f64],
+) -> Result<ApplyResult> {
+    grid.validate()?;
+    let pass = apply_lambdas_no_baselines(grid, specs, lambdas)?;
     let (baseline_objective, baseline_constraints) = grid.baseline_totals();
 
     Ok(ApplyResult {
-        optimal_steps,
+        optimal_steps: pass.optimal_steps,
         lambdas: lambdas.to_vec(),
-        total_objective,
-        total_constraints,
+        total_objective: pass.total_objective,
+        total_constraints: pass.total_constraints,
         baseline_objective,
         baseline_constraints,
     })

@@ -6,6 +6,7 @@ mod lambda;
 mod online;
 
 pub use apply::apply_lambdas;
+pub(crate) use apply::{apply_lambdas_no_baselines, ApplyPass};
 pub use argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
 pub use convergence::{all_constraints_satisfied, select_final_lambdas};
 pub use grouped::solve_grouped;

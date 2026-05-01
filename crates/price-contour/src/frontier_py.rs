@@ -7,7 +7,8 @@ use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
 use price_contour_core::{
-    sweep_frontier, ConstraintSpec, FrontierConfig, FrontierResult, SolverConfig,
+    sweep_frontier, ConstraintSpec, FrontierConfig, FrontierResult, NonConvergenceReason,
+    SolverConfig, SolverPath,
 };
 
 use crate::constraint_parsing::{direction_for, is_pct_key, validate_constraints_dict};
@@ -75,6 +76,39 @@ impl PyFrontierResult {
 
         let conv_vals: Vec<bool> = self.inner.points.iter().map(|p| p.converged).collect();
         columns.push(Column::new("converged".into(), &conv_vals));
+
+        // Solver path — string label so Python callers can filter rows
+        // by `"bisection"` / `"subgradient"` without depending on Rust
+        // enum integer values. The work-units in `iterations` differ
+        // across paths; this column is the disambiguator.
+        let path_vals: Vec<&'static str> = self
+            .inner
+            .points
+            .iter()
+            .map(|p| match p.solver_path {
+                SolverPath::Bisection => "bisection",
+                SolverPath::Subgradient => "subgradient",
+            })
+            .collect();
+        columns.push(Column::new("solver_path".into(), &path_vals));
+
+        // Non-convergence reason (None for converged points). String
+        // labels for the same reasoning as `solver_path`. `null` is
+        // emitted as a Polars null entry rather than an empty string so
+        // downstream `is_null()` filters work naturally.
+        let reason_vals: Vec<Option<&'static str>> = self
+            .inner
+            .points
+            .iter()
+            .map(|p| {
+                p.non_convergence_reason.map(|r| match r {
+                    NonConvergenceReason::AboveEnvelope => "above_envelope",
+                    NonConvergenceReason::BracketExpansionExhausted => "bracket_exhausted",
+                    NonConvergenceReason::IterationBudgetExhausted => "iteration_budget_exhausted",
+                })
+            })
+            .collect();
+        columns.push(Column::new("non_convergence_reason".into(), &reason_vals));
 
         // Scenario value distribution stats — helper macro avoids complex type
         macro_rules! sv_col {

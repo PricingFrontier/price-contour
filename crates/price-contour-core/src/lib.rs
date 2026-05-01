@@ -11,7 +11,8 @@ pub use data::{
 };
 pub use error::{PriceContourError, Result};
 pub use frontier::{
-    sweep_frontier, FrontierConfig, FrontierPoint, FrontierResult, ScenarioValueStats,
+    sweep_frontier, FrontierConfig, FrontierPoint, FrontierResult, NonConvergenceReason,
+    ScenarioValueStats, SolverPath,
 };
 pub use solver::{
     apply_lambdas, compute_lambda_signs_f32, lagrangian_argmax_pass, solve_grouped, solve_online,

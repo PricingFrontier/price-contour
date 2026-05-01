@@ -144,6 +144,36 @@ pub enum ConstraintDirection {
     Max,
 }
 
+impl ConstraintDirection {
+    /// One-sided satisfaction check matching the constraint direction.
+    ///
+    /// `Min`: returns `true` iff `total >= target`.
+    /// `Max`: returns `true` iff `total <= target`.
+    ///
+    /// Centralised here so every solver path (frontier bisection, lambda
+    /// subgradient, argmax sign) routes through one canonical
+    /// definition. Adding a new `ConstraintDirection` variant becomes a
+    /// compile-error checklist instead of a grep across the codebase.
+    #[inline]
+    pub fn is_satisfied(self, total: f64, target: f64) -> bool {
+        match self {
+            ConstraintDirection::Min => total >= target,
+            ConstraintDirection::Max => total <= target,
+        }
+    }
+
+    /// Signed residual (target - actual for Min, actual - target for Max).
+    /// Positive means *violated*, negative means *over-satisfied*. Useful
+    /// for subgradient updates that want a single sign convention.
+    #[inline]
+    pub fn signed_residual(self, total: f64, target: f64) -> f64 {
+        match self {
+            ConstraintDirection::Min => target - total,
+            ConstraintDirection::Max => total - target,
+        }
+    }
+}
+
 /// Specification for a single constraint in the optimisation problem.
 #[derive(Debug, Clone)]
 pub struct ConstraintSpec {

@@ -1,5 +1,5 @@
 use crate::constants::{SUBGRADIENT_ALPHA, SUBGRADIENT_MIN_STEP};
-use crate::data::{ConstraintDirection, ConstraintSpec};
+use crate::data::ConstraintSpec;
 
 /// Update lambdas using subgradient method with per-constraint scale factors.
 ///
@@ -30,10 +30,10 @@ pub fn update_lambdas_subgradient(
     let mut max_change: f64 = 0.0;
 
     for (k, spec) in specs.iter().enumerate() {
-        let gap = match spec.direction {
-            ConstraintDirection::Min => spec.threshold - totals[k],
-            ConstraintDirection::Max => totals[k] - spec.threshold,
-        };
+        // Positive when the constraint is violated. Centralised on
+        // `ConstraintDirection` so adding a new direction variant is a
+        // compile-error checklist instead of a grep-around exercise.
+        let gap = spec.direction.signed_residual(totals[k], spec.threshold);
 
         // Normalize gap: divide by threshold magnitude, multiply by scale factor.
         // This makes the step size independent of the absolute scale of the
@@ -59,6 +59,7 @@ pub fn update_lambdas_subgradient(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::ConstraintDirection;
 
     fn default_scales(n: usize) -> Vec<f64> {
         vec![1.0; n]

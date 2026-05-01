@@ -32,20 +32,20 @@
         "total_volume": 25.579409569501877
       },
       {
-        "converged": false,
-        "iterations": 200,
-        "lambda_volume": 2.5848130114681447,
+        "converged": true,
+        "iterations": 35,
+        "lambda_volume": 5.078719854354858,
         "threshold_volume": 1.0500000000000003,
-        "total_objective": 2440.574436187744,
-        "total_volume": 26.02577430009842
+        "total_objective": 2439.610118865967,
+        "total_volume": 26.273578733205795
       },
       {
-        "converged": false,
-        "iterations": 200,
-        "lambda_volume": 8.38256826927415,
+        "converged": true,
+        "iterations": 34,
+        "lambda_volume": 15.510633959717893,
         "threshold_volume": 1.1,
-        "total_objective": 2435.2458839416504,
-        "total_volume": 26.92672899365425
+        "total_objective": 2428.194408416748,
+        "total_volume": 27.51778534054756
       }
     ]
   },

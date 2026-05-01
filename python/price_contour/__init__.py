@@ -5,6 +5,7 @@ Lagrangian dual decomposition for portfolio-level price optimisation,
 with Rust core and Polars DataFrame interop.
 """
 
+from enum import Enum
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 try:
@@ -29,6 +30,33 @@ from price_contour._price_contour import (
     build_grid_from_parquet_py as _build_grid_from_parquet_inner,
     build_grid_from_parquet_chunked_py as _build_grid_from_parquet_chunked_inner,
 )
+
+
+class SolverPath(str, Enum):
+    """Mirror of the Rust ``SolverPath`` enum surfaced as strings on the
+    frontier result's ``solver_path`` column.
+
+    Use these constants instead of bare string literals when filtering
+    or comparing — a typo against ``SolverPath.BISECTION`` is a
+    ``NameError`` at import; a typo against ``"bisect"`` silently
+    returns no rows. The ``str`` mixin makes ``SolverPath.BISECTION ==
+    "bisection"`` evaluate ``True`` so legacy comparisons keep working.
+    """
+
+    BISECTION = "bisection"
+    SUBGRADIENT = "subgradient"
+
+
+class NonConvergenceReason(str, Enum):
+    """Mirror of the Rust ``NonConvergenceReason`` enum surfaced as
+    strings on the frontier result's ``non_convergence_reason`` column.
+
+    See :class:`SolverPath` for the typo-safety rationale.
+    """
+
+    ABOVE_ENVELOPE = "above_envelope"
+    BRACKET_EXHAUSTED = "bracket_exhausted"
+    ITERATION_BUDGET_EXHAUSTED = "iteration_budget_exhausted"
 
 
 def build_grid_from_parquet(
@@ -261,11 +289,13 @@ __all__ = [
     "FrontierResult",
     "FrontierResultLike",
     "GroupedSolveResult",
+    "NonConvergenceReason",
     "OnlineOptimiser",
     "QuoteGrid",
     "QuoteGridBuilder",
     "RatebookOptimiser",
     "RatebookResult",
+    "SolverPath",
     "SolveResult",
     "build_grid_from_parquet",
     "build_grid_from_parquet_chunked",

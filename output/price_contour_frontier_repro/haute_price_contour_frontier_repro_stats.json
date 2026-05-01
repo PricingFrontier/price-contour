@@ -1,0 +1,48 @@
+{
+  "config": {
+    "constraints": {
+      "conversion_prediction": {
+        "min": 0
+      }
+    },
+    "frontier_ranges": {
+      "conversion_prediction": {
+        "max": 99695.75,
+        "min": 189.03746032714844
+      }
+    },
+    "max_iter": 50,
+    "objective": "expected_margin",
+    "quote_id": "quote_id",
+    "scenario_index": "scenario_index",
+    "scenario_value": "premium_multiplier",
+    "tolerance": 1e-06
+  },
+  "path": "C:\\Users\\prici\\haute\\output\\price_contour_frontier_repro\\haute_price_contour_frontier_repro.parquet",
+  "scenario_envelope": {
+    "max_steps_per_quote": 21,
+    "min_steps_per_quote": 21,
+    "sum_quote_max_constraint": 99695.7421875,
+    "sum_quote_min_constraint": 189.03746032714844
+  },
+  "schema": {
+    "conversion_prediction": "Float32",
+    "expected_margin": "Float32",
+    "premium_multiplier": "Float32",
+    "quote_id": "Categorical",
+    "scenario_index": "Int32"
+  },
+  "totals": {
+    "constraint_nulls": 0,
+    "n_quotes": 100000,
+    "n_scenarios": 21,
+    "objective_nulls": 0,
+    "row_max_constraint": 0.9991123080253601,
+    "row_max_objective": 224.9648895263672,
+    "row_min_constraint": 0.0005264091887511313,
+    "row_min_objective": -6095.15576171875,
+    "rows": 2100000,
+    "scenario_value_max": 1.399999976158142,
+    "scenario_value_min": 0.20000000298023224
+  }
+}
