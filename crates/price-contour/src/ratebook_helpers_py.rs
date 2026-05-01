@@ -157,8 +157,18 @@ pub fn build_interaction_labels_py(
 /// each) before PyO3 unwraps the strings back into a Rust `Vec<String>`.
 /// For 50M-quote portfolios that's gigabytes of transient Python overhead.
 /// This function casts inside Rust and only ever produces the final
-/// `Vec<String>` — the Rust-side intermediate buffers are the same size as
-/// they were before, but the per-element Python wrapping is gone.
+/// `Vec<String>`s, eliminating that wrapping cost.
+///
+/// **Memory caveat for multi-column interaction specs:** to build a joined
+/// label per row, we cast each column to Utf8 once and hold all the casted
+/// `Series` alive for the duration of the join (so the underlying string
+/// buffers stay valid while we walk rows in lock-step). For a K-column
+/// interaction on `N` rows, that's `K × N × avg_string_len` of casted
+/// buffers held concurrently, vs the legacy Python path which processed
+/// columns one at a time. For the common K=1-2 case this is fine; for
+/// deep interactions on very large `N`, the Rust-side peak is higher
+/// than legacy by a factor of K. The PyUnicode-elision win still
+/// dominates net memory for typical workloads.
 ///
 /// Nulls in any factor column are rejected with a clear error naming the
 /// offending column. Non-string columns are auto-cast to Utf8 via Polars.

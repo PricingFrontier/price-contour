@@ -63,9 +63,7 @@ import price_contour as pc
 # ---------------------------------------------------------------------------
 
 
-def make_ratio_solve_df(
-    n_quotes: int = 20, n_steps: int = 5
-) -> pl.DataFrame:
+def make_ratio_solve_df(n_quotes: int = 20, n_steps: int = 5) -> pl.DataFrame:
     """Synthetic long-format DataFrame for ratio-solve tests.
 
     Columns: ``quote_id``, ``scenario_index``, ``scenario_value``,
@@ -277,9 +275,7 @@ class TestRatioSolveBasic:
 
         # Actual ratio at optimum (recomputed from out_df) is <= target
         # within tolerance.
-        actual = actual_ratio_at_optimum(
-            result.dataframe, "incurred", "premium"
-        )
+        actual = actual_ratio_at_optimum(result.dataframe, "incurred", "premium")
         assert actual <= target * (1 + RATIO_RTOL) + RATIO_ABS_SLACK, (
             f"actual loss ratio {actual} > target {target} + tolerance"
         )
@@ -326,13 +322,9 @@ class TestRatioSolveBasic:
         # Slack constraint: lambda should be (very) small. Use a soft
         # threshold rather than == 0 because the dual update can leave
         # a tiny residual near the optimum.
-        assert lam < 1e-3, (
-            f"lambda for slack constraint should be ~0, got {lam}"
-        )
+        assert lam < 1e-3, f"lambda for slack constraint should be ~0, got {lam}"
         # Objective close to unconstrained.
-        assert result.total_objective == pytest.approx(
-            unconstrained_obj, rel=0.01
-        ), (
+        assert result.total_objective == pytest.approx(unconstrained_obj, rel=0.01), (
             f"slack-constraint objective should match unconstrained; "
             f"got {result.total_objective} vs {unconstrained_obj}"
         )
@@ -349,8 +341,7 @@ class TestRatioSolveBasic:
         baseline_retention = baseline_ratio(df, "kept", "exposed")
         # Sanity: baseline must be near 0.97 by construction.
         assert 0.95 < baseline_retention < 0.99, (
-            f"fixture baseline retention {baseline_retention} out of "
-            f"expected ballpark"
+            f"fixture baseline retention {baseline_retention} out of expected ballpark"
         )
 
         target = 0.95
@@ -368,9 +359,7 @@ class TestRatioSolveBasic:
         )
         result = solver.solve(df)
         assert result.converged
-        actual = actual_ratio_at_optimum(
-            result.dataframe, "kept", "exposed"
-        )
+        actual = actual_ratio_at_optimum(result.dataframe, "kept", "exposed")
         assert actual >= target * (1 - RATIO_RTOL) - RATIO_ABS_SLACK, (
             f"actual retention {actual} < floor {target} beyond tolerance"
         )
@@ -403,13 +392,9 @@ class TestRatioSolveBasic:
         # quality via the actual ratio, not result.converged.
         lam = result.lambdas["loss_ratio"]
         assert math.isfinite(lam)
-        assert lam > 0, (
-            f"max_pct=0.95 should bind on this fixture; lambda was {lam}"
-        )
+        assert lam > 0, f"max_pct=0.95 should bind on this fixture; lambda was {lam}"
         target_l = 0.95 * baseline_lr
-        actual = actual_ratio_at_optimum(
-            result.dataframe, "incurred", "premium"
-        )
+        actual = actual_ratio_at_optimum(result.dataframe, "incurred", "premium")
         assert actual <= target_l * (1 + RATIO_RTOL) + RATIO_ABS_SLACK, (
             f"actual {actual} > target {target_l} (0.95 x baseline "
             f"{baseline_lr}) beyond tolerance"
@@ -437,9 +422,7 @@ class TestRatioSolveBasic:
         lam = result.lambdas["retention_ratio"]
         assert math.isfinite(lam)
         target_l = 0.98 * baseline_ret
-        actual = actual_ratio_at_optimum(
-            result.dataframe, "kept", "exposed"
-        )
+        actual = actual_ratio_at_optimum(result.dataframe, "kept", "exposed")
         assert actual >= target_l * (1 - RATIO_RTOL) - RATIO_ABS_SLACK, (
             f"actual {actual} < target {target_l} (0.98 x baseline "
             f"{baseline_ret}) beyond tolerance"
@@ -483,9 +466,7 @@ class TestRatioSolveBasic:
             f"{result.lambdas['retention_ratio']}, iterations="
             f"{result.iterations}"
         )
-        actual = actual_ratio_at_optimum(
-            result.dataframe, "kept", "exposed"
-        )
+        actual = actual_ratio_at_optimum(result.dataframe, "kept", "exposed")
         assert actual >= target * (1 - RATIO_RTOL) - RATIO_ABS_SLACK, (
             f"actual {actual} < target {target} beyond tolerance"
         )
@@ -536,23 +517,16 @@ class TestRatioSolveMixedWithSumConstraint:
         assert "premium" in result.lambdas
         assert "loss_ratio" in result.lambdas
         for name, lam in result.lambdas.items():
-            assert math.isfinite(lam), (
-                f"lambda for '{name}' must be finite, got {lam}"
-            )
+            assert math.isfinite(lam), f"lambda for '{name}' must be finite, got {lam}"
         # Sum constraint satisfied.
-        assert result.total_constraints["premium"] >= volume_floor * (
-            1 - RATIO_RTOL
-        ), (
+        assert result.total_constraints["premium"] >= volume_floor * (1 - RATIO_RTOL), (
             f"premium {result.total_constraints['premium']} < floor "
             f"{volume_floor} beyond tolerance"
         )
         # Ratio constraint satisfied (recompute actual ratio).
-        actual_lr = actual_ratio_at_optimum(
-            result.dataframe, "incurred", "premium"
-        )
+        actual_lr = actual_ratio_at_optimum(result.dataframe, "incurred", "premium")
         assert actual_lr <= lr_target * (1 + RATIO_RTOL) + RATIO_ABS_SLACK, (
-            f"actual loss_ratio {actual_lr} > target {lr_target} "
-            f"beyond tolerance"
+            f"actual loss_ratio {actual_lr} > target {lr_target} beyond tolerance"
         )
 
 
@@ -625,9 +599,7 @@ class TestRatioSolveEdgeCases:
         with pytest.raises(ValueError) as exc_info:
             solver.solve(df)
         msg = str(exc_info.value)
-        assert "loss_ratio" in msg, (
-            f"error {msg!r} must name the constraint label"
-        )
+        assert "loss_ratio" in msg, f"error {msg!r} must name the constraint label"
         # Message must hint at zero denominator / undefined baseline.
         assert (
             "0" in msg
@@ -761,9 +733,7 @@ class TestRatioSolveEdgeCases:
         assert result.converged
         # Lambda close to zero.
         lam = result.lambdas["loss_ratio"]
-        assert abs(lam) < 1e-3, (
-            f"lambda for slack constraint should be ~0, got {lam}"
-        )
+        assert abs(lam) < 1e-3, f"lambda for slack constraint should be ~0, got {lam}"
         # Convergence in modest iterations.
         assert result.iterations < 50, (
             f"slack constraint should converge fast; took {result.iterations}"
@@ -795,8 +765,7 @@ class TestRatioSolveEdgeCases:
         lam = result.lambdas["loss_ratio"]
         assert math.isfinite(lam)
         assert lam > 0.01, (
-            f"binding tight ratio constraint should give meaningful "
-            f"lambda; got {lam}"
+            f"binding tight ratio constraint should give meaningful lambda; got {lam}"
         )
 
     def test_nan_in_numerator_column_rejected_at_validation(self):
@@ -812,9 +781,7 @@ class TestRatioSolveEdgeCases:
         # Inject a NaN into the numerator column.
         incurred_vals = df["incurred"].to_list()
         incurred_vals[0] = float("nan")
-        df = df.with_columns(
-            pl.Series("incurred", incurred_vals, dtype=pl.Float32)
-        )
+        df = df.with_columns(pl.Series("incurred", incurred_vals, dtype=pl.Float32))
 
         solver = pc.OnlineOptimiser(
             objective="income",
@@ -992,9 +959,7 @@ class TestRatioSolveWarmStartAndHistory:
         )
         # Both must produce a feasible-quality result (actual ratio <= target
         # within tolerance).
-        actual = actual_ratio_at_optimum(
-            warm.dataframe, "incurred", "premium"
-        )
+        actual = actual_ratio_at_optimum(warm.dataframe, "incurred", "premium")
         assert actual <= 0.62 * (1 + RATIO_RTOL) + RATIO_ABS_SLACK
 
     def test_record_history_with_ratio(self):
@@ -1050,14 +1015,11 @@ class TestRatioSolveWarmStartAndHistory:
         blob = summary["params"]["constraints"]
         decoded = json.loads(blob)
         assert decoded == constraints, (
-            f"round-tripped constraints {decoded} != original "
-            f"{constraints}"
+            f"round-tripped constraints {decoded} != original {constraints}"
         )
         # artifacts.summary.constraints[name].spec is the original
         # constraint dict body (without the dict-key wrap).
-        spec = summary["artifacts"]["summary"]["constraints"]["loss_ratio"][
-            "spec"
-        ]
+        spec = summary["artifacts"]["summary"]["constraints"]["loss_ratio"]["spec"]
         assert spec == constraints["loss_ratio"]
 
 

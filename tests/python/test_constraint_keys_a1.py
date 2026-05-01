@@ -582,8 +582,7 @@ class TestEdgeCaseThresholds:
         total_profit = result.total_constraints["profit"]
         # Floor is -100; allow 2% absolute slack on a small portfolio.
         assert total_profit >= -100.0 - 2.0, (
-            f"total profit {total_profit} below the -100 floor "
-            f"by more than tolerance"
+            f"total profit {total_profit} below the -100 floor by more than tolerance"
         )
 
     def test_nan_threshold_rejected_at_construction(self):

@@ -167,9 +167,7 @@ class TestRatebookRatioBasicSolve:
         # Lambda for the ratio is finite and non-negative (max-direction).
         lam = result.lambdas["loss_ratio"]
         assert math.isfinite(lam), f"lambda must be finite, got {lam}"
-        assert lam >= -1e-9, (
-            f"lambda for max-ratio must be >= 0, got {lam}"
-        )
+        assert lam >= -1e-9, f"lambda for max-ratio must be >= 0, got {lam}"
 
         # C3-through-C5 reporting: total_constraints['loss_ratio'] is
         # the actual ratio at the optimum.
@@ -177,10 +175,7 @@ class TestRatebookRatioBasicSolve:
         assert math.isfinite(actual), (
             f"total_constraints['loss_ratio'] must be finite, got {actual}"
         )
-        assert (
-            actual
-            <= target * (1 + RATEBOOK_RATIO_RTOL) + RATEBOOK_RATIO_ABS
-        ), (
+        assert actual <= target * (1 + RATEBOOK_RATIO_RTOL) + RATEBOOK_RATIO_ABS, (
             f"actual loss ratio {actual} > target {target} + tolerance"
         )
 
@@ -223,17 +218,13 @@ class TestRatebookRatioBasicSolve:
         lam = result.lambdas["retention_ratio"]
         assert math.isfinite(lam)
         # min-direction lambda non-negative; C3 contract carries through.
-        assert lam >= -1e-9, (
-            f"lambda for min-ratio must be >= 0, got {lam}"
-        )
+        assert lam >= -1e-9, f"lambda for min-ratio must be >= 0, got {lam}"
 
         baseline_ret = baseline_ratio(df, "kept", "exposed")
         target_l = 0.98 * baseline_ret
         actual = result.total_constraints["retention_ratio"]
         assert math.isfinite(actual)
-        assert (
-            actual >= target_l * (1 - RATEBOOK_RATIO_RTOL) - RATEBOOK_RATIO_ABS
-        ), (
+        assert actual >= target_l * (1 - RATEBOOK_RATIO_RTOL) - RATEBOOK_RATIO_ABS, (
             f"actual retention {actual} < floor {target_l} (= 0.98 * "
             f"{baseline_ret}) beyond tolerance"
         )
@@ -280,10 +271,7 @@ class TestRatebookRatioBasicSolve:
         # Ratio constraint satisfied at the end of CD.
         actual = result.total_constraints["loss_ratio"]
         assert math.isfinite(actual)
-        assert (
-            actual
-            <= target * (1 + RATEBOOK_RATIO_RTOL) + RATEBOOK_RATIO_ABS
-        ), (
+        assert actual <= target * (1 + RATEBOOK_RATIO_RTOL) + RATEBOOK_RATIO_ABS, (
             f"actual loss ratio {actual} > target {target} + tolerance "
             f"after {result.cd_iterations} CD iterations"
         )
@@ -544,26 +532,19 @@ class TestRatebookRatioMixed:
         assert "premium" in result.lambdas
         assert "loss_ratio" in result.lambdas
         for name, lam in result.lambdas.items():
-            assert math.isfinite(lam), (
-                f"lambda for '{name}' must be finite, got {lam}"
-            )
+            assert math.isfinite(lam), f"lambda for '{name}' must be finite, got {lam}"
 
         # Volume floor satisfied (within tolerance).
         actual_volume = result.total_constraints["premium"]
         assert actual_volume >= volume_floor * (1 - RATEBOOK_RATIO_RTOL), (
-            f"premium {actual_volume} < floor "
-            f"{volume_floor} beyond tolerance"
+            f"premium {actual_volume} < floor {volume_floor} beyond tolerance"
         )
 
         # Ratio ceiling satisfied (within tolerance).
         actual_lr = result.total_constraints["loss_ratio"]
         assert (
-            actual_lr
-            <= lr_target * (1 + RATEBOOK_RATIO_RTOL) + RATEBOOK_RATIO_ABS
-        ), (
-            f"actual loss_ratio {actual_lr} > target {lr_target} "
-            f"beyond tolerance"
-        )
+            actual_lr <= lr_target * (1 + RATEBOOK_RATIO_RTOL) + RATEBOOK_RATIO_ABS
+        ), f"actual loss_ratio {actual_lr} > target {lr_target} beyond tolerance"
 
         # Factor tables for both rating factors are produced.
         assert "region" in result.factor_tables
@@ -887,9 +868,7 @@ class TestRatebookRatioFrontier:
         # total_loss_ratio is the actual ratio at each point.
         for tot in pts["total_loss_ratio"].to_list():
             assert math.isfinite(tot)
-            assert 0.4 < tot < 0.8, (
-                f"total_loss_ratio={tot} out of plausible band"
-            )
+            assert 0.4 < tot < 0.8, f"total_loss_ratio={tot} out of plausible band"
 
         # total_premium is on the volume scale (>> 1).
         for vol in pts["total_premium"].to_list():
@@ -1051,18 +1030,13 @@ class TestRatebookRatioEdgeCases:
         with pytest.raises(ValueError) as exc_info:
             solver.solve(df, factors)
         msg = str(exc_info.value)
-        assert "loss_ratio" in msg, (
-            f"error {msg!r} must name the constraint label"
-        )
+        assert "loss_ratio" in msg, f"error {msg!r} must name the constraint label"
         assert (
             "0" in msg
             or "zero" in msg.lower()
             or "denominator" in msg.lower()
             or "baseline" in msg.lower()
-        ), (
-            f"error {msg!r} must signal zero-denominator / "
-            f"undefined-baseline condition"
-        )
+        ), f"error {msg!r} must signal zero-denominator / undefined-baseline condition"
 
     def test_zero_baseline_denominator_ok_for_absolute_max(self):
         """Absolute ``max`` mode does NOT depend on baseline_LR. Even
@@ -1183,8 +1157,7 @@ class TestRatebookRatioEdgeCases:
             solver.solve(df, factors)
         msg = str(exc_info.value)
         assert "loss_ratio" in msg, (
-            f"None-threshold solve error must name the constraint "
-            f"label; got: {msg!r}"
+            f"None-threshold solve error must name the constraint label; got: {msg!r}"
         )
 
     def test_none_threshold_frontier_with_range_succeeds(self):
@@ -1290,8 +1263,7 @@ class TestRatebookRatioSummary:
         blob = summary["params"]["constraints"]
         decoded = json.loads(blob)
         assert decoded == constraints, (
-            f"round-tripped constraints {decoded} != original "
-            f"{constraints}"
+            f"round-tripped constraints {decoded} != original {constraints}"
         )
 
     def test_summary_metrics_constraint_total_is_actual_ratio(self):

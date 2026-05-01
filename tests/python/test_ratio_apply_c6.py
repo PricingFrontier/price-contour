@@ -193,7 +193,9 @@ class TestApplyOptimiserRatioBasic:
         solve_actual = actual_ratio_at_optimum(
             solve_result.dataframe, "incurred", "premium"
         )
-        assert reported == pytest.approx(solve_actual, rel=RATIO_RTOL, abs=RATIO_ABS_SLACK), (
+        assert reported == pytest.approx(
+            solve_actual, rel=RATIO_RTOL, abs=RATIO_ABS_SLACK
+        ), (
             f"apply actual ratio {reported} differs from solve actual "
             f"ratio {solve_actual} beyond tolerance"
         )
@@ -429,9 +431,7 @@ class TestApplyOptimiserRatioPctSemantics:
         )
 
         apply_live = applier.apply(df_live)
-        reported_live_baseline = apply_live.baseline_constraints[
-            "retention_ratio"
-        ]
+        reported_live_baseline = apply_live.baseline_constraints["retention_ratio"]
         assert reported_live_baseline == pytest.approx(
             baseline_live, rel=REPORT_RTOL, abs=REPORT_ABS
         ), (
@@ -486,9 +486,7 @@ class TestApplyOptimiserRatioPctSemantics:
         apply_b = applier.apply(df_b)
         reported = apply_b.baseline_constraints["loss_ratio"]
         # The reported baseline must track df_b, not df_a.
-        assert reported == pytest.approx(
-            baseline_b, rel=REPORT_RTOL, abs=REPORT_ABS
-        ), (
+        assert reported == pytest.approx(baseline_b, rel=REPORT_RTOL, abs=REPORT_ABS), (
             f"apply on df_b must report df_b's baseline LR ({baseline_b}); "
             f"got {reported}, df_a baseline was {baseline_a}"
         )
@@ -611,9 +609,7 @@ class TestApplyOptimiserRatioReporting:
 
         # Sum entry: report is a sum (recomputable from optimal_premium).
         reported_premium = apply_result.total_constraints["premium"]
-        recomputed_premium = float(
-            apply_result.dataframe["optimal_premium"].sum()
-        )
+        recomputed_premium = float(apply_result.dataframe["optimal_premium"].sum())
         assert reported_premium == pytest.approx(
             recomputed_premium, rel=REPORT_RTOL, abs=REPORT_ABS
         ), (
@@ -981,9 +977,7 @@ class TestApplyOptimiserRatioRejectsNone:
                 },
             )
         msg = str(exc_info.value)
-        assert "loss_ratio" in msg, (
-            f"error {msg!r} must name the constraint label"
-        )
+        assert "loss_ratio" in msg, f"error {msg!r} must name the constraint label"
         # Apply-specific wording: the message should signal that apply
         # mode needs a fixed threshold (or use frontier instead).
         assert (
@@ -991,9 +985,7 @@ class TestApplyOptimiserRatioRejectsNone:
             or "apply" in msg
             or "None" in msg
             or "threshold" in msg.lower()
-        ), (
-            f"error {msg!r} must signal the apply-mode None-rejection"
-        )
+        ), f"error {msg!r} must signal the apply-mode None-rejection"
 
     def test_construction_rejects_none_min_threshold(self):
         """Symmetric to the max case but for ``min`` direction."""
@@ -1089,9 +1081,7 @@ class TestApplyOptimiserRatioEdgeCases:
         with pytest.raises(ValueError) as exc_info:
             applier.apply(df)
         msg = str(exc_info.value)
-        assert "loss_ratio" in msg, (
-            f"error {msg!r} must name the constraint label"
-        )
+        assert "loss_ratio" in msg, f"error {msg!r} must name the constraint label"
         assert (
             "0" in msg
             or "zero" in msg.lower()
@@ -1174,9 +1164,7 @@ class TestApplyOptimiserRatioEdgeCases:
         assert "incurred" in msg, (
             f"error {msg!r} must name the missing numerator column"
         )
-        assert "loss_ratio" in msg, (
-            f"error {msg!r} must name the constraint label"
-        )
+        assert "loss_ratio" in msg, f"error {msg!r} must name the constraint label"
 
     def test_denominator_column_missing_raises_schema_error(self):
         """Symmetric to the numerator-missing test."""

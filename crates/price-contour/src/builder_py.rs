@@ -6,6 +6,7 @@ use pyo3_polars::PyDataFrame;
 use price_contour_core::QuoteGridBuilder;
 
 use crate::grid_py::PyQuoteGrid;
+use crate::quote_id::quote_id_str_iter;
 
 /// Extracted chunk: (quote_ids, objective_values, constraint_columns).
 type ChunkData = (Vec<String>, Vec<f32>, Vec<Vec<f32>>);
@@ -58,7 +59,7 @@ impl PyQuoteGridBuilder {
         *,
         quote_id = "quote_id",
         scenario_index = "scenario_index",
-        scenario_value_col = "scenario_value",
+        scenario_value = "scenario_value",
         objective = "expected_income",
         n_steps = None,
     ))]
@@ -66,7 +67,7 @@ impl PyQuoteGridBuilder {
         constraint_columns: Vec<String>,
         quote_id: &str,
         scenario_index: &str,
-        scenario_value_col: &str,
+        scenario_value: &str,
         objective: &str,
         n_steps: Option<usize>,
     ) -> PyResult<Self> {
@@ -77,7 +78,7 @@ impl PyQuoteGridBuilder {
             inner: None,
             quote_id_col: quote_id.to_string(),
             scenario_index_col: scenario_index.to_string(),
-            scenario_value_col: scenario_value_col.to_string(),
+            scenario_value_col: scenario_value.to_string(),
             objective_col: objective.to_string(),
             constraint_cols: constraint_columns,
             n_steps,
@@ -232,21 +233,37 @@ fn derive_grid_metadata(
         )));
     }
 
-    let qid_ca = df
+    // Sequential walk over quote_id; supports both Utf8 and Categorical via
+    // the shared accessor. The first row's value is captured as an owned
+    // String so it survives subsequent iterator advances and can be used in
+    // the error message.
+    let qid_col = df
         .column(quote_id_col)
-        .map_err(|_| PyValueError::new_err(format!("Missing column: {quote_id_col}")))?
-        .str()
-        .map_err(|_| PyValueError::new_err(format!("{quote_id_col} must be Utf8")))?;
-    let first_qid = qid_ca
-        .get(0)
-        .ok_or_else(|| PyValueError::new_err(format!("Null {quote_id_col} at row 0")))?;
+        .map_err(|_| PyValueError::new_err(format!("Missing column: {quote_id_col}")))?;
+    let mut qid_iter = quote_id_str_iter(qid_col, quote_id_col)?;
+
+    let first_qid = qid_iter
+        .next()
+        .ok_or_else(|| PyValueError::new_err("empty DataFrame"))?
+        .ok_or_else(|| PyValueError::new_err(format!("Null {quote_id_col} at row 0")))?
+        .to_string();
 
     // The first quote must occupy the first `n_steps` rows in scenario_index
     // order. This catches interleaved layouts where step-0 rows for many
     // quotes appear before any step-1 row.
-    for j in 0..n_steps {
-        let row_qid = qid_ca
-            .get(j)
+    let row_step = step_ca
+        .get(0)
+        .ok_or_else(|| PyValueError::new_err(format!("Null {scenario_index_col} at row 0")))?;
+    if row_step != 0 {
+        return Err(PyValueError::new_err(format!(
+            "First quote '{first_qid}': row 0 has {scenario_index_col}={row_step}, \
+             expected 0"
+        )));
+    }
+    for j in 1..n_steps {
+        let row_qid = qid_iter
+            .next()
+            .ok_or_else(|| PyValueError::new_err(format!("iter exhausted at row {j}")))?
             .ok_or_else(|| PyValueError::new_err(format!("Null {quote_id_col} at row {j}")))?;
         if row_qid != first_qid {
             return Err(PyValueError::new_err(format!(
@@ -310,11 +327,10 @@ fn extract_chunk(
     }
     let n_quotes = n_rows / n_steps;
 
-    let qid_ca = df
+    let qid_col = df
         .column(quote_id_col)
-        .map_err(|_| PyValueError::new_err(format!("Missing column: {quote_id_col}")))?
-        .str()
-        .map_err(|_| PyValueError::new_err(format!("{quote_id_col} must be Utf8")))?;
+        .map_err(|_| PyValueError::new_err(format!("Missing column: {quote_id_col}")))?;
+    let mut qid_iter = quote_id_str_iter(qid_col, quote_id_col)?;
     let steps_ca = df
         .column(scenario_index_col)
         .map_err(|_| PyValueError::new_err(format!("Missing column: {scenario_index_col}")))?
@@ -330,46 +346,70 @@ fn extract_chunk(
     // n_steps rows in that group share that quote_id, that scenario_index
     // runs 0..n_steps in order, and that scenario_value matches the
     // canonical grid bit-for-bit (within tolerance).
+    //
+    // The quote_id iterator handles Utf8 and Categorical uniformly; we own
+    // each block's first quote_id as a `String` so it's safe to compare
+    // across iterator advances (categorical `&str` borrows from the chunk's
+    // dictionary, which is fine within a chunk but we copy out anyway for
+    // pushing into the builder's `Vec<String>`).
     let mut quote_ids: Vec<String> = Vec::with_capacity(n_quotes);
     for q in 0..n_quotes {
         let block_start = q * n_steps;
-        let qid = qid_ca.get(block_start).ok_or_else(|| {
-            PyValueError::new_err(format!("Null {quote_id_col} at row {block_start}"))
-        })?;
-        for (j, &expected_sv) in canonical_scenario_values.iter().enumerate().take(n_steps) {
+        let first_qid_str = qid_iter
+            .next()
+            .ok_or_else(|| PyValueError::new_err(format!("iter exhausted at row {block_start}")))?
+            .ok_or_else(|| {
+                PyValueError::new_err(format!("Null {quote_id_col} at row {block_start}"))
+            })?
+            .to_string();
+
+        // Validate scenario_index + scenario_value at row 0 of this block.
+        validate_block_step(
+            steps_ca,
+            mult_ca,
+            block_start,
+            0,
+            &first_qid_str,
+            scenario_index_col,
+            scenario_value_col,
+            n_steps,
+            canonical_scenario_values[0],
+        )?;
+
+        // Validate the remaining n_steps - 1 rows: same quote_id, expected
+        // scenario_index, expected scenario_value.
+        for (j, &expected_sv) in canonical_scenario_values
+            .iter()
+            .enumerate()
+            .take(n_steps)
+            .skip(1)
+        {
             let idx = block_start + j;
-            let row_qid = qid_ca.get(idx).ok_or_else(|| {
-                PyValueError::new_err(format!("Null {quote_id_col} at row {idx}"))
-            })?;
-            if row_qid != qid {
+            let row_qid = qid_iter
+                .next()
+                .ok_or_else(|| PyValueError::new_err(format!("iter exhausted at row {idx}")))?
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("Null {quote_id_col} at row {idx}"))
+                })?;
+            if row_qid != first_qid_str.as_str() {
                 return Err(PyValueError::new_err(format!(
                     "Quote rows not contiguous: row {idx} has {quote_id_col}='{row_qid}', \
-                     expected '{qid}' (each quote must occupy {n_steps} consecutive rows)"
+                     expected '{first_qid_str}' (each quote must occupy {n_steps} consecutive rows)"
                 )));
             }
-            let step_val = steps_ca.get(idx).ok_or_else(|| {
-                PyValueError::new_err(format!("Null {scenario_index_col} at row {idx}"))
-            })?;
-            if step_val != j as i32 {
-                return Err(PyValueError::new_err(format!(
-                    "Quote '{qid}' row {idx}: {scenario_index_col}={step_val}, expected {j} \
-                     (rows for each quote must be in scenario_index order 0..{n_steps})"
-                )));
-            }
-            let mult_val = mult_ca.get(idx).ok_or_else(|| {
-                PyValueError::new_err(format!("Null {scenario_value_col} at row {idx}"))
-            })?;
-            // (NaN - NaN).abs() is NaN, which compares false against any
-            // finite tolerance — without an explicit check, a NaN at row > 0
-            // would slip through the consistency comparison.
-            if !mult_val.is_finite() || (mult_val - expected_sv).abs() > SCENARIO_VALUE_TOL {
-                return Err(PyValueError::new_err(format!(
-                    "Quote '{qid}' row {idx}: {scenario_value_col}={mult_val}, expected \
-                     {expected_sv} for step {j} (all chunks must share the same scenario grid)"
-                )));
-            }
+            validate_block_step(
+                steps_ca,
+                mult_ca,
+                block_start,
+                j,
+                &first_qid_str,
+                scenario_index_col,
+                scenario_value_col,
+                n_steps,
+                expected_sv,
+            )?;
         }
-        quote_ids.push(qid.to_string());
+        quote_ids.push(first_qid_str);
     }
 
     let obj_ca = df
@@ -400,4 +440,46 @@ fn extract_chunk(
     }
 
     Ok((quote_ids, objective, constraints))
+}
+
+/// Validate `scenario_index` and `scenario_value` for a single row in a
+/// quote-block. Pulled into a helper because the per-row check happens
+/// twice in `extract_chunk` (once at j=0 before entering the inner loop,
+/// once for j=1..n_steps inside it) and inlining it here cleanly is
+/// awkward against the iterator-walk over `quote_id`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn validate_block_step(
+    steps_ca: &Int32Chunked,
+    mult_ca: &Float32Chunked,
+    block_start: usize,
+    j: usize,
+    qid: &str,
+    scenario_index_col: &str,
+    scenario_value_col: &str,
+    n_steps: usize,
+    expected_sv: f32,
+) -> PyResult<()> {
+    let idx = block_start + j;
+    let step_val = steps_ca
+        .get(idx)
+        .ok_or_else(|| PyValueError::new_err(format!("Null {scenario_index_col} at row {idx}")))?;
+    if step_val != j as i32 {
+        return Err(PyValueError::new_err(format!(
+            "Quote '{qid}' row {idx}: {scenario_index_col}={step_val}, expected {j} \
+             (rows for each quote must be in scenario_index order 0..{n_steps})"
+        )));
+    }
+    let mult_val = mult_ca
+        .get(idx)
+        .ok_or_else(|| PyValueError::new_err(format!("Null {scenario_value_col} at row {idx}")))?;
+    // (NaN - NaN).abs() is NaN, which compares false against any finite
+    // tolerance — without an explicit check, a NaN would slip through.
+    if !mult_val.is_finite() || (mult_val - expected_sv).abs() > SCENARIO_VALUE_TOL {
+        return Err(PyValueError::new_err(format!(
+            "Quote '{qid}' row {idx}: {scenario_value_col}={mult_val}, expected \
+             {expected_sv} for step {j} (all chunks must share the same scenario grid)"
+        )));
+    }
+    Ok(())
 }

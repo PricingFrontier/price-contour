@@ -220,8 +220,7 @@ def _read_golden(name: str) -> dict[str, Any]:
     path = _golden_path(name)
     if not path.exists():
         raise FileNotFoundError(
-            f"Golden file {path} not found. Run with UPDATE_GOLDEN=1 to "
-            f"generate it."
+            f"Golden file {path} not found. Run with UPDATE_GOLDEN=1 to generate it."
         )
     return json.loads(path.read_text())
 
@@ -351,9 +350,7 @@ def _frontier_result_to_payload(
     }
 
 
-def _compare_solve_to_golden(
-    result: pc.SolveResult, golden: dict[str, Any]
-) -> None:
+def _compare_solve_to_golden(result: pc.SolveResult, golden: dict[str, Any]) -> None:
     """Assert a ``SolveResult`` matches the persisted golden payload."""
     expected = golden["expected"]
     abs_tol = float(golden["tolerance"]["absolute"])
@@ -404,9 +401,7 @@ def _compare_solve_to_golden(
     )
 
 
-def _compare_apply_to_golden(
-    result: pc.ApplyResult, golden: dict[str, Any]
-) -> None:
+def _compare_apply_to_golden(result: pc.ApplyResult, golden: dict[str, Any]) -> None:
     """Assert an ``ApplyResult`` matches the persisted golden payload."""
     expected = golden["expected"]
     abs_tol = float(golden["tolerance"]["absolute"])
@@ -448,8 +443,7 @@ def _compare_frontier_to_golden(result: Any, golden: dict[str, Any]) -> None:
     abs_tol = float(golden["tolerance"]["absolute"])
     rel_tol = float(golden["tolerance"]["relative"])
     assert result.n_points == expected["n_points"], (
-        f"n_points mismatch: actual={result.n_points}, "
-        f"expected={expected['n_points']}"
+        f"n_points mismatch: actual={result.n_points}, expected={expected['n_points']}"
     )
     pts = result.points
     expected_rows = expected["rows"]
@@ -466,8 +460,7 @@ def _compare_frontier_to_golden(result: Any, golden: dict[str, Any]) -> None:
             elif isinstance(expected_v, int) and not isinstance(expected_v, bool):
                 # iterations is an int field in the points DataFrame.
                 assert int(actual_v) == int(expected_v), (
-                    f"row {i}, col {k!r}: actual={actual_v}, "
-                    f"expected={expected_v}"
+                    f"row {i}, col {k!r}: actual={actual_v}, expected={expected_v}"
                 )
             else:
                 assert _approx_equal(
@@ -502,9 +495,7 @@ class TestOnlineGolden:
 
     def test_online_sum_golden(self):
         """Sum-constraint binding ``min_pct`` solve."""
-        df = build_deterministic_fixture(
-            GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS
-        )
+        df = build_deterministic_fixture(GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS)
         constraints = {"volume": {"min_pct": 1.10}}
         solver = pc.OnlineOptimiser(
             objective="expected_income",
@@ -529,9 +520,7 @@ class TestOnlineGolden:
 
     def test_online_ratio_golden(self):
         """Ratio-constraint binding ``max`` solve."""
-        df = build_deterministic_fixture(
-            GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS
-        )
+        df = build_deterministic_fixture(GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS)
         constraints = {
             "loss_ratio": {
                 "numerator": "incurred",
@@ -566,12 +555,8 @@ class TestRatebookGolden:
 
     def test_ratebook_sum_golden(self):
         """Two-factor ratebook with binding sum constraint."""
-        df = build_deterministic_fixture(
-            GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS
-        )
-        factors = build_deterministic_factors(
-            GOLDEN_SEED, GOLDEN_N_QUOTES
-        )
+        df = build_deterministic_fixture(GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS)
+        factors = build_deterministic_factors(GOLDEN_SEED, GOLDEN_N_QUOTES)
         constraints = {"volume": {"min_pct": 0.95}}
         solver = pc.RatebookOptimiser(
             objective="expected_income",
@@ -598,8 +583,7 @@ class TestRatebookGolden:
                     "baseline_objective": float(result.baseline_objective),
                     "baseline_constraints": dict(result.baseline_constraints),
                     "factor_tables": {
-                        f: dict(levels)
-                        for f, levels in result.factor_tables.items()
+                        f: dict(levels) for f, levels in result.factor_tables.items()
                     },
                 },
                 "tolerance": {"absolute": ABS_TOL, "relative": REL_TOL},
@@ -659,9 +643,7 @@ class TestApplyGolden:
 
     def test_apply_ratio_golden(self):
         """Apply with a fixed lambda on a ratio-constrained config."""
-        df = build_deterministic_fixture(
-            GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS
-        )
+        df = build_deterministic_fixture(GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS)
         constraints = {
             "loss_ratio": {
                 "numerator": "incurred",
@@ -701,9 +683,7 @@ class TestFrontierGolden:
 
     def test_frontier_sum_golden(self):
         """1D frontier sweep with 5 points on a sum constraint."""
-        df = build_deterministic_fixture(
-            GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS
-        )
+        df = build_deterministic_fixture(GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS)
         constraints = {"volume": {"min_pct": 0.90}}
         threshold_ranges = {"volume": (0.90, 1.10)}
         n_points_per_dim = 5
@@ -721,9 +701,7 @@ class TestFrontierGolden:
 
         # Persist threshold_ranges as a list[list[float]] (JSON has no
         # native tuple), keyed by constraint name.
-        threshold_ranges_json = {
-            k: list(v) for k, v in threshold_ranges.items()
-        }
+        threshold_ranges_json = {k: list(v) for k, v in threshold_ranges.items()}
 
         if _should_update():
             payload = _frontier_result_to_payload(
@@ -756,9 +734,7 @@ class TestDeterminism:
 
     def test_online_solve_is_deterministic(self):
         """Same fixture + config => identical results, 5 runs in a row."""
-        df = build_deterministic_fixture(
-            GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS
-        )
+        df = build_deterministic_fixture(GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS)
         constraints = {"volume": {"min_pct": 1.10}}
         results = []
         for _ in range(5):
@@ -788,9 +764,7 @@ class TestDeterminism:
 
     def test_apply_is_deterministic(self):
         """Apply must be deterministic — single forward pass, no randomness."""
-        df = build_deterministic_fixture(
-            GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS
-        )
+        df = build_deterministic_fixture(GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS)
         constraints = {"volume": {"min_pct": 0.90}}
         lambdas = {"volume": 0.05}
         results = []
@@ -811,9 +785,7 @@ class TestDeterminism:
             )
         ref = results[0]
         for i, run in enumerate(results[1:], start=1):
-            assert run == ref, (
-                f"Apply is non-deterministic: run {i} differs from run 0"
-            )
+            assert run == ref, f"Apply is non-deterministic: run {i} differs from run 0"
 
     def test_ratebook_is_deterministic_at_floating_point(self):
         """Ratebook (coordinate descent + grouped Lagrangian) must produce
@@ -823,12 +795,8 @@ class TestDeterminism:
         HashMap iteration order is not guaranteed), so we compare
         sorted (key, value) tuples per factor rather than dict equality.
         """
-        df = build_deterministic_fixture(
-            GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS
-        )
-        factors = build_deterministic_factors(
-            GOLDEN_SEED, GOLDEN_N_QUOTES
-        )
+        df = build_deterministic_fixture(GOLDEN_SEED, GOLDEN_N_QUOTES, GOLDEN_N_STEPS)
+        factors = build_deterministic_factors(GOLDEN_SEED, GOLDEN_N_QUOTES)
         constraints = {"volume": {"min_pct": 0.95}}
         results = []
         for _ in range(5):

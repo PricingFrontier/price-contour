@@ -516,9 +516,7 @@ class RatebookOptimiser:
                 )
             # Actual baseline ratio: ``Sigma_baseline num / Sigma_baseline
             # denom`` from rows where ``scenario_value == 1.0``.
-            baseline_slice = original_df.filter(
-                pl.col(self.scenario_value) == 1.0
-            )
+            baseline_slice = original_df.filter(pl.col(self.scenario_value) == 1.0)
             for label, num_col, denom_col in ratio_columns:
                 baseline_constraints[label] = _safe_ratio_from_columns(
                     baseline_slice, num_col, denom_col
@@ -720,9 +718,7 @@ class RatebookOptimiser:
             # constructor value at every point). Ratio "constraints"
             # use display labels rather than columns and are excluded.
             sum_constraint_cols = [
-                c
-                for c in constraint_names
-                if not _is_ratio_spec(self.constraints[c])
+                c for c in constraint_names if not _is_ratio_spec(self.constraints[c])
             ]
             grid = build_grid(
                 df_or_grid,
@@ -740,7 +736,11 @@ class RatebookOptimiser:
         # contribute one fixed value (the constructor threshold) to
         # every output row but do not multiply the combo count.
         dim_grids = [
-            _linspace(float(threshold_ranges[name][0]), float(threshold_ranges[name][1]), n_points_per_dim)
+            _linspace(
+                float(threshold_ranges[name][0]),
+                float(threshold_ranges[name][1]),
+                n_points_per_dim,
+            )
             for name in swept_names
         ]
         combos = _cartesian_product(dim_grids)
@@ -817,9 +817,7 @@ class RatebookOptimiser:
         for name in constraint_names:
             if name in swept_index:
                 k = swept_index[name]
-                columns[f"threshold_{name}"] = [
-                    p[1]["thresholds"][k] for p in points
-                ]
+                columns[f"threshold_{name}"] = [p[1]["thresholds"][k] for p in points]
             else:
                 fixed_val = unswept_thresholds[name]
                 columns[f"threshold_{name}"] = [fixed_val for _ in points]

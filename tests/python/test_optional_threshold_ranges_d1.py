@@ -103,7 +103,7 @@ class TestOptionalRangeOnlineFrontier:
         pts = result.points
         # points DataFrame height matches the swept-axis cartesian
         # product (1 swept axis ** n_points_per_dim entries).
-        assert pts.height == n_points_per_dim ** 1
+        assert pts.height == n_points_per_dim**1
         # Both threshold columns must be present, even though only one
         # was swept.
         assert "threshold_volume" in pts.columns
@@ -182,11 +182,11 @@ class TestOptionalRangeOnlineFrontier:
             n_points_per_dim=n,
         )
         # Cartesian product over the two swept axes.
-        assert result.n_points == n ** 2
+        assert result.n_points == n**2
         pts = result.points
         # points DataFrame height matches the swept-axes cartesian
         # product (2 swept axes ** n_points_per_dim entries).
-        assert pts.height == n ** 2
+        assert pts.height == n**2
         # Three threshold columns (one per constraint).
         for col in (
             "threshold_volume",
@@ -202,9 +202,7 @@ class TestOptionalRangeOnlineFrontier:
             assert col in pts.columns, f"missing column '{col}'"
         # The omitted axis is constant.
         income_thresholds = pts["threshold_expected_income"].to_list()
-        assert all(
-            v == pytest.approx(fixed_income_pct) for v in income_thresholds
-        ), (
+        assert all(v == pytest.approx(fixed_income_pct) for v in income_thresholds), (
             f"threshold_expected_income must be constant at "
             f"{fixed_income_pct} (user-fraction units), got "
             f"{income_thresholds}"
@@ -379,8 +377,7 @@ class TestOptionalRangeOnlineRatioFrontier:
         # premium threshold is constant at the constructor value.
         prem_thresh = pts["threshold_premium"].to_list()
         assert all(v == pytest.approx(fixed_premium) for v in prem_thresh), (
-            f"threshold_premium must be constant at {fixed_premium}, "
-            f"got {prem_thresh}"
+            f"threshold_premium must be constant at {fixed_premium}, got {prem_thresh}"
         )
         # loss_ratio sweeps across the requested range.
         lr_thresh = sorted(pts["threshold_loss_ratio"].to_list())
@@ -492,9 +489,7 @@ class TestOptionalRangeRatebookFrontier:
         assert result.n_points == 9  # 3 x 3
         pts = result.points
         income_thresholds = pts["threshold_expected_income"].to_list()
-        assert all(
-            v == pytest.approx(fixed_income_pct) for v in income_thresholds
-        )
+        assert all(v == pytest.approx(fixed_income_pct) for v in income_thresholds)
 
     def test_ratebook_omitted_axis_emits_total_and_lambda(self):
         """The omitted axis still produces ``total_<name>`` and
@@ -596,8 +591,7 @@ class TestOptionalRangeWithNoneThresholds:
         # volume is held constant at the constructor value.
         vol_thresholds = pts["threshold_volume"].to_list()
         assert all(v == pytest.approx(fixed_volume) for v in vol_thresholds), (
-            f"threshold_volume must be constant at {fixed_volume}, "
-            f"got {vol_thresholds}"
+            f"threshold_volume must be constant at {fixed_volume}, got {vol_thresholds}"
         )
         # loss_ratio sweeps across the requested range.
         lr_thresholds = sorted(pts["threshold_loss_ratio"].to_list())

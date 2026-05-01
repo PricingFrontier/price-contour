@@ -214,10 +214,12 @@ impl PyChunkedApplyResult {
 ///
 /// **Memory:** the input parquet IO buffer is bounded by `chunk_size`, the
 /// output parquet is written incrementally one row group per chunk, and
-/// the per-quote `optimal_steps` array is **not** held in memory at all
-/// (each chunk's mini-grid is dropped after its rows are written). The
-/// peak resident set is therefore O(chunk_size × n_columns × 4 bytes) +
-/// the BatchedWriter's internal buffers, regardless of the input file size.
+/// the **whole-portfolio** per-quote `optimal_steps` array is never
+/// materialised — only one chunk's `optimal_steps` is alive at a time
+/// (`chunk_size / n_steps` u32 entries) and gets dropped along with the
+/// chunk's mini-grid after the row group has been written. The peak
+/// resident set is therefore O(chunk_size × n_columns × 4 bytes) + the
+/// BatchedWriter's internal buffers, regardless of the input file size.
 ///
 /// `chunk_size` is rounded down to a multiple of `n_steps` so every slice
 /// boundary falls between quotes. The chunked reader contract from
@@ -243,7 +245,7 @@ impl PyChunkedApplyResult {
     *,
     quote_id = "quote_id",
     scenario_index = "scenario_index",
-    scenario_value_col = "scenario_value",
+    scenario_value = "scenario_value",
     objective = "expected_income",
     n_steps = None,
 ))]
@@ -257,7 +259,7 @@ pub fn apply_lambdas_to_parquet_chunked_py(
     chunk_size: usize,
     quote_id: &str,
     scenario_index: &str,
-    scenario_value_col: &str,
+    scenario_value: &str,
     objective: &str,
     n_steps: Option<usize>,
 ) -> PyResult<PyChunkedApplyResult> {
@@ -269,28 +271,49 @@ pub fn apply_lambdas_to_parquet_chunked_py(
     }
     reject_same_input_output(parquet_in, parquet_out)?;
 
-    let constraint_keys: Vec<String> = constraints.keys().cloned().collect();
-    for key in lambdas.keys() {
-        if !constraints.contains_key(key) {
-            return Err(PyValueError::new_err(format!(
-                "Lambda key '{key}' does not match any constraint. Valid constraint keys are {:?}",
-                constraint_keys
-            )));
-        }
+    // Note: ratio constraint specs (containing string `numerator` /
+    // `denominator` keys) cannot reach this function — PyO3 deserialises
+    // `constraints` into `HashMap<String, HashMap<String, Option<f64>>>`
+    // and rejects string values at the boundary with `TypeError:
+    // argument 'constraints': must be real number, not str`. The
+    // chunked path therefore can't accept ratios by construction; the
+    // type system enforces this. The Python wrapper docstring directs
+    // ratio-constraint callers to `ApplyOptimiser.apply(df)`.
+
+    // Sort constraint keys before any error message that references them
+    // (matches `ApplyOptimiser.__init__`'s error format) and before storing
+    // them in the grid (the grid's constraint_names is sorted-order so
+    // results align across one-shot and chunked paths).
+    let mut sorted_constraint_keys: Vec<String> = constraints.keys().cloned().collect();
+    sorted_constraint_keys.sort();
+    // Strict-match: every lambda key must correspond to a known constraint.
+    // Collecting all extras and sorting them mirrors `ApplyOptimiser`'s
+    // error wording exactly and is deterministic regardless of HashMap
+    // iteration order.
+    let mut extras: Vec<String> = lambdas
+        .keys()
+        .filter(|k| !constraints.contains_key(*k))
+        .cloned()
+        .collect();
+    if !extras.is_empty() {
+        extras.sort();
+        return Err(PyValueError::new_err(format!(
+            "Lambda keys {extras:?} do not match any constraint. Valid \
+             constraint keys are {sorted_constraint_keys:?}."
+        )));
     }
 
     validate_column_names(
         quote_id,
         scenario_index,
-        scenario_value_col,
+        scenario_value,
         objective,
-        &constraint_keys,
+        &sorted_constraint_keys,
     )?;
 
-    // Constraint columns are stored in the grid in sorted-name order, so
-    // results align across one-shot and chunked paths.
-    let mut constraint_cols: Vec<String> = constraint_keys;
-    constraint_cols.sort();
+    // The grid stores constraint columns in sorted-name order; we already
+    // sorted these for the strict-match error above, so just rename.
+    let constraint_cols: Vec<String> = sorted_constraint_keys;
 
     // Cleanup-on-error: if the streaming pipeline fails after we've started
     // writing the output parquet, the file on disk has partial row groups
@@ -306,7 +329,7 @@ pub fn apply_lambdas_to_parquet_chunked_py(
         chunk_size,
         quote_id,
         scenario_index,
-        scenario_value_col,
+        scenario_value,
         objective,
         n_steps,
         constraint_cols,

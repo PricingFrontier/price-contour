@@ -158,8 +158,7 @@ class TestRatioFrontierBasic:
         # All lambdas non-negative (constraint is max-direction).
         lambdas = pts["lambda_loss_ratio"].to_list()
         assert all(math.isfinite(lam) and lam >= -1e-9 for lam in lambdas), (
-            f"all lambda_loss_ratio values must be finite and >= 0; "
-            f"got {lambdas}"
+            f"all lambda_loss_ratio values must be finite and >= 0; got {lambdas}"
         )
 
         # total_<label> is the actual ratio (not the linearised total).
@@ -215,8 +214,7 @@ class TestRatioFrontierBasic:
         # tolerance bands as the C2 solve tests.
         for thr, tot, lam in zip(thresholds, totals, lambdas):
             assert tot <= thr * (1 + FRONTIER_RATIO_RTOL) + FRONTIER_RATIO_ABS, (
-                f"binding frontier point: actual ratio {tot} > target "
-                f"{thr} + tolerance"
+                f"binding frontier point: actual ratio {tot} > target {thr} + tolerance"
             )
             # And lambda must be positive for binding targets.
             assert lam > 0, (
@@ -234,11 +232,15 @@ class TestRatioFrontierBasic:
         df = make_ratio_solve_df(n_quotes=20, n_steps=5)
 
         # Unconstrained reference for objective comparison.
-        unconstrained = pc.OnlineOptimiser(
-            objective="income",
-            constraints={"income": {"min": -1.0}},
-            max_iter=200,
-        ).solve(df).total_objective
+        unconstrained = (
+            pc.OnlineOptimiser(
+                objective="income",
+                constraints={"income": {"min": -1.0}},
+                max_iter=200,
+            )
+            .solve(df)
+            .total_objective
+        )
 
         solver = pc.OnlineOptimiser(
             objective="income",
@@ -264,9 +266,7 @@ class TestRatioFrontierBasic:
 
         for lam in lambdas:
             assert math.isfinite(lam)
-            assert lam < 1e-2, (
-                f"slack frontier point should have lambda ~0; got {lam}"
-            )
+            assert lam < 1e-2, f"slack frontier point should have lambda ~0; got {lam}"
         for obj in objectives:
             assert obj == pytest.approx(unconstrained, rel=0.02), (
                 f"slack frontier point objective {obj} should match "
@@ -391,7 +391,9 @@ class TestRatioFrontierBasic:
         pts_sorted = pts.sort("threshold_loss_ratio")
         lo_total = float(pts_sorted["total_loss_ratio"][0])
         target_l_at_lo = lo_pct * baseline_lr
-        assert lo_total <= target_l_at_lo * (1 + FRONTIER_RATIO_RTOL) + FRONTIER_RATIO_ABS, (
+        assert (
+            lo_total <= target_l_at_lo * (1 + FRONTIER_RATIO_RTOL) + FRONTIER_RATIO_ABS
+        ), (
             f"max_pct: at threshold_loss_ratio={lo_pct} the internal target "
             f"L = {target_l_at_lo} (= {lo_pct} * {baseline_lr}); the actual "
             f"ratio at this point ({lo_total}) must satisfy that target"
@@ -800,11 +802,15 @@ class TestRatioFrontierEdgeCases:
         Achievable LR max is ~0.6924. (0.85, 0.95) is well above it.
         """
         df = make_ratio_solve_df(n_quotes=20, n_steps=5)
-        unconstrained = pc.OnlineOptimiser(
-            objective="income",
-            constraints={"income": {"min": -1.0}},
-            max_iter=200,
-        ).solve(df).total_objective
+        unconstrained = (
+            pc.OnlineOptimiser(
+                objective="income",
+                constraints={"income": {"min": -1.0}},
+                max_iter=200,
+            )
+            .solve(df)
+            .total_objective
+        )
 
         solver = pc.OnlineOptimiser(
             objective="income",
@@ -828,8 +834,7 @@ class TestRatioFrontierEdgeCases:
         for lam in pts["lambda_loss_ratio"].to_list():
             assert math.isfinite(lam)
             assert lam < 1e-2, (
-                f"all-slack sweep should have lambda ~0 at every point; "
-                f"got {lam}"
+                f"all-slack sweep should have lambda ~0 at every point; got {lam}"
             )
         for obj in pts["total_objective"].to_list():
             assert obj == pytest.approx(unconstrained, rel=0.02), (
@@ -1084,9 +1089,5 @@ class TestRatioFrontierResultAPI:
         assert "selected_total_loss_ratio" in summary["metrics"]
         assert "selected_lambda_loss_ratio" in summary["metrics"]
         # And they should be valid floats.
-        assert isinstance(
-            summary["metrics"]["selected_total_loss_ratio"], float
-        )
-        assert isinstance(
-            summary["metrics"]["selected_lambda_loss_ratio"], float
-        )
+        assert isinstance(summary["metrics"]["selected_total_loss_ratio"], float)
+        assert isinstance(summary["metrics"]["selected_lambda_loss_ratio"], float)

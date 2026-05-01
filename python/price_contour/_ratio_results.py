@@ -90,9 +90,8 @@ def _stitch_optimal_ratio_columns(
             wanted.append(col)
     if not wanted:
         return base_df
-    lookup = (
-        original_df.select([quote_id_col, scenario_index_col, *wanted])
-        .rename({scenario_index_col: "optimal_step"})
+    lookup = original_df.select([quote_id_col, scenario_index_col, *wanted]).rename(
+        {scenario_index_col: "optimal_step"}
     )
     joined = base_df.join(
         lookup,

@@ -18,7 +18,9 @@ from helpers import make_small_df
 
 
 @pytest.fixture
-def df_and_lambdas() -> tuple[pl.DataFrame, dict[str, float], dict[str, dict[str, float]]]:
+def df_and_lambdas() -> tuple[
+    pl.DataFrame, dict[str, float], dict[str, dict[str, float]]
+]:
     """Run a one-shot solve to get a stable lambda set + baseline DataFrame."""
     df = make_small_df(n_quotes=40, n_steps=5)
     constraints = {"volume": {"min_pct": 0.92}}
@@ -56,8 +58,7 @@ class TestApplyChunked:
         assert abs(chunked.baseline_objective - oneshot.baseline_objective) < 1e-3
         for k in oneshot.total_constraints:
             assert (
-                abs(chunked.total_constraints[k] - oneshot.total_constraints[k])
-                < 1e-3
+                abs(chunked.total_constraints[k] - oneshot.total_constraints[k]) < 1e-3
             )
             assert (
                 abs(chunked.baseline_constraints[k] - oneshot.baseline_constraints[k])
@@ -91,19 +92,21 @@ class TestApplyChunked:
         assert set(out.columns) == expected_cols
         assert out.height == df.select("quote_id").n_unique()
 
-    def test_output_matches_oneshot_per_quote(
-        self, tmp_path: Path, df_and_lambdas
-    ):
+    def test_output_matches_oneshot_per_quote(self, tmp_path: Path, df_and_lambdas):
         """Per-quote output (joined on quote_id) matches the one-shot DataFrame."""
         df, lambdas, constraints = df_and_lambdas
         in_path = str(tmp_path / "in.parquet")
         out_path = str(tmp_path / "out.parquet")
         df.write_parquet(in_path)
 
-        oneshot_df = pc.ApplyOptimiser(
-            lambdas=lambdas,
-            constraints=constraints,
-        ).apply(df).dataframe
+        oneshot_df = (
+            pc.ApplyOptimiser(
+                lambdas=lambdas,
+                constraints=constraints,
+            )
+            .apply(df)
+            .dataframe
+        )
 
         pc.apply_lambdas_to_parquet_chunked(
             parquet_in=in_path,
@@ -119,8 +122,7 @@ class TestApplyChunked:
         # Same quotes, same optimal step per quote.
         assert chunked_df["quote_id"].to_list() == oneshot_df["quote_id"].to_list()
         assert (
-            chunked_df["optimal_step"].to_list()
-            == oneshot_df["optimal_step"].to_list()
+            chunked_df["optimal_step"].to_list() == oneshot_df["optimal_step"].to_list()
         )
 
     def test_invariant_under_chunk_size(self, tmp_path: Path, df_and_lambdas):
@@ -142,13 +144,16 @@ class TestApplyChunked:
                 )
             )
         ref = results[0]
+        # Different chunk_sizes cut the file into different chunk
+        # partitions, so the per-chunk sums are added in different orders.
+        # f64 addition is non-associative, so a tiny drift (a few ULPs) is
+        # expected. The drift is bounded by O(N × ε), well below 1e-6 for
+        # n_quotes ≤ 100.
         for r in results[1:]:
             assert abs(r.total_objective - ref.total_objective) < 1e-6
             assert abs(r.baseline_objective - ref.baseline_objective) < 1e-6
             for k in ref.total_constraints:
-                assert (
-                    abs(r.total_constraints[k] - ref.total_constraints[k]) < 1e-6
-                )
+                assert abs(r.total_constraints[k] - ref.total_constraints[k]) < 1e-6
 
     def test_multiple_constraints(self, tmp_path: Path):
         """Two constraints in the input parquet — both apply correctly."""
@@ -322,9 +327,7 @@ class TestApplyChunked:
                 chunk_size=100,
             )
 
-    def test_missing_lambda_defaults_to_zero(
-        self, tmp_path: Path, df_and_lambdas
-    ):
+    def test_missing_lambda_defaults_to_zero(self, tmp_path: Path, df_and_lambdas):
         """Mirrors one-shot apply: a constraint with no lambda key is treated as 0."""
         df, _lambdas, _ = df_and_lambdas
         in_path = str(tmp_path / "in.parquet")
@@ -394,9 +397,7 @@ class TestApplyChunked:
         assert out.schema["optimal_scenario_value"] == pl.Float32
         assert out.schema["optimal_objective"] == pl.Float32
 
-    def test_overwrite_replaces_previous_output(
-        self, tmp_path: Path, df_and_lambdas
-    ):
+    def test_overwrite_replaces_previous_output(self, tmp_path: Path, df_and_lambdas):
         """Calling twice with the same parquet_out fully replaces the file.
 
         Previous chunked-write residue must not leak through; the second run's
@@ -438,9 +439,7 @@ class TestApplyChunked:
         # Corrupt scenario_value for Q0010 step 2 — the per-row builder
         # validation will catch it on the chunk that contains those rows.
         df = df.with_columns(
-            pl.when(
-                (pl.col("quote_id") == "Q0010") & (pl.col("scenario_index") == 2)
-            )
+            pl.when((pl.col("quote_id") == "Q0010") & (pl.col("scenario_index") == 2))
             .then(pl.lit(99.0, dtype=pl.Float32))
             .otherwise(pl.col("scenario_value"))
             .alias("scenario_value")
@@ -519,9 +518,7 @@ class TestApplyChunked:
         )
         assert abs(sum_obj - result.total_objective) < 1e-2
 
-    def test_output_directory_missing_raises(
-        self, tmp_path: Path, df_and_lambdas
-    ):
+    def test_output_directory_missing_raises(self, tmp_path: Path, df_and_lambdas):
         """An output path under a non-existent directory errors clearly."""
         df, lambdas, constraints = df_and_lambdas
         in_path = str(tmp_path / "in.parquet")
@@ -559,9 +556,7 @@ class TestApplyChunked:
         )
         assert abs(chunked.total_objective - oneshot.total_objective) < 1e-3
 
-    def test_chunk_size_below_n_steps_raises(
-        self, tmp_path: Path, df_and_lambdas
-    ):
+    def test_chunk_size_below_n_steps_raises(self, tmp_path: Path, df_and_lambdas):
         """chunk_size < n_steps must error early via the shared chunked-reader."""
         df, lambdas, constraints = df_and_lambdas
         in_path = str(tmp_path / "in.parquet")
@@ -574,6 +569,63 @@ class TestApplyChunked:
                 constraints=constraints,
                 chunk_size=3,  # < n_steps=5
             )
+
+    def test_ratio_constraints_rejected(self, tmp_path: Path):
+        """Ratio constraints can't be linearised in a per-chunk mini-grid.
+        The PyO3 signature rejects ratio specs at the type-system boundary
+        (the `numerator` / `denominator` string values can't deserialise
+        into the constraints' `Option<f64>` value type), so the user
+        always sees a clear error rather than silent behaviour. The
+        Python wrapper's docstring directs ratio callers to
+        ``ApplyOptimiser.apply(df)`` — this test pins the rejection."""
+        df = make_small_df(n_quotes=10, n_steps=5)
+        in_path = str(tmp_path / "in.parquet")
+        df.write_parquet(in_path)
+        # PyO3 raises TypeError (a subclass of Exception) at the boundary;
+        # the user-visible behaviour is "this fails loudly, not silently".
+        with pytest.raises(
+            (TypeError, ValueError), match=r"(?i)real number|str|not supported"
+        ):
+            pc.apply_lambdas_to_parquet_chunked(
+                parquet_in=in_path,
+                parquet_out=str(tmp_path / "out.parquet"),
+                lambdas={"loss_ratio": 0.0},
+                constraints={
+                    "loss_ratio": {
+                        "numerator": "expected_income",
+                        "denominator": "volume",
+                        "max": 1.0,
+                    }
+                },
+                chunk_size=20,
+            )
+
+    def test_extra_lambda_key_error_lists_all_extras_sorted(
+        self, tmp_path: Path, df_and_lambdas
+    ):
+        """Lambda keys not matching any constraint are rejected; the error
+        names ALL extras (not just the first) and lists them sorted, so
+        users debugging large lambda dicts see deterministic output that
+        matches `ApplyOptimiser`'s wording."""
+        df, _, _ = df_and_lambdas
+        in_path = str(tmp_path / "in.parquet")
+        df.write_parquet(in_path)
+        with pytest.raises(ValueError) as excinfo:
+            pc.apply_lambdas_to_parquet_chunked(
+                parquet_in=in_path,
+                parquet_out=str(tmp_path / "out.parquet"),
+                # Two extras in non-alphabetical order; the error must
+                # report them sorted.
+                lambdas={"zzz": 1.0, "aaa": 0.5, "volume": 0.1},
+                constraints={"volume": {"min_pct": 0.90}},
+                chunk_size=20,
+            )
+        msg = str(excinfo.value)
+        assert "aaa" in msg and "zzz" in msg
+        # Sorted order: 'aaa' must appear before 'zzz' in the message.
+        assert msg.index("aaa") < msg.index("zzz")
+        # And the wording must mirror ApplyOptimiser's plural form.
+        assert "Lambda keys" in msg
 
     def test_total_rows_not_divisible_raises(self, tmp_path: Path, df_and_lambdas):
         """Truncated parquet (rows % n_steps != 0) errors before any output is written."""

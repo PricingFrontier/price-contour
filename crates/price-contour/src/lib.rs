@@ -5,6 +5,7 @@ mod frontier_py;
 mod grid_py;
 mod grouped_py;
 mod parquet_grid_py;
+pub(crate) mod quote_id;
 mod ratebook_helpers_py;
 mod solver_py;
 pub(crate) mod utils;

@@ -31,7 +31,7 @@ class QuoteGridBuilder:
         *,
         quote_id: str = "quote_id",
         scenario_index: str = "scenario_index",
-        scenario_value_col: str = "scenario_value",
+        scenario_value: str = "scenario_value",
         objective: str = "expected_income",
         n_steps: int | None = None,
     ) -> None: ...
@@ -208,7 +208,7 @@ def apply_lambdas_to_parquet_chunked_py(
     *,
     quote_id: str = "quote_id",
     scenario_index: str = "scenario_index",
-    scenario_value_col: str = "scenario_value",
+    scenario_value: str = "scenario_value",
     objective: str = "expected_income",
     n_steps: int | None = None,
 ) -> ChunkedApplyResult: ...
@@ -240,7 +240,7 @@ def build_grid_from_parquet_py(
     *,
     quote_id: str = "quote_id",
     scenario_index: str = "scenario_index",
-    scenario_value_col: str = "scenario_value",
+    scenario_value: str = "scenario_value",
     objective: str = "expected_income",
 ) -> QuoteGrid: ...
 def build_grid_from_parquet_chunked_py(
@@ -250,7 +250,7 @@ def build_grid_from_parquet_chunked_py(
     *,
     quote_id: str = "quote_id",
     scenario_index: str = "scenario_index",
-    scenario_value_col: str = "scenario_value",
+    scenario_value: str = "scenario_value",
     objective: str = "expected_income",
     n_steps: int | None = None,
 ) -> QuoteGrid: ...
@@ -278,6 +278,7 @@ def build_interaction_labels_py(
     Rust and avoids the per-element ``PyUnicode`` round-trip. Retained for
     backwards compatibility with downstream callers."""
     ...
+
 def extract_factor_labels_py(
     factors: pl.DataFrame,
     factor_specs: list[list[str]],

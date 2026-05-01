@@ -12,38 +12,66 @@ use price_contour_core::{
 
 use crate::constraint_parsing::validate_constraints_dict;
 use crate::grid_py::PyQuoteGrid;
+use crate::quote_id::quote_id_str_iter;
 use crate::utils::{order_lambdas, zip_to_dict};
 
-/// Check if a DataFrame is already sorted by (col1, col2) where col1 is Utf8
-/// and col2 is Int32. Returns false on any error or null values.
-/// O(n) scan — much cheaper than the O(n log n) sort it can skip.
+/// Check if a DataFrame is already sorted by (col1, col2) where col1 is a
+/// quote_id-shaped column (Utf8 or Categorical) and col2 is Int32. Returns
+/// false on any error or null values. O(n) scan — much cheaper than the
+/// O(n log n) sort it can skip.
 pub(crate) fn is_df_sorted(df: &DataFrame, col1: &str, col2: &str) -> bool {
     let n = df.height();
     if n <= 1 {
         return true;
     }
 
-    let (Ok(s1), Ok(s2)) = (df.column(col1), df.column(col2)) else {
+    let (Ok(c1), Ok(s2)) = (df.column(col1), df.column(col2)) else {
         return false;
     };
-    let (Ok(ca1), Ok(ca2)) = (s1.str(), s2.i32()) else {
+    let Ok(mut iter1) = quote_id_str_iter(c1, col1) else {
+        return false;
+    };
+    let Ok(ca2) = s2.i32() else {
         return false;
     };
 
+    // Owned `String` carry-over: comparing successive iterator items
+    // through a `Box<dyn Iterator>` is awkward to spell against the
+    // borrow checker, so we stage `prev1` as an owned String and reuse
+    // its capacity via `clear() + push_str()`. Total allocation cost is
+    // O(n_distinct_quote_ids) at worst (one buffer growth each time the
+    // new id is longer than the existing capacity); for fixed-width id
+    // schemes (UUIDs, padded sequence numbers) it's a single allocation.
+    // The sorted-input fast path is the common one and bails on the
+    // first mismatch.
+    let Some(Some(first1)) = iter1.next() else {
+        return false;
+    };
+    let Some(first2) = ca2.get(0) else {
+        return false;
+    };
+    let mut prev1 = first1.to_string();
+    let mut prev2 = first2;
+
     for i in 1..n {
-        let (Some(prev1), Some(curr1)) = (ca1.get(i - 1), ca1.get(i)) else {
+        let Some(Some(curr1)) = iter1.next() else {
             return false;
         };
-        match prev1.cmp(curr1) {
+        let Some(curr2) = ca2.get(i) else {
+            return false;
+        };
+        match prev1.as_str().cmp(curr1) {
             std::cmp::Ordering::Greater => return false,
-            std::cmp::Ordering::Less => continue,
+            std::cmp::Ordering::Less => {
+                prev1.clear();
+                prev1.push_str(curr1);
+                prev2 = curr2;
+            }
             std::cmp::Ordering::Equal => {
-                let (Some(prev2), Some(curr2)) = (ca2.get(i - 1), ca2.get(i)) else {
-                    return false;
-                };
                 if prev2 > curr2 {
                     return false;
                 }
+                prev2 = curr2;
             }
         }
     }
@@ -83,26 +111,31 @@ pub(crate) fn ingest_dataframe(
         .i32()
         .map_err(|_| PyValueError::new_err(format!("{scenario_index_col} must be Int32")))?;
 
-    // Count unique quotes and determine n_steps
-    let qid_series = df
+    // Count unique quotes and determine n_steps. Iterates the quote_id
+    // column once via the shared accessor so the one-shot path supports
+    // both Utf8 and Categorical inputs identically.
+    let qid_col = df
         .column(quote_id_col)
         .map_err(|_| PyValueError::new_err(format!("Missing column: {quote_id_col}")))?;
-    let qid_ca = qid_series
-        .str()
-        .map_err(|_| PyValueError::new_err(format!("{quote_id_col} must be Utf8")))?;
 
-    // Determine n_steps from first quote
-    let first_qid = qid_ca
-        .get(0)
-        .ok_or_else(|| PyValueError::new_err("Empty DataFrame"))?;
-    let mut n_steps: usize = 0;
-    for i in 0..n_rows {
-        if qid_ca.get(i) == Some(first_qid) {
-            n_steps += 1;
-        } else {
-            break;
+    // Determine n_steps from the first quote: count how many leading rows
+    // share the same string as row 0.
+    let n_steps: usize = {
+        let mut probe_iter = quote_id_str_iter(qid_col, quote_id_col)?;
+        let first_qid = probe_iter
+            .next()
+            .ok_or_else(|| PyValueError::new_err("Empty DataFrame"))?
+            .ok_or_else(|| PyValueError::new_err("Empty DataFrame"))?
+            .to_string();
+        let mut count: usize = 1;
+        for next_opt in probe_iter {
+            match next_opt {
+                Some(s) if s == first_qid.as_str() => count += 1,
+                _ => break,
+            }
         }
-    }
+        count
+    };
     if n_steps == 0 {
         return Err(PyValueError::new_err("Could not determine n_steps"));
     }
@@ -161,16 +194,27 @@ pub(crate) fn ingest_dataframe(
         constraints.push(ca.into_no_null_iter().collect());
     }
 
-    // Extract quote_ids (one per quote — take every n_steps-th)
-    let quote_ids: Vec<String> = (0..n_quotes)
-        .map(|q| {
+    // Extract quote_ids: one per quote (the head of each n_steps block).
+    // Iterating the column once and skipping n_steps - 1 rows after each
+    // capture is identical-cost for Utf8 and avoids the random-access path
+    // that Categorical would otherwise pay (per-row dict lookup × n_rows).
+    let mut quote_ids: Vec<String> = Vec::with_capacity(n_quotes);
+    {
+        let mut iter = quote_id_str_iter(qid_col, quote_id_col)?;
+        for q in 0..n_quotes {
             let row = q * n_steps;
-            qid_ca
-                .get(row)
-                .map(|s| s.to_string())
-                .ok_or_else(|| PyValueError::new_err(format!("Null {quote_id_col} at row {row}")))
-        })
-        .collect::<PyResult<Vec<String>>>()?;
+            let qid = iter
+                .next()
+                .ok_or_else(|| PyValueError::new_err(format!("iter exhausted at row {row}")))?
+                .ok_or_else(|| PyValueError::new_err(format!("Null {quote_id_col} at row {row}")))?
+                .to_string();
+            quote_ids.push(qid);
+            // Skip the remaining n_steps - 1 rows of this quote.
+            for _ in 1..n_steps {
+                let _ = iter.next();
+            }
+        }
+    }
 
     // Validate step sequence (first 10 quotes only, for performance on large grids)
     for (q, qid) in quote_ids.iter().enumerate().take(n_quotes.min(10)) {

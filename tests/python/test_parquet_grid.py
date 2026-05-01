@@ -94,7 +94,7 @@ class TestBuildGridFromParquet:
             ["volume"],
             quote_id="policy_id",
             scenario_index="step",
-            scenario_value_col="price_factor",
+            scenario_value="price_factor",
             objective="revenue",
         )
         assert grid.n_quotes == 10
@@ -145,9 +145,7 @@ class TestBuildGridFromParquet:
         # Column projection is now done up front by Polars, so the error names
         # the missing column and lists valid ones — strictly more informative
         # than the old "Missing column: ..." string from ingest_dataframe.
-        with pytest.raises(
-            ValueError, match=r"(?i)expected_income|missing|not found"
-        ):
+        with pytest.raises(ValueError, match=r"(?i)expected_income|missing|not found"):
             build_grid_from_parquet(pq_path, ["volume"])
 
     def test_sink_parquet_then_read(self, tmp_path: Path):
@@ -181,9 +179,7 @@ class TestBuildGridFromParquetChunked:
         df.write_parquet(pq_path)
 
         oneshot = build_grid_from_parquet(pq_path, ["volume"])
-        chunked = build_grid_from_parquet_chunked(
-            pq_path, ["volume"], chunk_size=37
-        )
+        chunked = build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=37)
 
         assert chunked.n_quotes == oneshot.n_quotes
         assert chunked.n_steps == oneshot.n_steps
@@ -200,9 +196,7 @@ class TestBuildGridFromParquetChunked:
         df.write_parquet(pq_path)
 
         with pytest.raises(ValueError, match=r"(?i)chunk_size|n_steps"):
-            build_grid_from_parquet_chunked(
-                pq_path, ["volume"], chunk_size=3
-            )
+            build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=3)
 
     def test_chunk_size_exactly_one_quote(self, tmp_path: Path):
         """`chunk_size == n_steps` reads one quote per IO."""
@@ -213,9 +207,7 @@ class TestBuildGridFromParquetChunked:
         df.write_parquet(pq_path)
 
         oneshot = build_grid_from_parquet(pq_path, ["volume"])
-        chunked = build_grid_from_parquet_chunked(
-            pq_path, ["volume"], chunk_size=5
-        )
+        chunked = build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=5)
         assert chunked.quote_ids == oneshot.quote_ids
         assert chunked.scenario_values == oneshot.scenario_values
 
@@ -261,9 +253,7 @@ class TestBuildGridFromParquetChunked:
         pq_path = str(tmp_path / "test.parquet")
         df.write_parquet(pq_path)
         with pytest.raises(ValueError, match=r"(?i)chunk_size"):
-            build_grid_from_parquet_chunked(
-                pq_path, ["volume"], chunk_size=0
-            )
+            build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=0)
 
     def test_missing_file_raises(self):
         """Non-existent file raises ValueError."""
@@ -281,9 +271,7 @@ class TestBuildGridFromParquetChunked:
         bad_path = str(tmp_path / "corrupt.parquet")
         Path(bad_path).write_bytes(b"not parquet at all")
         with pytest.raises(ValueError, match=r"(?i)parquet|read"):
-            build_grid_from_parquet_chunked(
-                bad_path, ["volume"], chunk_size=100
-            )
+            build_grid_from_parquet_chunked(bad_path, ["volume"], chunk_size=100)
 
     def test_empty_parquet_raises(self, tmp_path: Path):
         """Zero-row parquet raises a clear error."""
@@ -301,9 +289,7 @@ class TestBuildGridFromParquetChunked:
         pq_path = str(tmp_path / "empty.parquet")
         df.write_parquet(pq_path)
         with pytest.raises(ValueError, match=r"(?i)empty|no rows"):
-            build_grid_from_parquet_chunked(
-                pq_path, ["volume"], chunk_size=100
-            )
+            build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=100)
 
     def test_missing_columns_raises(self, tmp_path: Path):
         """Parquet missing a required column raises a clear error."""
@@ -313,9 +299,57 @@ class TestBuildGridFromParquetChunked:
         pq_path = str(tmp_path / "missing.parquet")
         df.write_parquet(pq_path)
         with pytest.raises(ValueError, match=r"(?i)missing|column"):
-            build_grid_from_parquet_chunked(
-                pq_path, ["volume"], chunk_size=100
-            )
+            build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=100)
+
+    def test_first_row_scenario_index_must_be_zero(self, tmp_path: Path):
+        """A parquet whose first row has scenario_index != 0 must error.
+
+        The chunked auto-detect contract is "first quote occupies rows
+        0..n_steps with scenario_index = 0..n_steps". A parquet where
+        the first row's scenario_index is anything other than 0 is
+        malformed; the error path should fire deterministically rather
+        than silently mis-detecting n_steps.
+        """
+        from price_contour import build_grid_from_parquet_chunked
+
+        df = make_small_df(n_quotes=4, n_steps=5)
+        # Slice off the first row so the parquet starts at scenario_index=1.
+        df = df.slice(1, df.height - 1)
+        pq_path = str(tmp_path / "shifted.parquet")
+        df.write_parquet(pq_path)
+        with pytest.raises(ValueError, match=r"(?i)scenario_index|expected 0"):
+            build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=20)
+
+    def test_first_row_null_quote_id_raises(self, tmp_path: Path):
+        """A null quote_id in the first row must surface a named error
+        rather than panicking through `unwrap()`."""
+        from price_contour import build_grid_from_parquet_chunked
+
+        df = make_small_df(n_quotes=4, n_steps=5)
+        # Replace row 0's quote_id with null while preserving dtype.
+        ids = df["quote_id"].to_list()
+        ids[0] = None
+        df = df.with_columns(pl.Series("quote_id", ids, dtype=pl.Utf8))
+        pq_path = str(tmp_path / "null_qid.parquet")
+        df.write_parquet(pq_path)
+        with pytest.raises(ValueError, match=r"(?i)null|quote_id"):
+            build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=20)
+
+    def test_first_row_nan_scenario_value_raises(self, tmp_path: Path):
+        """A NaN in the first quote's scenario_value column corrupts the
+        canonical grid. The first chunk's `derive_grid_metadata` reads
+        scenario_values from the first n_steps rows; NaN there must be
+        rejected by `QuoteGrid::validate()` (no NaN in scenario_values)."""
+        from price_contour import build_grid_from_parquet_chunked
+
+        df = make_small_df(n_quotes=4, n_steps=5)
+        sv = df["scenario_value"].to_list()
+        sv[2] = float("nan")  # corrupt the first quote's step 2 scenario_value
+        df = df.with_columns(pl.Series("scenario_value", sv, dtype=pl.Float32))
+        pq_path = str(tmp_path / "nan_sv.parquet")
+        df.write_parquet(pq_path)
+        with pytest.raises(ValueError, match=r"(?i)nan|scenario|finite"):
+            build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=20)
 
     def test_total_rows_not_divisible_by_n_steps_raises(self, tmp_path: Path):
         """If the parquet's total rows don't divide n_steps, error early."""
@@ -327,9 +361,7 @@ class TestBuildGridFromParquetChunked:
         pq_path = str(tmp_path / "ragged.parquet")
         df.write_parquet(pq_path)
         with pytest.raises(ValueError, match=r"(?i)divisible|n_steps"):
-            build_grid_from_parquet_chunked(
-                pq_path, ["volume"], chunk_size=10
-            )
+            build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=10)
 
     def test_multi_row_group_parquet(self, tmp_path: Path):
         """A parquet with multiple row groups still produces the canonical grid."""
@@ -341,9 +373,7 @@ class TestBuildGridFromParquetChunked:
         df.write_parquet(pq_path, row_group_size=50)
 
         oneshot = build_grid_from_parquet(pq_path, ["volume"])
-        chunked = build_grid_from_parquet_chunked(
-            pq_path, ["volume"], chunk_size=43
-        )
+        chunked = build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=43)
         assert chunked.quote_ids == oneshot.quote_ids
         assert chunked.scenario_values == oneshot.scenario_values
 
@@ -360,9 +390,7 @@ class TestBuildGridFromParquetChunked:
         pq_path = str(tmp_path / "reversed.parquet")
         reversed_quotes.write_parquet(pq_path)
 
-        chunked = build_grid_from_parquet_chunked(
-            pq_path, ["volume"], chunk_size=37
-        )
+        chunked = build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=37)
         # build()-time sort restores canonical order.
         assert chunked.quote_ids == [f"Q{q:04d}" for q in range(30)]
 
@@ -376,9 +404,7 @@ class TestBuildGridFromParquetChunked:
 
         oneshot = build_grid_from_parquet(pq_path, ["volume"])
         # chunk_size=10 → 50 chunks total
-        chunked = build_grid_from_parquet_chunked(
-            pq_path, ["volume"], chunk_size=10
-        )
+        chunked = build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=10)
         assert chunked.quote_ids == oneshot.quote_ids
         assert chunked.scenario_values == oneshot.scenario_values
 
@@ -426,9 +452,7 @@ class TestBuildGridFromParquetChunked:
         pq_path = str(tmp_path / "extras.parquet")
         df.write_parquet(pq_path)
 
-        grid = build_grid_from_parquet_chunked(
-            pq_path, ["volume"], chunk_size=20
-        )
+        grid = build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=20)
         assert grid.n_quotes == 10
         # Only the requested constraint should be loaded.
         assert grid.constraint_names == ["volume"]
@@ -442,9 +466,7 @@ class TestBuildGridFromParquetChunked:
         df.write_parquet(pq_path)
 
         grids = [
-            build_grid_from_parquet_chunked(
-                pq_path, ["volume"], chunk_size=cs
-            )
+            build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=cs)
             for cs in (5, 13, 37, 100, 10_000)
         ]
         ref = grids[0]
@@ -463,9 +485,7 @@ class TestBuildGridFromParquetChunked:
         df.write_parquet(pq_path, row_group_size=37)
 
         oneshot = build_grid_from_parquet(pq_path, ["volume"])
-        chunked = build_grid_from_parquet_chunked(
-            pq_path, ["volume"], chunk_size=29
-        )
+        chunked = build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=29)
         assert chunked.quote_ids == oneshot.quote_ids
         assert chunked.scenario_values == oneshot.scenario_values
 
@@ -477,9 +497,7 @@ class TestBuildGridFromParquetChunked:
         pq_path = str(tmp_path / "single.parquet")
         df.write_parquet(pq_path)
 
-        grid = build_grid_from_parquet_chunked(
-            pq_path, ["volume"], chunk_size=100
-        )
+        grid = build_grid_from_parquet_chunked(pq_path, ["volume"], chunk_size=100)
         assert grid.n_quotes == 1
         assert grid.n_steps == 5
 
@@ -496,9 +514,7 @@ class TestBuildGridFromParquetChunked:
                 pq_path, ["volume", "volume"], chunk_size=20
             )
 
-    def test_constraint_column_collides_with_schema_column_raises(
-        self, tmp_path: Path
-    ):
+    def test_constraint_column_collides_with_schema_column_raises(self, tmp_path: Path):
         """A constraint named like a schema column must error early."""
         from price_contour import build_grid_from_parquet_chunked
 
@@ -508,6 +524,4 @@ class TestBuildGridFromParquetChunked:
 
         with pytest.raises(ValueError, match=r"(?i)collide|schema"):
             # "quote_id" overlaps with schema's quote_id column name.
-            build_grid_from_parquet_chunked(
-                pq_path, ["quote_id"], chunk_size=20
-            )
+            build_grid_from_parquet_chunked(pq_path, ["quote_id"], chunk_size=20)

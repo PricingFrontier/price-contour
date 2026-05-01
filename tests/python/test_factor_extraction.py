@@ -118,9 +118,7 @@ class TestExtractFactorLabels:
 
     def test_zero_rows(self):
         """Zero-row DataFrame → empty per-spec lists."""
-        df = pl.DataFrame(
-            {"region": pl.Series("region", [], dtype=pl.Utf8)}
-        )
+        df = pl.DataFrame({"region": pl.Series("region", [], dtype=pl.Utf8)})
         labels = extract_factor_labels_py(df, [["region"]], "\x1f")
         assert labels == [[]]
 
@@ -140,9 +138,7 @@ class TestExtractFactorLabels:
         old_interaction = build_interaction_labels_py(old_interaction_cols, "\x1f")
 
         # New path: extract_factor_labels_py.
-        new = extract_factor_labels_py(
-            df, [["region"], ["region", "age_band"]], "\x1f"
-        )
+        new = extract_factor_labels_py(df, [["region"], ["region", "age_band"]], "\x1f")
         assert new[0] == old_single
         assert new[1] == old_interaction
 
@@ -188,9 +184,7 @@ class TestExtractFactorLabels:
 
     def test_all_null_column_raises(self):
         """A column that is entirely null still surfaces as a null-rejection error."""
-        df = pl.DataFrame(
-            {"col": pl.Series("col", [None, None, None], dtype=pl.Utf8)}
-        )
+        df = pl.DataFrame({"col": pl.Series("col", [None, None, None], dtype=pl.Utf8)})
         with pytest.raises(ValueError, match=r"(?i)null|col"):
             extract_factor_labels_py(df, [["col"]], "\x1f")
 
@@ -270,9 +264,7 @@ class TestRatebookEndToEndRegressions:
             max_iter=50,
             max_cd_iterations=3,
         )
-        result = rb.solve(
-            df, factors, factor_columns=[["region", "age_band"]]
-        )
+        result = rb.solve(df, factors, factor_columns=[["region", "age_band"]])
         assert "region:age_band" in result.factor_tables
 
     def test_solve_with_int_factor_column(self):
@@ -283,9 +275,7 @@ class TestRatebookEndToEndRegressions:
         # Int-typed factor column; previous Python `.to_list()` path would
         # have produced ["25", "35", ...] via Polars cast → list[str]. The
         # new path casts in Rust; results must be identical.
-        factors = pl.DataFrame(
-            {"age_int": [(20 + (i * 3) % 30) for i in range(20)]}
-        )
+        factors = pl.DataFrame({"age_int": [(20 + (i * 3) % 30) for i in range(20)]})
         rb = pc.RatebookOptimiser(
             objective="expected_income",
             constraints={"volume": {"min_pct": 0.90}},

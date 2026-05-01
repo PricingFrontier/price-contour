@@ -226,9 +226,7 @@ class ApplyOptimiser:
         }
         extras = set(config.keys()) - known_keys
         if extras:
-            raise ValueError(
-                f"unknown keys in saved config: {sorted(extras)}"
-            )
+            raise ValueError(f"unknown keys in saved config: {sorted(extras)}")
         return cls(
             lambdas=config["lambdas"],
             objective=config.get("objective", "expected_income"),

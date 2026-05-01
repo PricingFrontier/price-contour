@@ -35,7 +35,7 @@ def build_grid(
         constraint_columns,
         quote_id=quote_id,
         scenario_index=scenario_index,
-        scenario_value_col=scenario_value,
+        scenario_value=scenario_value,
         objective=objective,
     )
     builder.append(df)

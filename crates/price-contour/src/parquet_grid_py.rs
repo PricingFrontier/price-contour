@@ -5,6 +5,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
+use price_contour_core::QuoteGrid;
+
 use crate::builder_py::PyQuoteGridBuilder;
 use crate::grid_py::PyQuoteGrid;
 use crate::solver_py::ingest_dataframe;
@@ -28,21 +30,22 @@ use crate::solver_py::ingest_dataframe;
     *,
     quote_id = "quote_id",
     scenario_index = "scenario_index",
-    scenario_value_col = "scenario_value",
+    scenario_value = "scenario_value",
     objective = "expected_income",
 ))]
 pub fn build_grid_from_parquet_py(
+    py: Python<'_>,
     path: &str,
     constraint_columns: Vec<String>,
     quote_id: &str,
     scenario_index: &str,
-    scenario_value_col: &str,
+    scenario_value: &str,
     objective: &str,
 ) -> PyResult<PyQuoteGrid> {
     validate_column_names(
         quote_id,
         scenario_index,
-        scenario_value_col,
+        scenario_value,
         objective,
         &constraint_columns,
     )?;
@@ -50,27 +53,30 @@ pub fn build_grid_from_parquet_py(
     let needed_columns = build_projection(
         quote_id,
         scenario_index,
-        scenario_value_col,
+        scenario_value,
         objective,
         &constraint_columns,
     );
 
-    // Reuse the slice reader so projection pruning applies to the one-shot
-    // path too — a measurable memory win for parquets that carry columns
-    // outside this grid's needs.
-    let (total_rows, metadata) = open_metadata(path)?;
-    let df = read_parquet_slice(path, &metadata, 0, total_rows, &needed_columns)?;
-
-    let grid = ingest_dataframe(
-        &df,
-        quote_id,
-        scenario_index,
-        scenario_value_col,
-        objective,
-        &constraint_columns,
-    )?;
-
-    Ok(PyQuoteGrid::new(grid))
+    // Release the GIL across parquet IO + ingest. The body is pure Rust:
+    // `read_parquet_slice` constructs Polars buffers (no Python objects),
+    // `ingest_dataframe` walks the column data into a `QuoteGrid`. Errors
+    // become `PyValueError`s lazily — `PyValueError::new_err(String)` is
+    // safe to construct without the GIL in pyo3 0.26 (it stores the
+    // message until restored to the interpreter).
+    py.detach(|| -> PyResult<QuoteGrid> {
+        let (total_rows, metadata) = open_metadata(path)?;
+        let df = read_parquet_slice(path, &metadata, 0, total_rows, &needed_columns)?;
+        ingest_dataframe(
+            &df,
+            quote_id,
+            scenario_index,
+            scenario_value,
+            objective,
+            &constraint_columns,
+        )
+    })
+    .map(PyQuoteGrid::new)
 }
 
 /// Build a QuoteGrid by streaming a Parquet file in fixed-size row slices.
@@ -107,18 +113,19 @@ pub fn build_grid_from_parquet_py(
     *,
     quote_id = "quote_id",
     scenario_index = "scenario_index",
-    scenario_value_col = "scenario_value",
+    scenario_value = "scenario_value",
     objective = "expected_income",
     n_steps = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn build_grid_from_parquet_chunked_py(
+    py: Python<'_>,
     path: &str,
     constraint_columns: Vec<String>,
     chunk_size: usize,
     quote_id: &str,
     scenario_index: &str,
-    scenario_value_col: &str,
+    scenario_value: &str,
     objective: &str,
     n_steps: Option<usize>,
 ) -> PyResult<PyQuoteGrid> {
@@ -131,43 +138,54 @@ pub fn build_grid_from_parquet_chunked_py(
     validate_column_names(
         quote_id,
         scenario_index,
-        scenario_value_col,
+        scenario_value,
         objective,
         &constraint_columns,
     )?;
 
-    // The builder is initialised on the first chunk once `n_steps` has been
-    // resolved by the shared helper, then every subsequent chunk appends
-    // through the same instance. Locking `n_steps` on the builder skips its
-    // own auto-detection and gets us a single consistent contract.
-    let mut builder: Option<PyQuoteGridBuilder> = None;
+    // Release the GIL across the entire chunked-read + per-row validation
+    // + cycle-permutation sort. The closure body is pure Rust: it
+    // constructs `PyDataFrame` (a #[repr(transparent)] newtype around a
+    // Polars `DataFrame`, no Python objects) and calls `PyQuoteGridBuilder`
+    // methods which don't touch the interpreter. Without `py.detach` here
+    // every other Python thread stalls through the entire ingest, including
+    // any concurrent `build_grid_from_parquet_chunked` call.
+    py.detach(|| -> PyResult<PyQuoteGrid> {
+        // The builder is initialised on the first chunk once `n_steps` has
+        // been resolved by the shared helper, then every subsequent chunk
+        // appends through the same instance. Locking `n_steps` on the
+        // builder skips its own auto-detection and gets us a single
+        // consistent contract.
+        let mut builder: Option<PyQuoteGridBuilder> = None;
 
-    read_parquet_in_aligned_chunks(
-        path,
-        chunk_size,
-        n_steps,
-        quote_id,
-        scenario_index,
-        scenario_value_col,
-        objective,
-        &constraint_columns,
-        |df, resolved_n_steps| {
-            if builder.is_none() {
-                builder = Some(PyQuoteGridBuilder::new(
-                    constraint_columns.clone(),
-                    quote_id,
-                    scenario_index,
-                    scenario_value_col,
-                    objective,
-                    Some(resolved_n_steps),
-                )?);
-            }
-            builder.as_mut().unwrap().append(PyDataFrame(df))
-        },
-    )?;
+        read_parquet_in_aligned_chunks(
+            path,
+            chunk_size,
+            n_steps,
+            quote_id,
+            scenario_index,
+            scenario_value,
+            objective,
+            &constraint_columns,
+            |df, resolved_n_steps| {
+                if builder.is_none() {
+                    builder = Some(PyQuoteGridBuilder::new(
+                        constraint_columns.clone(),
+                        quote_id,
+                        scenario_index,
+                        scenario_value,
+                        objective,
+                        Some(resolved_n_steps),
+                    )?);
+                }
+                builder.as_mut().unwrap().append(PyDataFrame(df))
+            },
+        )?;
 
-    let mut builder = builder.ok_or_else(|| PyValueError::new_err("no chunks were processed"))?;
-    builder.build()
+        let mut builder =
+            builder.ok_or_else(|| PyValueError::new_err("no chunks were processed"))?;
+        builder.build()
+    })
 }
 
 /// Read parquet metadata once so subsequent slice reads can reuse it.

@@ -34,7 +34,9 @@ class TestQuoteGridBuilder:
 
         assert result_grid.n_quotes == result_df.n_quotes
         assert result_grid.n_steps == result_df.n_steps
-        assert abs(result_grid.total_objective - result_df.total_objective) < 1e-3
+        # Same data, same canonical grid layout, deterministic solver under
+        # ARGMAX_PAR_GRAIN — totals must be bit-equal, not just close.
+        assert result_grid.total_objective == result_df.total_objective
 
     def test_five_chunks_matches_oneshot(self):
         """Build grid from 5 chunks = same result as one-shot."""
@@ -136,9 +138,7 @@ class TestQuoteGridBuilderUnsortedChunks:
         """Quotes appended back-to-front still yield a grid sorted by quote_id."""
         df = make_small_df(n_quotes=20, n_steps=5)
         # Split the DataFrame into per-quote chunks and append in reverse.
-        chunks = [
-            df.filter(pl.col("quote_id") == f"Q{q:04d}") for q in range(20)
-        ]
+        chunks = [df.filter(pl.col("quote_id") == f"Q{q:04d}") for q in range(20)]
         builder = QuoteGridBuilder(["volume"])
         for chunk in reversed(chunks):
             builder.append(chunk)
@@ -156,11 +156,12 @@ class TestQuoteGridBuilderUnsortedChunks:
         )
         result_unsorted = solver.solve(grid)
         result_canonical = solver.solve(canonical_grid)
-        # Same data, same solve — totals must match exactly.
-        assert (
-            abs(result_unsorted.total_objective - result_canonical.total_objective)
-            < 1e-3
-        )
+        # Both grids are byte-identical post-sort (Issue 1's permutation
+        # property is pinned at the Rust level by
+        # `test_build_property_random_shuffles_match_naive_sort`); n=20
+        # is well under ARGMAX_PAR_GRAIN=4096 so the solver is fully
+        # deterministic — totals must be bit-equal.
+        assert result_unsorted.total_objective == result_canonical.total_objective
 
     def test_interleaved_single_quote_chunks_produce_sorted_grid(self):
         """Many tiny chunks in a scrambled order still yield the canonical grid."""
@@ -183,7 +184,9 @@ class TestQuoteGridBuilderUnsortedChunks:
         )
         r_a = solver.solve(grid)
         r_b = solver.solve(canonical_grid)
-        assert abs(r_a.total_objective - r_b.total_objective) < 1e-3
+        # Both grids are byte-identical post-sort; n=15 is single-rayon-
+        # partition so the solver is deterministic — totals are bit-equal.
+        assert r_a.total_objective == r_b.total_objective
 
     def test_duplicate_quote_id_across_chunks_raises(self):
         """Same quote_id in two chunks must surface a clear error at build()."""
@@ -213,9 +216,7 @@ class TestQuoteGridBuilderUnsortedChunks:
         scrambled = df.sort(["scenario_index", "quote_id"])
 
         builder = QuoteGridBuilder(["volume"])
-        with pytest.raises(
-            ValueError, match=r"(?i)contiguous|n_steps|scenario_index"
-        ):
+        with pytest.raises(ValueError, match=r"(?i)contiguous|n_steps|scenario_index"):
             builder.append(scrambled)
 
     def test_empty_chunk_is_noop(self):
@@ -292,9 +293,7 @@ class TestQuoteGridBuilderUnsortedChunks:
         df = make_small_df(n_quotes=2, n_steps=5)
         # Tell the builder n_steps=3 but feed it a 5-step DataFrame.
         builder = QuoteGridBuilder(["volume"], n_steps=3)
-        with pytest.raises(
-            ValueError, match=r"(?i)n_steps|scenario_index|contiguous"
-        ):
+        with pytest.raises(ValueError, match=r"(?i)n_steps|scenario_index|contiguous"):
             builder.append(df)
 
     def test_scenario_values_not_permuted_by_sort(self):
@@ -329,8 +328,39 @@ class TestQuoteGridBuilderUnsortedChunks:
 
         forward = solve_with_order(list(range(30)))
         reverse = solve_with_order(list(reversed(range(30))))
-        scrambled = solve_with_order([13, 0, 27, 5, 19, 8, 22, 1, 11, 28, 3, 17, 9,
-                                       15, 25, 6, 21, 12, 4, 23, 16, 2, 29, 18, 7,
-                                       20, 10, 26, 14, 24])
+        scrambled = solve_with_order(
+            [
+                13,
+                0,
+                27,
+                5,
+                19,
+                8,
+                22,
+                1,
+                11,
+                28,
+                3,
+                17,
+                9,
+                15,
+                25,
+                6,
+                21,
+                12,
+                4,
+                23,
+                16,
+                2,
+                29,
+                18,
+                7,
+                20,
+                10,
+                26,
+                14,
+                24,
+            ]
+        )
         assert abs(forward - reverse) < 1e-3
         assert abs(forward - scrambled) < 1e-3

@@ -245,9 +245,7 @@ class OnlineOptimiser:
         # design assumes one range per constraint, so the unswept-axis
         # case is handled by the Python orchestrator).
         ratio_names = _ratio_constraint_names(self.constraints)
-        has_unswept = any(
-            name not in threshold_ranges for name in self.constraints
-        )
+        has_unswept = any(name not in threshold_ranges for name in self.constraints)
         if ratio_names or has_unswept:
             if ratio_names and not isinstance(df_or_grid, pl.DataFrame):
                 # The ratio linearisation needs raw numerator / denominator
@@ -350,9 +348,7 @@ class OnlineOptimiser:
             if name in threshold_ranges:
                 continue
             if _spec_threshold_is_none(spec):
-                raise ValueError(
-                    f"No threshold_range for constraint '{name}'"
-                )
+                raise ValueError(f"No threshold_range for constraint '{name}'")
 
         constraint_names = list(self.constraints.keys())
         # ``self.constraints`` cannot be empty here: ``frontier()`` only
@@ -1077,9 +1073,7 @@ def _linearise_ratio_constraints(
                 break
         if direction_key is None:
             # Defensive: validator enforces this.
-            raise ValueError(
-                f"Ratio constraint '{name}' missing direction key."
-            )
+            raise ValueError(f"Ratio constraint '{name}' missing direction key.")
         threshold_value = spec[direction_key]
         if threshold_value is None:
             raise ValueError(
@@ -1352,9 +1346,7 @@ class _RatioSolveResultWrapper:
         self._history_cache = adjusted
         return adjusted
 
-    def _actual_ratios_for_lambdas(
-        self, lambdas: dict[str, float]
-    ) -> dict[str, float]:
+    def _actual_ratios_for_lambdas(self, lambdas: dict[str, float]) -> dict[str, float]:
         """Replay the Lagrangian argmax in Python and compute actual
         ratios per ratio label.
 
@@ -1387,12 +1379,10 @@ class _RatioSolveResultWrapper:
         # keeps quotes in insertion order for deterministic downstream
         # joins; ``arg_max`` is stable on ties (returns the first index)
         # which mirrors the Rust solver's tie-break.
-        opt_steps = (
-            work.group_by(self._quote_id, maintain_order=True).agg(
-                pl.col(self._scenario_index)
-                .get(pl.col("_lagrangian").arg_max())
-                .alias("_optimal_step")
-            )
+        opt_steps = work.group_by(self._quote_id, maintain_order=True).agg(
+            pl.col(self._scenario_index)
+            .get(pl.col("_lagrangian").arg_max())
+            .alias("_optimal_step")
         )
         # Inner-join back onto the original DataFrame at (quote_id,
         # scenario_index == optimal_step) to pull num / denom values at
@@ -1631,7 +1621,10 @@ def _validate_dataframe(
     # Note: label-vs-column collision is checked at the linearisation
     # call site (:func:`_linearise_ratio_constraints`), NOT here.
     for label, numerator_col, denominator_col in ratio_specs:
-        for role, col in (("numerator", numerator_col), ("denominator", denominator_col)):
+        for role, col in (
+            ("numerator", numerator_col),
+            ("denominator", denominator_col),
+        ):
             if col not in df.columns:
                 raise ValueError(
                     f"Ratio constraint '{label}' references {role} column "
@@ -1815,5 +1808,3 @@ def _check_zero_baseline_denominator_for_pct_ratios(
             denom_total = float(baseline[denom_col].cast(pl.Float64).sum())
         if denom_total == 0.0:
             raise ValueError(_zero_denom_message(name, denom_col))
-
-

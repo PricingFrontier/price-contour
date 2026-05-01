@@ -316,7 +316,7 @@ builder = pc.QuoteGridBuilder(
     ["volume", "loss_ratio"],
     quote_id="quote_id",
     scenario_index="scenario_index",
-    scenario_value_col="scenario_value",
+    scenario_value="scenario_value",
     objective="income",
     # n_steps=20,               # optional: lock upfront for streaming sources
 )
@@ -359,7 +359,7 @@ print(result.output_path)             # 'scored_results.parquet'
 opt = pl.scan_parquet(result.output_path)
 ```
 
-The `optimal_steps` array is **never** held in memory — each chunk's mini-grid is built, scored, written to the output parquet, and dropped before the next chunk is read. Aggregate totals are accumulated in f64 across chunks. On any error the partial output is best-effort deleted so callers never observe a corrupt artefact, and the input/output paths are checked for equality so the input parquet can't be silently overwritten. Lambda keys not matching any constraint are rejected up front (matching `ApplyOptimiser`).
+The **whole-portfolio** `optimal_steps` array is never materialised — only one chunk's `optimal_steps` is alive at a time (`chunk_size / n_steps` entries), and gets dropped along with the chunk's mini-grid after the row group has been written. Aggregate totals accumulate in f64 across chunks. On any error the partial output is best-effort deleted so callers never observe a corrupt artefact, and the input/output paths are checked for equality so the input parquet can't be silently overwritten. Lambda keys not matching any constraint are rejected up front (matching `ApplyOptimiser`). Ratio constraints are rejected on this path — use `ApplyOptimiser.apply(df)` on a DataFrame instead, since the per-chunk mini-grid can't carry the raw numerator/denominator columns.
 
 ---
 
@@ -520,7 +520,7 @@ maturin develop
 
 | Method | Description |
 |---|---|
-| `QuoteGridBuilder(constraint_columns, *, quote_id, scenario_index, scenario_value_col, objective, n_steps=None)` | Construct a builder. `n_steps` may be passed upfront to skip auto-detection from the first chunk — useful for streaming sources where the first chunk may be partial. |
+| `QuoteGridBuilder(constraint_columns, *, quote_id, scenario_index, scenario_value, objective, n_steps=None)` | Construct a builder. `n_steps` may be passed upfront to skip auto-detection from the first chunk — useful for streaming sources where the first chunk may be partial. |
 | `append(df)` | Add a chunk of quotes. Rows must be grouped by `quote_id` with `scenario_index` running `0..n_steps` in order. Per-row validation rejects layout violations and `scenario_value` drift across chunks. |
 | `build()` | Finalise and return a `QuoteGrid`. Sorts by `quote_id` in-place via cycle-following permutation (no 2× memory peak). Rejects duplicate `quote_id`s with both append-order indices in the error. |
 
@@ -555,7 +555,7 @@ maturin develop
 
 ### ChunkedApplyResult
 
-Returned by `apply_lambdas_to_parquet_chunked`. Carries the same aggregate totals as `ApplyResult` but the per-quote rows live only in the output parquet — `optimal_steps` is never held in memory.
+Returned by `apply_lambdas_to_parquet_chunked`. Carries the same aggregate totals as `ApplyResult` but the per-quote rows live only in the output parquet — only one chunk's `optimal_steps` (`chunk_size / n_steps` entries) is alive at any time, then dropped after the row group is written.
 
 | Property | Type | Description |
 |---|---|---|

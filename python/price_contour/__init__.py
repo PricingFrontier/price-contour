@@ -5,7 +5,15 @@ Lagrangian dual decomposition for portfolio-level price optimisation,
 with Rust core and Polars DataFrame interop.
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("price-contour")
+except PackageNotFoundError:
+    # Editable installs without metadata fall back to a sentinel; this
+    # should never happen in a built wheel but keeps importable from a
+    # source tree that hasn't been `maturin develop`'d yet.
+    __version__ = "0.0.0+local"
 
 from price_contour.apply import ApplyOptimiser, apply_from_grid
 from price_contour.builder import QuoteGrid, QuoteGridBuilder
@@ -29,7 +37,7 @@ def build_grid_from_parquet(
     *,
     quote_id: str = "quote_id",
     scenario_index: str = "scenario_index",
-    scenario_value_col: str = "scenario_value",
+    scenario_value: str = "scenario_value",
     objective: str = "expected_income",
 ) -> QuoteGrid:
     """Build a QuoteGrid directly from a Parquet file.
@@ -48,7 +56,7 @@ def build_grid_from_parquet(
         Column name for quote identifiers.
     scenario_index : str
         Column name for scenario step indices.
-    scenario_value_col : str
+    scenario_value : str
         Column name for scenario values (e.g. price multipliers).
     objective : str
         Column name for the objective values.
@@ -62,7 +70,7 @@ def build_grid_from_parquet(
         constraint_columns,
         quote_id=quote_id,
         scenario_index=scenario_index,
-        scenario_value_col=scenario_value_col,
+        scenario_value=scenario_value,
         objective=objective,
     )
 
@@ -74,7 +82,7 @@ def build_grid_from_parquet_chunked(
     *,
     quote_id: str = "quote_id",
     scenario_index: str = "scenario_index",
-    scenario_value_col: str = "scenario_value",
+    scenario_value: str = "scenario_value",
     objective: str = "expected_income",
     n_steps: int | None = None,
 ) -> QuoteGrid:
@@ -115,7 +123,7 @@ def build_grid_from_parquet_chunked(
         Column name for quote identifiers.
     scenario_index : str
         Column name for scenario step indices.
-    scenario_value_col : str
+    scenario_value : str
         Column name for scenario values.
     objective : str
         Column name for the objective values.
@@ -136,7 +144,7 @@ def build_grid_from_parquet_chunked(
         chunk_size,
         quote_id=quote_id,
         scenario_index=scenario_index,
-        scenario_value_col=scenario_value_col,
+        scenario_value=scenario_value,
         objective=objective,
         n_steps=n_steps,
     )
@@ -151,7 +159,7 @@ def apply_lambdas_to_parquet_chunked(
     *,
     quote_id: str = "quote_id",
     scenario_index: str = "scenario_index",
-    scenario_value_col: str = "scenario_value",
+    scenario_value: str = "scenario_value",
     objective: str = "expected_income",
     n_steps: int | None = None,
 ) -> ChunkedApplyResult:
@@ -159,13 +167,22 @@ def apply_lambdas_to_parquet_chunked(
 
     Reads ``parquet_in`` in fixed-size row slices and writes per-quote
     apply results to ``parquet_out`` one row group at a time. Returns a
-    :class:`ChunkedApplyResult` with aggregate totals — the per-quote
-    ``optimal_steps`` array is **never** held in memory; callers who want
-    those rows read them back via ``pl.read_parquet(parquet_out)``.
+    :class:`ChunkedApplyResult` with aggregate totals — the
+    **whole-portfolio** per-quote ``optimal_steps`` array is never
+    materialised; only one chunk's ``optimal_steps`` (``chunk_size / n_steps``
+    entries) is alive at a time and is dropped after the chunk's row group
+    is written. Callers who want the per-row results read them back via
+    ``pl.read_parquet(parquet_out)``.
 
     Use this when the input parquet exceeds available memory or you want
     bounded peak memory regardless of file size. For small inputs, the
     in-memory :class:`ApplyOptimiser` is simpler.
+
+    **Ratio constraints are not supported on this path** — the per-chunk
+    mini-grid drops the raw numerator/denominator columns that the
+    apply-time linearisation needs. Use :class:`ApplyOptimiser` on a
+    DataFrame for ratio constraints. The chunked path will reject
+    ratio-shaped specs upfront with a clear error.
 
     Parameters
     ----------
@@ -191,7 +208,7 @@ def apply_lambdas_to_parquet_chunked(
     chunk_size : int
         Target rows per IO slice. Rounded down to a multiple of
         ``n_steps``. Must be > 0 and >= ``n_steps``.
-    quote_id, scenario_index, scenario_value_col, objective : str
+    quote_id, scenario_index, scenario_value, objective : str
         Column-name overrides (defaults match the rest of the API).
     n_steps : int, optional
         If known upfront, skips the auto-detection probe. When ``None``,
@@ -228,7 +245,7 @@ def apply_lambdas_to_parquet_chunked(
         chunk_size,
         quote_id=quote_id,
         scenario_index=scenario_index,
-        scenario_value_col=scenario_value_col,
+        scenario_value=scenario_value,
         objective=objective,
         n_steps=n_steps,
     )

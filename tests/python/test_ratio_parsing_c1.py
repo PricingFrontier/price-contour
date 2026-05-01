@@ -73,9 +73,7 @@ def make_ratio_df(n_quotes: int = 50, n_steps: int = 5) -> pl.DataFrame:
             pl.Series("incurred", incurred, dtype=pl.Float32),
             pl.Series("premium", premiums, dtype=pl.Float32),
             pl.Series("expenses", expenses, dtype=pl.Float32),
-            pl.Series(
-                "claims_plus_expenses", claims_plus_expenses, dtype=pl.Float32
-            ),
+            pl.Series("claims_plus_expenses", claims_plus_expenses, dtype=pl.Float32),
         ]
     )
 
@@ -94,9 +92,7 @@ def make_ratio_df_with_nulls(
 # the message must mention either "C2" or "not yet supported"/"not yet
 # implemented", AND it must name the offending constraint label so the user
 # can act on it.
-RE_C2_STUB = (
-    r"(?si)C2|not yet supported|not yet implemented|ratio constraints"
-)
+RE_C2_STUB = r"(?si)C2|not yet supported|not yet implemented|ratio constraints"
 
 
 # Migration regexes shared with A1.
@@ -165,7 +161,7 @@ class TestRatioConstraintValidation:
                 "retention_ratio": {
                     "numerator": "kept",
                     "denominator": "exposed",
-                    "min_pct": 0.95,   # 95% of baseline retention ratio
+                    "min_pct": 0.95,  # 95% of baseline retention ratio
                 },
             }
         )
@@ -376,7 +372,7 @@ class TestRatioConstraintValidation:
             _validate_constraint_dict(
                 {
                     "loss_ratio": {
-                        "numerator": 42,        # int, not a string
+                        "numerator": 42,  # int, not a string
                         "denominator": [1, 2],  # list, also not a string
                         "max": 0.65,
                     },
@@ -450,9 +446,7 @@ class TestRatioConstraintValidation:
         Pin both the label AND a recognisable direction-key token so the
         message can't drift to a generic ``invalid spec`` while still
         passing this test."""
-        with pytest.raises(
-            ValueError, match=r"loss_ratio.*(max_pct|max)"
-        ):
+        with pytest.raises(ValueError, match=r"loss_ratio.*(max_pct|max)"):
             _validate_constraint_dict(
                 {
                     "loss_ratio": {
@@ -626,9 +620,7 @@ class TestRatioConstraintConstructionPasses:
         """B1 still applies: Apply rejects None thresholds, ratio or not.
         Pin both the constraint label and the keyword ``None`` so a
         wording change still must reference the actual cause."""
-        with pytest.raises(
-            ValueError, match=r"loss_ratio.*None|None.*loss_ratio"
-        ):
+        with pytest.raises(ValueError, match=r"loss_ratio.*None|None.*loss_ratio"):
             pc.ApplyOptimiser(
                 lambdas={"loss_ratio": 0.0},
                 objective="expected_income",
@@ -690,9 +682,7 @@ class TestRatioColumnValidation:
         assert "incurred" in msg, (
             f"error {msg!r} must name the missing numerator column"
         )
-        assert "loss_ratio" in msg, (
-            f"error {msg!r} must name the constraint label"
-        )
+        assert "loss_ratio" in msg, f"error {msg!r} must name the constraint label"
 
     def test_denominator_column_missing_raises(self):
         df = make_ratio_df(n_quotes=30).drop("premium")
@@ -712,9 +702,7 @@ class TestRatioColumnValidation:
         assert "premium" in msg, (
             f"error {msg!r} must name the missing denominator column"
         )
-        assert "loss_ratio" in msg, (
-            f"error {msg!r} must name the constraint label"
-        )
+        assert "loss_ratio" in msg, f"error {msg!r} must name the constraint label"
 
     def test_numerator_column_has_nulls_raises(self):
         df = make_ratio_df_with_nulls("incurred", n_quotes=30)
@@ -731,9 +719,7 @@ class TestRatioColumnValidation:
         with pytest.raises(ValueError) as exc_info:
             solver.solve(df)
         msg = str(exc_info.value)
-        assert "incurred" in msg, (
-            f"error {msg!r} must name the column containing nulls"
-        )
+        assert "incurred" in msg, f"error {msg!r} must name the column containing nulls"
 
     def test_denominator_column_has_nulls_raises(self):
         df = make_ratio_df_with_nulls("premium", n_quotes=30)
@@ -750,9 +736,7 @@ class TestRatioColumnValidation:
         with pytest.raises(ValueError) as exc_info:
             solver.solve(df)
         msg = str(exc_info.value)
-        assert "premium" in msg, (
-            f"error {msg!r} must name the column containing nulls"
-        )
+        assert "premium" in msg, f"error {msg!r} must name the column containing nulls"
 
     def test_frontier_path_validates_numerator_column(self):
         """Same schema check applies to ``frontier()``."""
@@ -918,7 +902,7 @@ class TestRatioColumnValidation:
             objective="expected_income",
             constraints={
                 "loss_ratio": {
-                    "numerator": "incurred",   # not in df anymore
+                    "numerator": "incurred",  # not in df anymore
                     "denominator": "premium",
                     "max": 0.65,
                 },
@@ -941,7 +925,7 @@ class TestRatioColumnValidation:
             constraints={
                 "loss_ratio": {
                     "numerator": "incurred",
-                    "denominator": "premium",   # not in df anymore
+                    "denominator": "premium",  # not in df anymore
                     "max": 0.65,
                 },
             },

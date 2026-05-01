@@ -100,9 +100,7 @@ LP_LOWER_BOUND_TIGHT = 0.90
 # ---------------------------------------------------------------------------
 
 
-def make_ratio_oracle_df(
-    n_quotes: int = 30, n_steps: int = 5
-) -> pl.DataFrame:
+def make_ratio_oracle_df(n_quotes: int = 30, n_steps: int = 5) -> pl.DataFrame:
     """Synthetic DataFrame for ratio-constraint oracle tests.
 
     Mirrors ``test_ratio_solve_c2.make_ratio_solve_df`` but reproduced
@@ -163,9 +161,7 @@ def _pivot_column_to_grid(
         on=scenario_index_col,
         aggregate_function="first",
     )
-    step_cols = sorted(
-        [c for c in pivoted.columns if c != "quote_id"], key=int
-    )
+    step_cols = sorted([c for c in pivoted.columns if c != "quote_id"], key=int)
     return pivoted.select(step_cols).to_numpy().astype(np.float64)
 
 
@@ -396,9 +392,7 @@ class TestOracleSumConstraints:
         ``scenario_value == 1.0``.
         """
         df = make_small_df(n_quotes=50, n_steps=5)
-        baseline_vol = float(
-            df.filter(pl.col("scenario_value") == 1.0)["volume"].sum()
-        )
+        baseline_vol = float(df.filter(pl.col("scenario_value") == 1.0)["volume"].sum())
 
         solver = pc.OnlineOptimiser(
             objective="expected_income",
@@ -620,9 +614,7 @@ class TestOracleRatioConstraints:
         # integrality gap than single-constraint cases (two binding
         # hyperplanes intersect at fractional vertices). 0.93 covers
         # the empirical range.
-        compare_pc_to_lp(
-            pc_result.total_objective, lp_obj, lower_bound=0.93
-        )
+        compare_pc_to_lp(pc_result.total_objective, lp_obj, lower_bound=0.93)
 
 
 # ---------------------------------------------------------------------------
@@ -661,9 +653,7 @@ class TestOracleEdgeCases:
         lp_obj, _ = solve_lp_oracle(c, A_ub, b_ub, A_eq, b_eq)
 
         # Slack constraint: integrality gap is essentially zero.
-        compare_pc_to_lp(
-            pc_result.total_objective, lp_obj, lower_bound=0.999
-        )
+        compare_pc_to_lp(pc_result.total_objective, lp_obj, lower_bound=0.999)
 
     def test_oracle_tight_constraint(self):
         """Constraint near the feasibility boundary — wider gap allowed.

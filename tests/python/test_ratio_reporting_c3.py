@@ -121,9 +121,7 @@ class TestRatioTotalConstraintsActualRatio:
         result = solver.solve(df)
 
         reported = result.total_constraints["loss_ratio"]
-        recomputed = actual_ratio_at_optimum(
-            result.dataframe, "incurred", "premium"
-        )
+        recomputed = actual_ratio_at_optimum(result.dataframe, "incurred", "premium")
         assert reported == pytest.approx(recomputed, rel=REPORT_RTOL, abs=REPORT_ABS), (
             f"C3: total_constraints['loss_ratio']={reported} must equal "
             f"the actual ratio Sigma incurred / Sigma premium = "
@@ -156,9 +154,7 @@ class TestRatioTotalConstraintsActualRatio:
         result = solver.solve(df)
 
         reported = result.total_constraints["retention_ratio"]
-        recomputed = actual_ratio_at_optimum(
-            result.dataframe, "kept", "exposed"
-        )
+        recomputed = actual_ratio_at_optimum(result.dataframe, "kept", "exposed")
         assert reported == pytest.approx(recomputed, rel=REPORT_RTOL, abs=REPORT_ABS), (
             f"C3: total_constraints['retention_ratio']={reported} must "
             f"equal Sigma kept / Sigma exposed = {recomputed}."
@@ -181,9 +177,7 @@ class TestRatioTotalConstraintsActualRatio:
         result = solver.solve(df)
 
         reported = result.total_constraints["loss_ratio"]
-        recomputed = actual_ratio_at_optimum(
-            result.dataframe, "incurred", "premium"
-        )
+        recomputed = actual_ratio_at_optimum(result.dataframe, "incurred", "premium")
         assert reported == pytest.approx(recomputed, rel=REPORT_RTOL, abs=REPORT_ABS), (
             f"C3 (max_pct): total_constraints['loss_ratio']={reported} "
             f"must equal actual ratio {recomputed}."
@@ -206,9 +200,7 @@ class TestRatioTotalConstraintsActualRatio:
         result = solver.solve(df)
 
         reported = result.total_constraints["retention_ratio"]
-        recomputed = actual_ratio_at_optimum(
-            result.dataframe, "kept", "exposed"
-        )
+        recomputed = actual_ratio_at_optimum(result.dataframe, "kept", "exposed")
         assert reported == pytest.approx(reported, rel=REPORT_RTOL, abs=REPORT_ABS)
         assert reported == pytest.approx(recomputed, rel=REPORT_RTOL, abs=REPORT_ABS), (
             f"C3 (min_pct): total_constraints['retention_ratio']="
@@ -307,8 +299,7 @@ class TestRatioBaselineConstraintsActualRatio:
         )
         # Sanity: this fixture's baseline LR is ~0.6484.
         assert 0.6 < reported_baseline < 0.7, (
-            f"fixture baseline LR {reported_baseline} outside expected "
-            f"[0.6, 0.7]"
+            f"fixture baseline LR {reported_baseline} outside expected [0.6, 0.7]"
         )
 
     def test_min_direction_baseline_is_actual_ratio(self):
@@ -540,9 +531,7 @@ class TestRatioInSummary:
             "constraints"
         ]
 
-        actual_total = actual_ratio_at_optimum(
-            result.dataframe, "incurred", "premium"
-        )
+        actual_total = actual_ratio_at_optimum(result.dataframe, "incurred", "premium")
         actual_baseline = baseline_ratio(df, "incurred", "premium")
 
         assert constraints_block["loss_ratio"]["total"] == pytest.approx(
@@ -614,8 +603,7 @@ class TestRatioInRecordHistory:
         for i, rec in enumerate(result.history):
             v = rec["total_constraints"]["loss_ratio"]
             assert math.isfinite(v), (
-                f"history[{i}].total_constraints['loss_ratio']={v} must "
-                f"be finite"
+                f"history[{i}].total_constraints['loss_ratio']={v} must be finite"
             )
             assert 0.55 <= v <= 0.75, (
                 f"history[{i}].total_constraints['loss_ratio']={v} "
@@ -684,8 +672,7 @@ class TestRatioInRecordHistory:
         # Last iter: pick the median over the trailing 5 records to
         # smooth lambda-oscillation between feasible iterates.
         tail = sorted(
-            rec["total_constraints"]["loss_ratio"]
-            for rec in result.history[-5:]
+            rec["total_constraints"]["loss_ratio"] for rec in result.history[-5:]
         )
         median_tail = tail[len(tail) // 2]
 
@@ -710,8 +697,7 @@ class TestRatioInRecordHistory:
         )
         # And the final-tail median must respect the binding ceiling.
         assert median_tail <= target * (1 + RATIO_RTOL) + RATIO_ABS_SLACK, (
-            f"final-tail median LR {median_tail} > target {target} + "
-            f"tolerance"
+            f"final-tail median LR {median_tail} > target {target} + tolerance"
         )
 
 
@@ -889,9 +875,7 @@ class TestSumConstraintsUnchanged:
             assert result.total_constraints[col] == pytest.approx(
                 float(out[f"optimal_{col}"].sum()), rel=REPORT_RTOL, abs=REPORT_ABS
             ), f"sum-only total for '{col}' must be Sigma optimal_{col}"
-            baseline_sum = float(
-                df.filter(pl.col("scenario_value") == 1.0)[col].sum()
-            )
+            baseline_sum = float(df.filter(pl.col("scenario_value") == 1.0)[col].sum())
             assert result.baseline_constraints[col] == pytest.approx(
                 baseline_sum, rel=REPORT_RTOL, abs=REPORT_ABS
             ), f"sum-only baseline for '{col}' must be Sigma_baseline {col}"
@@ -1018,9 +1002,7 @@ class TestRatioReportingEdgeCases:
             abs=REPORT_ABS,
         )
         # Ratio key reports the actual ratio.
-        actual_ratio = actual_ratio_at_optimum(
-            result.dataframe, "incurred", "premium"
-        )
+        actual_ratio = actual_ratio_at_optimum(result.dataframe, "incurred", "premium")
         assert result.total_constraints["loss_ratio"] == pytest.approx(
             actual_ratio, rel=REPORT_RTOL, abs=REPORT_ABS
         )

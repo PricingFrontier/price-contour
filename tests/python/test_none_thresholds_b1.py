@@ -43,9 +43,7 @@ from helpers import make_small_df, make_factors
 # `frontier()` so the user sees the migration path. We don't pin the
 # exact wording — just the two things that matter.
 RE_SOLVE_REJECTION_VOLUME = r"(?s)volume.*frontier\(\)|frontier\(\).*volume"
-RE_SOLVE_REJECTION_LOSS_RATIO = (
-    r"(?s)loss_ratio.*frontier\(\)|frontier\(\).*loss_ratio"
-)
+RE_SOLVE_REJECTION_LOSS_RATIO = r"(?s)loss_ratio.*frontier\(\)|frontier\(\).*loss_ratio"
 RE_SOLVE_REJECTION_LOSS_METRIC = (
     r"(?s)loss_metric.*frontier\(\)|frontier\(\).*loss_metric"
 )
@@ -480,9 +478,7 @@ class TestOnlineFrontierWithNone:
             constraints={"volume": {"min": None}},
             max_iter=50,
         )
-        with pytest.raises(
-            ValueError, match=RE_FRONTIER_MISSING_RANGE_VOLUME
-        ):
+        with pytest.raises(ValueError, match=RE_FRONTIER_MISSING_RANGE_VOLUME):
             solver.frontier(df, threshold_ranges={}, n_points_per_dim=3)
 
     def test_frontier_with_none_wrong_range_key_raises(self):
@@ -494,9 +490,7 @@ class TestOnlineFrontierWithNone:
             constraints={"volume": {"min": None}},
             max_iter=50,
         )
-        with pytest.raises(
-            ValueError, match=RE_FRONTIER_MISSING_RANGE_VOLUME
-        ):
+        with pytest.raises(ValueError, match=RE_FRONTIER_MISSING_RANGE_VOLUME):
             solver.frontier(
                 df,
                 threshold_ranges={"some_other_key": (0.0, 1.0)},
