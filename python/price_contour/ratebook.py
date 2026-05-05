@@ -436,9 +436,7 @@ class RatebookOptimiser:
         if _factor_contexts_override is not None:
             factor_contexts = _factor_contexts_override
         else:
-            factor_contexts = build_factor_contexts_py(
-                factors, factor_specs, "\x1f"
-            )
+            factor_contexts = build_factor_contexts_py(factors, factor_specs, "\x1f")
 
         # Per-factor group label lists for stitching the final `dict[str,
         # float]` factor tables back together. These are the unique
@@ -978,10 +976,7 @@ def _extrapolate_lambdas(
     if dt_prev_squared == 0.0:
         return None
 
-    dot = sum(
-        (tn - tp) * (tp - tp2)
-        for tn, tp, tp2 in zip(t_next, t_prev, t_prev2)
-    )
+    dot = sum((tn - tp) * (tp - tp2) for tn, tp, tp2 in zip(t_next, t_prev, t_prev2))
     fraction = dot / dt_prev_squared
 
     predicted: dict[str, float] = {}
