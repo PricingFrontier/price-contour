@@ -28,7 +28,9 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<builder_py::PyQuoteGridBuilder>()?;
     m.add_class::<grid_py::PyQuoteGrid>()?;
     m.add_class::<grouped_py::PyGroupedSolveResult>()?;
+    m.add_class::<grouped_py::PyRatebookCDResult>()?;
     m.add_function(wrap_pyfunction!(grouped_py::solve_grouped_py, m)?)?;
+    m.add_function(wrap_pyfunction!(grouped_py::run_cd_pass_py, m)?)?;
     m.add_class::<frontier_py::PyFrontierResult>()?;
     m.add_function(wrap_pyfunction!(frontier_py::sweep_frontier_py, m)?)?;
     m.add_function(wrap_pyfunction!(
@@ -39,12 +41,9 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
         parquet_grid_py::build_grid_from_parquet_chunked_py,
         m
     )?)?;
+    m.add_class::<ratebook_helpers_py::PyFactorContext>()?;
     m.add_function(wrap_pyfunction!(
-        ratebook_helpers_py::compute_residuals_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        ratebook_helpers_py::update_multipliers_py,
+        ratebook_helpers_py::build_factor_contexts_py,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(

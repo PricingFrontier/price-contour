@@ -214,7 +214,7 @@ def apply_lambdas_to_parquet_chunked_py(
 ) -> ChunkedApplyResult: ...
 def solve_grouped_py(
     grid: QuoteGrid,
-    group_labels: list[str],
+    context: FactorContext,
     residuals: list[float],
     candidates: list[float],
     constraints: dict[str, dict[str, float]] | None = None,
@@ -259,17 +259,28 @@ def build_grid_from_parquet_chunked_py(
 # Ratebook helpers
 # ---------------------------------------------------------------------------
 
-def compute_residuals_py(
-    overall_mult: list[float],
-    group_labels: list[str],
-    factor_table: dict[str, float],
-) -> list[float]: ...
-def update_multipliers_py(
-    overall_mult: list[float],
-    group_labels: list[str],
-    old_table: dict[str, float],
-    new_table: dict[str, float],
-) -> list[float]: ...
+class FactorContext:
+    """Cached per-factor group structure used by the ratebook hot path.
+
+    Wraps a Rust-side ``Arc<GroupMapping>`` (per-quote group index +
+    per-group label vector) so the orchestrator can pass a single Python
+    object on every solver call instead of re-ferrying a
+    ``list[str]`` of per-quote labels through PyO3."""
+
+    @staticmethod
+    def from_labels(labels: list[str]) -> FactorContext: ...
+    @property
+    def n_groups(self) -> int: ...
+    @property
+    def n_quotes(self) -> int: ...
+    @property
+    def group_labels(self) -> list[str]: ...
+
+def build_factor_contexts_py(
+    factors: pl.DataFrame,
+    factor_specs: list[list[str]],
+    separator: str = "\x1f",
+) -> list[FactorContext]: ...
 def build_interaction_labels_py(
     columns: list[list[str]],
     separator: str,

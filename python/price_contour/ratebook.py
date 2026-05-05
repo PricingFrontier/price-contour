@@ -3,21 +3,21 @@
 from __future__ import annotations
 
 import json
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import polars as pl
 
 from price_contour._grid_utils import build_grid
 from price_contour._price_contour import (
+    FactorContext,
     FrontierResult,
-    GroupedSolveResult,
     QuoteGrid,
-    compute_residuals_py,
-    extract_factor_labels_py,
+    build_factor_contexts_py,
+    run_cd_pass_py,
     solve_grouped_py,
-    update_multipliers_py,
 )
 from price_contour._frontier_helpers import (
     _cartesian_product,
@@ -41,6 +41,19 @@ from price_contour.solver import (
 )
 
 
+class PerFactorRecord(Protocol):
+    """Lightweight per-(cd_iter × factor) record exposed on
+    :attr:`RatebookResult.per_factor_results`. Carries only the fields
+    consumers need (CD-monotonicity tests, debugging) — the full
+    `GroupedSolveResult` shape is not preserved because materialising one
+    PyClass per inner solve would defeat the FFI saving in
+    ``run_cd_pass_py``.
+    """
+
+    total_objective: float
+    lambdas: dict[str, float]
+
+
 @dataclass
 class RatebookResult:
     """Result of ratebook coordinate descent optimisation."""
@@ -54,7 +67,7 @@ class RatebookResult:
     cd_iterations: int
     converged: bool
     clamp_rate: float
-    per_factor_results: list[GroupedSolveResult] = field(default_factory=list)
+    per_factor_results: list[PerFactorRecord] = field(default_factory=list)
 
     def save(self, path: str | Path) -> None:
         """Save factor tables to a parameters folder.
@@ -267,6 +280,7 @@ class RatebookOptimiser:
         factor_columns: list[list[str]] | None = None,
         lambdas: dict[str, float] | None = None,
         _constraints_override: dict[str, dict[str, float]] | None = None,
+        _factor_contexts_override: list[FactorContext] | None = None,
     ) -> RatebookResult:
         """Run ratebook optimisation.
 
@@ -395,116 +409,104 @@ class RatebookOptimiser:
         else:
             grid = grid_input
 
-        n_quotes = grid.n_quotes
-
         # Build candidates
         candidates = self._build_candidates()
 
-        # Build per-factor group labels from the factors DataFrame.
+        # Build per-factor `FactorContext`s from the factors DataFrame.
         #
-        # `extract_factor_labels_py` casts each spec's columns to Utf8 inside
-        # Rust and emits the per-quote labels directly — skipping the
-        # `factors[col].to_list()` round-trip that previously materialised
-        # gigabytes of transient Python `list[str]` objects on large
-        # portfolios. ASCII 31 (unit separator) is the canonical interaction
-        # join character; it avoids collisions with colons that legitimately
-        # appear in factor values.
-        factor_group_labels: list[list[str]] = extract_factor_labels_py(
-            factors, factor_specs, "\x1f"
+        # Each context wraps a Rust-side `Arc<GroupMapping>` (per-quote
+        # group index + per-group label vector) built once and reused
+        # across every CD iteration's calls into the Rust solver and
+        # helpers. The previous flow re-ferried `Vec<String>` per call
+        # (~100k Python strings × 165 calls per frontier sweep through
+        # PyO3 → owned `String` allocations); the context lets the
+        # orchestrator pass `&PyFactorContext` references and
+        # group-indexed `Vec<f32>` factor values, eliminating the
+        # per-call string traffic and the inner `build_group_mapping`
+        # rebuild. ASCII 31 (unit separator) is the canonical interaction
+        # join character; it avoids collisions with colons that
+        # legitimately appear in factor values.
+        #
+        # `_factor_contexts_override` lets the frontier sweep build the
+        # contexts once and reuse them across every visited point — the
+        # `factors` DataFrame is constant across a sweep, so without the
+        # override each `solve()` call re-walks the dataframe and
+        # re-hashes the same group labels.
+        factor_contexts: list[FactorContext]
+        if _factor_contexts_override is not None:
+            factor_contexts = _factor_contexts_override
+        else:
+            factor_contexts = build_factor_contexts_py(
+                factors, factor_specs, "\x1f"
+            )
+
+        # Per-factor group label lists for stitching the final `dict[str,
+        # float]` factor tables back together. These are the unique
+        # labels per factor in group-index order, owned by the context.
+        factor_group_labels: list[list[str]] = [
+            ctx.group_labels for ctx in factor_contexts
+        ]
+
+        # Run the entire CD pass in Rust. Replaces the previous
+        # Python-side `for cd_iter: for f_idx: compute_residuals_py +
+        # solve_grouped_py + update_multipliers_py + bookkeeping` loop;
+        # `overall_mult`, residuals, and per-factor `factor_values` all
+        # stay Rust-side, eliminating ~`max_cd × n_factors × 2` PyO3
+        # round-trips of 100k-element f32 buffers per `solve()` call.
+        cd_result = run_cd_pass_py(
+            grid,
+            factor_contexts,
+            candidates,
+            constraints=cd_constraints if cd_constraints else None,
+            max_iter=self.max_iter,
+            tolerance=self.tolerance,
+            max_cd_iterations=self.max_cd_iterations,
+            cd_tolerance=self.cd_tolerance,
+            lambdas=lambdas,
         )
 
-        # Initialise factor tables: each group level → 1.0
-        factor_tables: list[dict[str, float]] = []
-        for labels in factor_group_labels:
-            unique_labels = sorted(set(labels))
-            factor_tables.append({label: 1.0 for label in unique_labels})
+        # Lightweight per-call records for backwards-compat consumers
+        # of `RatebookResult.per_factor_results` (e.g. CD-monotonicity
+        # tests). Each element exposes ``.total_objective`` and
+        # ``.lambdas`` fields — the only attributes the existing
+        # consumers read. Building real `GroupedSolveResult` objects per
+        # call would defeat the FFI saving we just landed.
+        per_call_objectives = cd_result.per_call_total_objectives
+        per_call_lambdas = cd_result.per_call_lambdas
+        per_factor_results: list[PerFactorRecord] = [
+            types.SimpleNamespace(total_objective=obj, lambdas=lams)
+            for obj, lams in zip(per_call_objectives, per_call_lambdas)
+        ]
+        cd_converged = cd_result.converged
+        cd_iter = cd_result.cd_iterations
+        factor_values_rust = cd_result.factor_values
 
-        # Overall multiplier per quote = product of all factor values
-        overall_mult = [1.0] * n_quotes
-
-        per_factor_results: list[GroupedSolveResult] = []
-        cd_converged = False
-        cd_iter = 0
-        last_lambdas: dict[str, float] | None = lambdas
-
-        for cd_iter in range(1, self.max_cd_iterations + 1):
-            max_change = 0.0
-
-            for f_idx, (spec, labels) in enumerate(
-                zip(factor_specs, factor_group_labels)
-            ):
-                # Compute residuals: overall_mult / current_factor_value_for_this_quote
-                old_table = factor_tables[f_idx]
-                residuals = compute_residuals_py(overall_mult, labels, old_table)
-
-                result = solve_grouped_py(
-                    grid,
-                    group_labels=labels,
-                    residuals=residuals,
-                    candidates=candidates,
-                    constraints=cd_constraints if cd_constraints else None,
-                    max_iter=self.max_iter,
-                    tolerance=self.tolerance,
-                    lambdas=last_lambdas,
-                )
-
-                per_factor_results.append(result)
-                last_lambdas = result.lambdas
-
-                # Update factor table
-                new_table = dict(result.optimal_factor_values)
-                for label in old_table:
-                    if label not in new_table:
-                        new_table[label] = old_table[label]
-
-                # Track max change
-                for label in old_table:
-                    change = abs(new_table.get(label, 1.0) - old_table[label])
-                    max_change = max(max_change, change)
-
-                factor_tables[f_idx] = new_table
-
-                # Update overall_mult via Rust helper
-                overall_mult = update_multipliers_py(
-                    overall_mult, labels, old_table, new_table
-                )
-
-            if max_change < self.cd_tolerance:
-                cd_converged = True
-                break
-
-        # Get final metrics from last result
-        last = per_factor_results[-1] if per_factor_results else None
+        # Convert per-group `Vec<f32>` factor values back to the public
+        # `dict[str, float]` shape that `RatebookResult.factor_tables`
+        # carries (and that callers persist via `save()`).
+        factor_tables: list[dict[str, float]] = [
+            {label: float(value) for label, value in zip(labels, values)}
+            for labels, values in zip(factor_group_labels, factor_values_rust)
+        ]
         named_tables = {
             ":".join(spec): table for spec, table in zip(factor_specs, factor_tables)
         }
 
-        # Compute final clamp rate as average across per-factor results
-        avg_clamp = (
-            sum(r.clamp_rate for r in per_factor_results) / len(per_factor_results)
-            if per_factor_results
-            else 0.0
-        )
+        avg_clamp = cd_result.clamp_rate
 
         # C5 (carries C3 reporting through to ratebook): each ratio
         # label's ``total_constraints`` / ``baseline_constraints`` entry
         # reports the **actual** ratio at the optimum / baseline rather
         # than the linearised total. We recompute these from the original
         # DataFrame at the last grouped result's optimal steps; sum
-        # entries pass through unchanged. ``RatebookResult`` is a
-        # Python-side dataclass so we populate the dicts directly here
-        # instead of wrapping a Rust object (no ``_RatioSolveResultWrapper``
-        # equivalent needed — it would only delegate ``__getattr__`` to
-        # fields the dataclass already owns).
-        total_constraints = dict(last.total_constraints) if last else {}
-        baseline_constraints = dict(last.baseline_constraints) if last else {}
-        if ratio_columns and original_df is not None and last is not None:
-            # Actual ratio at optimum: stitch ``optimal_<num>`` /
-            # ``optimal_<denom>`` columns onto the last grouped result's
-            # dataframe via a join on ``(quote_id, optimal_step)``, then
-            # sum and divide.
+        # entries pass through unchanged. ``cd_result.dataframe`` is the
+        # last grouped solve's per-quote results (built lazily Rust-side
+        # from `optimal_steps_per_quote` + grid).
+        total_constraints = dict(cd_result.total_constraints)
+        baseline_constraints = dict(cd_result.baseline_constraints)
+        if ratio_columns and original_df is not None:
             optimum_df = _stitch_optimal_ratio_columns(
-                base_df=last.dataframe,
+                base_df=cd_result.dataframe,
                 original_df=original_df,
                 ratio_columns=ratio_columns,
                 quote_id_col=self.quote_id,
@@ -524,10 +526,10 @@ class RatebookOptimiser:
 
         return RatebookResult(
             factor_tables=named_tables,
-            lambdas=last.lambdas if last else {},
-            total_objective=last.total_objective if last else 0.0,
+            lambdas=cd_result.lambdas,
+            total_objective=cd_result.total_objective,
             total_constraints=total_constraints,
-            baseline_objective=last.baseline_objective if last else 0.0,
+            baseline_objective=cd_result.baseline_objective,
             baseline_constraints=baseline_constraints,
             cd_iterations=cd_iter,
             converged=cd_converged,
@@ -561,20 +563,21 @@ class RatebookOptimiser:
         n_quotes = grid.n_quotes
         candidates = self._build_candidates()
 
-        # Extract every column's labels in one Rust-side pass — same memory
-        # win as the main solve loop. Column order in `all_labels` matches
-        # `factors.columns` order.
-        all_labels = extract_factor_labels_py(
+        # Build a `FactorContext` per candidate column in one Rust-side
+        # pass. Column order matches `factors.columns`; the contexts own
+        # the precomputed group mappings so the screening loop below
+        # avoids per-call string ferrying and group-mapping rebuilds.
+        all_contexts = build_factor_contexts_py(
             factors, [[col] for col in factors.columns], "\x1f"
         )
 
         lifts: list[tuple[str, float]] = []
-        for col, labels in zip(factors.columns, all_labels):
+        for col, ctx in zip(factors.columns, all_contexts):
             residuals = [1.0] * n_quotes
 
             result = solve_grouped_py(
                 grid,
-                group_labels=labels,
+                context=ctx,
                 residuals=residuals,
                 candidates=candidates,
                 constraints=self.constraints if self.constraints else None,
@@ -761,8 +764,36 @@ class RatebookOptimiser:
         # so omitting them is equivalent to including them.
         order = _nn_order(combos, [threshold_ranges[n] for n in swept_names])
 
-        # Sweep
-        prev_lambdas = initial_lambdas
+        # Pre-build factor contexts once for the whole sweep. The
+        # `factors` DataFrame is constant across every visited point, so
+        # without this hoist each per-point `self.solve()` would
+        # re-cast the factor columns to Utf8 and re-hash ~100k labels per
+        # factor through `build_group_mapping`. Resolving
+        # `factor_columns` once here also avoids re-running the
+        # `_discover_structure` screen on every point.
+        resolved_factor_specs = factor_columns or self.factor_columns
+        if resolved_factor_specs is None:
+            resolved_factor_specs = self._discover_structure(df_or_grid, factors)
+        frontier_factor_contexts = build_factor_contexts_py(
+            factors, resolved_factor_specs, "\x1f"
+        )
+
+        # Sweep — predictor-corrector warm starting. The frontier visits
+        # points in nearest-neighbour order, so the optimal λ vector
+        # changes smoothly along the visit path (away from active-set
+        # kinks). Instead of zero-order warm starting (copy the previous
+        # point's λ), we linearly extrapolate from the two most recent
+        # visits into the next threshold combo and use that as
+        # ``initial_lambdas``. The extrapolated λ is fed to the solver as
+        # a starting hint; the inner subgradient corrector still runs to
+        # convergence, so a bad predictor degrades gracefully to one or
+        # two extra iterations rather than producing a wrong answer.
+        prev_thresholds: list[float] | None = None
+        prev_lambdas: dict[str, float] | None = (
+            dict(initial_lambdas) if initial_lambdas else None
+        )
+        prev2_thresholds: list[float] | None = None
+        prev2_lambdas: dict[str, float] | None = None
         points: list[tuple[int, dict[str, Any]]] = []
 
         for idx in order:
@@ -780,14 +811,41 @@ class RatebookOptimiser:
                 self.constraints, list(thresholds), swept_names
             )
 
+            # Predictor: linearly extrapolate λ along the prev2→prev path
+            # to the new point's thresholds. Falls back to zero-order
+            # (the previous point's λ) for the first two points and for
+            # paths where the predictor would be degenerate (zero-length
+            # base segment). All-None initial state keeps the very first
+            # point on whatever ``initial_lambdas`` the user supplied.
+            init_lambdas = prev_lambdas
+            if (
+                prev_thresholds is not None
+                and prev2_thresholds is not None
+                and prev_lambdas is not None
+                and prev2_lambdas is not None
+            ):
+                predicted = _extrapolate_lambdas(
+                    prev2_thresholds,
+                    prev2_lambdas,
+                    prev_thresholds,
+                    prev_lambdas,
+                    list(thresholds),
+                )
+                if predicted is not None:
+                    init_lambdas = predicted
+
             result = self.solve(
                 grid,
                 factors,
-                factor_columns=factor_columns,
-                lambdas=prev_lambdas,
+                factor_columns=resolved_factor_specs,
+                lambdas=init_lambdas,
                 _constraints_override=modified_constraints,
+                _factor_contexts_override=frontier_factor_contexts,
             )
 
+            prev2_thresholds = prev_thresholds
+            prev2_lambdas = prev_lambdas
+            prev_thresholds = list(thresholds)
             prev_lambdas = result.lambdas
 
             points.append(
@@ -888,6 +946,50 @@ class RatebookOptimiser:
             "metrics": metrics,
             "artifacts": artifacts,
         }
+
+
+def _extrapolate_lambdas(
+    t_prev2: list[float],
+    lam_prev2: dict[str, float],
+    t_prev: list[float],
+    lam_prev: dict[str, float],
+    t_next: list[float],
+) -> dict[str, float] | None:
+    """Linearly extrapolate λ for the next frontier point along the
+    direction the path just travelled.
+
+    Models λ as locally affine in threshold along the visit path:
+
+        λ(t) ≈ λ_prev + ((t - t_prev) · (t_prev - t_prev2) / |t_prev - t_prev2|²)
+                       · (λ_prev - λ_prev2)
+
+    The scalar projection of ``t_next - t_prev`` onto ``t_prev - t_prev2``
+    gives "how far along the prev2→prev direction" the next point sits,
+    so a step in the same direction extrapolates by one full slope, a
+    perpendicular step extrapolates by zero (recovers zero-order), and a
+    backward step extrapolates by a negative slope (cancels overshoot).
+
+    Returns None if the prev2→prev segment has zero length — the slope
+    is undefined and the caller should fall back to copying ``lam_prev``
+    verbatim. λ values are clamped to be non-negative (Lagrange
+    multipliers for one-sided sum/ratio constraints can never be < 0).
+    """
+    dt_prev_squared = sum((a - b) ** 2 for a, b in zip(t_prev, t_prev2))
+    if dt_prev_squared == 0.0:
+        return None
+
+    dot = sum(
+        (tn - tp) * (tp - tp2)
+        for tn, tp, tp2 in zip(t_next, t_prev, t_prev2)
+    )
+    fraction = dot / dt_prev_squared
+
+    predicted: dict[str, float] = {}
+    for name, lam in lam_prev.items():
+        prev_lam = lam_prev2.get(name, lam)
+        slope = lam - prev_lam
+        predicted[name] = max(0.0, lam + fraction * slope)
+    return predicted
 
 
 def _nn_order(

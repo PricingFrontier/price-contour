@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use polars::prelude::*;
+use price_contour_core::{build_group_mapping, GroupMapping};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
@@ -9,93 +10,83 @@ use rayon::prelude::*;
 /// Threshold above which we switch to Rayon parallel iteration.
 const PAR_THRESHOLD: usize = 100_000;
 
-/// Compute residuals: for each quote, residual = overall_mult[i] / factor_table[label[i]].
+/// Cached per-factor group structure: an Arc-wrapped `GroupMapping` with
+/// pre-computed `group_of: Vec<u32>` (per-quote group index) and
+/// `group_labels: Vec<String>` (one label per group).
 ///
-/// If the factor value is 0, the residual defaults to 1.0.
-/// Missing keys in `factor_table` default to 1.0.
-#[pyfunction]
-pub fn compute_residuals_py(
-    py: Python<'_>,
-    overall_mult: Vec<f32>,
-    group_labels: Vec<String>,
-    factor_table: HashMap<String, f64>,
-) -> Vec<f32> {
-    let n = overall_mult.len();
-    py.detach(|| {
-        if n > PAR_THRESHOLD {
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let om = overall_mult[i];
-                    let fv = *factor_table.get(&group_labels[i]).unwrap_or(&1.0) as f32;
-                    if fv != 0.0 {
-                        om / fv
-                    } else {
-                        1.0
-                    }
-                })
-                .collect()
-        } else {
-            overall_mult
-                .iter()
-                .zip(group_labels.iter())
-                .map(|(&om, label)| {
-                    let fv = *factor_table.get(label).unwrap_or(&1.0) as f32;
-                    if fv != 0.0 {
-                        om / fv
-                    } else {
-                        1.0
-                    }
-                })
-                .collect()
-        }
-    })
+/// **Why this exists:** the ratebook CD orchestrator calls
+/// `solve_grouped_py`, `compute_residuals_py`, and `update_multipliers_py`
+/// once per (frontier point × CD iteration × factor) — typically 100–500
+/// times per portfolio sweep. Without a context, every call re-ferries
+/// the per-quote `Vec<String>` group_labels through PyO3 (each
+/// `PyString → owned String` allocation, 100k+ strings per call) and
+/// re-builds the `GroupMapping` HashMap inside Rust. Wrapping the
+/// expensive build once and passing the same `Arc<GroupMapping>` by
+/// reference on subsequent calls eliminates both costs.
+#[pyclass(name = "FactorContext", frozen)]
+pub struct PyFactorContext {
+    inner: Arc<GroupMapping>,
 }
 
-/// Update multipliers: for each quote, new_mult = old_mult / old_fv * new_fv.
-///
-/// If old_fv is 0, new_mult = new_fv.
-/// Missing keys in `old_table` default to 0.0; in `new_table` default to 1.0.
-#[pyfunction]
-pub fn update_multipliers_py(
-    py: Python<'_>,
-    overall_mult: Vec<f32>,
-    group_labels: Vec<String>,
-    old_table: HashMap<String, f64>,
-    new_table: HashMap<String, f64>,
-) -> Vec<f32> {
-    let n = overall_mult.len();
-    py.detach(|| {
-        if n > PAR_THRESHOLD {
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let om = overall_mult[i];
-                    let label = &group_labels[i];
-                    let fv_old = *old_table.get(label).unwrap_or(&0.0) as f32;
-                    let fv_new = *new_table.get(label).unwrap_or(&1.0) as f32;
-                    if fv_old != 0.0 {
-                        om / fv_old * fv_new
-                    } else {
-                        fv_new
-                    }
-                })
-                .collect()
-        } else {
-            overall_mult
-                .iter()
-                .zip(group_labels.iter())
-                .map(|(&om, label)| {
-                    let fv_old = *old_table.get(label).unwrap_or(&0.0) as f32;
-                    let fv_new = *new_table.get(label).unwrap_or(&1.0) as f32;
-                    if fv_old != 0.0 {
-                        om / fv_old * fv_new
-                    } else {
-                        fv_new
-                    }
-                })
-                .collect()
+impl PyFactorContext {
+    pub(crate) fn mapping(&self) -> &Arc<GroupMapping> {
+        &self.inner
+    }
+}
+
+#[pymethods]
+impl PyFactorContext {
+    /// Construct a context from per-quote group labels, building the
+    /// group mapping eagerly.
+    #[staticmethod]
+    fn from_labels(labels: Vec<String>) -> Self {
+        let mapping = build_group_mapping(&labels);
+        Self {
+            inner: Arc::new(mapping),
         }
+    }
+
+    #[getter]
+    fn n_groups(&self) -> usize {
+        self.inner.n_groups
+    }
+
+    #[getter]
+    fn n_quotes(&self) -> usize {
+        self.inner.group_of.len()
+    }
+
+    #[getter]
+    fn group_labels(&self) -> Vec<String> {
+        self.inner.group_labels.clone()
+    }
+}
+
+/// Build one `FactorContext` per spec from a Polars DataFrame in a single
+/// pass. Mirrors the per-spec label extraction in
+/// `extract_factor_labels_py` but eagerly builds the `GroupMapping` so
+/// downstream consumers don't pay for the rebuild on every solver call.
+#[pyfunction]
+#[pyo3(signature = (factors, factor_specs, separator = "\x1f"))]
+pub fn build_factor_contexts_py(
+    py: Python<'_>,
+    factors: PyDataFrame,
+    factor_specs: Vec<Vec<String>>,
+    separator: &str,
+) -> PyResult<Vec<PyFactorContext>> {
+    let df = factors.0;
+    let sep = separator.to_string();
+
+    py.detach(|| {
+        factor_specs
+            .iter()
+            .map(|spec| {
+                let labels = build_spec_labels(&df, spec, &sep)?;
+                Ok(PyFactorContext {
+                    inner: Arc::new(build_group_mapping(&labels)),
+                })
+            })
+            .collect()
     })
 }
 
@@ -316,86 +307,6 @@ fn cast_column_to_string_series(df: &DataFrame, column_name: &str) -> PyResult<S
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn test_compute_residuals_basic() {
-        let overall_mult = vec![2.0f32, 3.0, 4.0];
-        let labels = vec!["a".into(), "b".into(), "a".into()];
-        let mut table = HashMap::new();
-        table.insert("a".to_string(), 2.0);
-        table.insert("b".to_string(), 1.5);
-
-        // a: 2.0 / 2.0 = 1.0, b: 3.0 / 1.5 = 2.0, a: 4.0 / 2.0 = 2.0
-        let result = compute_residuals_impl(&overall_mult, &labels, &table);
-        assert_eq!(result, vec![1.0f32, 2.0, 2.0]);
-    }
-
-    #[test]
-    fn test_compute_residuals_missing_label() {
-        let overall_mult = vec![2.0f32];
-        let labels = vec!["missing".into()];
-        let table = HashMap::new();
-
-        // missing key defaults to 1.0: 2.0 / 1.0 = 2.0
-        let result = compute_residuals_impl(&overall_mult, &labels, &table);
-        assert_eq!(result, vec![2.0f32]);
-    }
-
-    #[test]
-    fn test_compute_residuals_zero_fv() {
-        let overall_mult = vec![2.0f32];
-        let labels = vec!["z".into()];
-        let mut table = HashMap::new();
-        table.insert("z".to_string(), 0.0);
-
-        // zero factor value => residual = 1.0
-        let result = compute_residuals_impl(&overall_mult, &labels, &table);
-        assert_eq!(result, vec![1.0f32]);
-    }
-
-    #[test]
-    fn test_update_multipliers_basic() {
-        let overall_mult = vec![2.0f32, 3.0];
-        let labels = vec!["a".into(), "b".into()];
-        let mut old_table = HashMap::new();
-        old_table.insert("a".to_string(), 1.0);
-        old_table.insert("b".to_string(), 1.5);
-        let mut new_table = HashMap::new();
-        new_table.insert("a".to_string(), 2.0);
-        new_table.insert("b".to_string(), 3.0);
-
-        // a: 2.0 / 1.0 * 2.0 = 4.0, b: 3.0 / 1.5 * 3.0 = 6.0
-        let result = update_multipliers_impl(&overall_mult, &labels, &old_table, &new_table);
-        assert_eq!(result, vec![4.0f32, 6.0]);
-    }
-
-    #[test]
-    fn test_update_multipliers_zero_old() {
-        let overall_mult = vec![2.0f32];
-        let labels = vec!["a".into()];
-        let mut old_table = HashMap::new();
-        old_table.insert("a".to_string(), 0.0);
-        let mut new_table = HashMap::new();
-        new_table.insert("a".to_string(), 5.0);
-
-        // old is 0.0 => result = new_fv = 5.0
-        let result = update_multipliers_impl(&overall_mult, &labels, &old_table, &new_table);
-        assert_eq!(result, vec![5.0f32]);
-    }
-
-    #[test]
-    fn test_update_multipliers_missing_old() {
-        let overall_mult = vec![2.0f32];
-        let labels = vec!["missing".into()];
-        let old_table = HashMap::new();
-        let new_table = HashMap::new();
-
-        // missing old defaults to 0.0 => result = new_fv default = 1.0
-        let result = update_multipliers_impl(&overall_mult, &labels, &old_table, &new_table);
-        assert_eq!(result, vec![1.0f32]);
-    }
-
     #[test]
     fn test_build_interaction_labels_basic() {
         let columns = vec![vec!["a".into(), "b".into()], vec!["1".into(), "2".into()]];
@@ -426,48 +337,6 @@ mod tests {
         let columns = vec![vec!["a".into(), "b".into()]];
         let result = build_interaction_labels_impl(&columns, "\x1f");
         assert_eq!(result, vec!["a", "b"]);
-    }
-
-    // Pure-Rust helpers for testing without Python GIL
-
-    fn compute_residuals_impl(
-        overall_mult: &[f32],
-        group_labels: &[String],
-        factor_table: &HashMap<String, f64>,
-    ) -> Vec<f32> {
-        overall_mult
-            .iter()
-            .zip(group_labels.iter())
-            .map(|(&om, label)| {
-                let fv = *factor_table.get(label).unwrap_or(&1.0) as f32;
-                if fv != 0.0 {
-                    om / fv
-                } else {
-                    1.0
-                }
-            })
-            .collect()
-    }
-
-    fn update_multipliers_impl(
-        overall_mult: &[f32],
-        group_labels: &[String],
-        old_table: &HashMap<String, f64>,
-        new_table: &HashMap<String, f64>,
-    ) -> Vec<f32> {
-        overall_mult
-            .iter()
-            .zip(group_labels.iter())
-            .map(|(&om, label)| {
-                let fv_old = *old_table.get(label).unwrap_or(&0.0) as f32;
-                let fv_new = *new_table.get(label).unwrap_or(&1.0) as f32;
-                if fv_old != 0.0 {
-                    om / fv_old * fv_new
-                } else {
-                    fv_new
-                }
-            })
-            .collect()
     }
 
     fn build_interaction_labels_impl(columns: &[Vec<String>], separator: &str) -> Vec<String> {

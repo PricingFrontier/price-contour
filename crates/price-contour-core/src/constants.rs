@@ -44,3 +44,11 @@ pub const SUM_TOLERANCE_MULTIPLIER: f64 = 10.0;
 /// (Σ num, Σ denom) are typically 100–1000× the synthetic baseline,
 /// so the natural absolute tolerance is correspondingly looser.
 pub const RATIO_LINEARISED_TOLERANCE_MULTIPLIER: f64 = 1000.0;
+
+/// Memory budget for the grouped solver's λ-independent remap cache
+/// (`target_idx[n_quotes × n_candidates]` plus aggregate A/B tables sized
+/// by `n_groups × n_candidates × (1 + n_constraints)`). When the estimated
+/// size exceeds this cap, the solver falls back to the per-iteration
+/// recompute path instead of materialising the cache. Sized to fit
+/// comfortably alongside a typical `QuoteGrid` on commodity hardware.
+pub const MAX_REMAP_TABLE_BYTES: usize = 1024 * 1024 * 1024;
