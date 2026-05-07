@@ -382,8 +382,9 @@ class ApplyOptimiser:
         out = (
             out.join(selected_lookup, on=self.quote_id, how="left")
             .with_columns(
-                (pl.col(self.scenario_index) == pl.col(_EXPLAINER_OPT_STEP))
-                .alias("selected")
+                (pl.col(self.scenario_index) == pl.col(_EXPLAINER_OPT_STEP)).alias(
+                    "selected"
+                )
             )
             .drop(_EXPLAINER_OPT_STEP)
         )
@@ -391,8 +392,9 @@ class ApplyOptimiser:
         out = (
             out.join(baseline_lookup, on=self.quote_id, how="left")
             .with_columns(
-                (pl.col(self.scenario_index) == pl.col(_EXPLAINER_BASELINE_SI))
-                .alias("is_baseline")
+                (pl.col(self.scenario_index) == pl.col(_EXPLAINER_BASELINE_SI)).alias(
+                    "is_baseline"
+                )
             )
             .drop(_EXPLAINER_BASELINE_SI)
         )

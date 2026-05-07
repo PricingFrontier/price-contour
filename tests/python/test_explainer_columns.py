@@ -36,7 +36,9 @@ def _sum_constraint_applier(
     """
     constraints = {
         "volume": {"min_pct": (constraint_thresholds or {}).get("volume", 0.92)},
-        "loss_ratio": {"max_pct": (constraint_thresholds or {}).get("loss_ratio", 1.05)},
+        "loss_ratio": {
+            "max_pct": (constraint_thresholds or {}).get("loss_ratio", 1.05)
+        },
     }
     solver = pc.OnlineOptimiser(
         objective="expected_income",
@@ -320,9 +322,7 @@ class TestRatioConstraints:
         )
         out = applier.with_explainer_columns(df)
 
-        reconstructed = (
-            out["income"] + out["lambda_term_loss_ratio"]
-        )
+        reconstructed = out["income"] + out["lambda_term_loss_ratio"]
         for actual, expected in zip(
             out["decision_score"].to_list(),
             reconstructed.cast(pl.Float64).to_list(),
@@ -788,9 +788,7 @@ class TestMultipleRatioConstraints:
         lr_baseline = float(baseline["incurred"].sum()) / float(
             baseline["premium"].sum()
         )
-        ret_baseline = float(baseline["kept"].sum()) / float(
-            baseline["exposed"].sum()
-        )
+        ret_baseline = float(baseline["kept"].sum()) / float(baseline["exposed"].sum())
         L_lr = 0.95 * lr_baseline
         L_ret = 0.95 * ret_baseline
 
@@ -813,9 +811,7 @@ class TestMultipleRatioConstraints:
         # Score invariant holds across both constraints:
         # loss_ratio is max -> -lambda; retention is min -> +lambda.
         reconstructed = (
-            out["income"]
-            + out["lambda_term_loss_ratio"]
-            + out["lambda_term_retention"]
+            out["income"] + out["lambda_term_loss_ratio"] + out["lambda_term_retention"]
         )
         for actual, expected in zip(
             out["decision_score"].to_list(),
