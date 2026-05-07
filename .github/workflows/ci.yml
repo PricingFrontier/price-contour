@@ -85,7 +85,7 @@ jobs:
       - name: Install dependencies and build
         run: |
           uv venv --python ${{ matrix.python-version }}
-          uv pip install "maturin>=1.4" "pytest>=9.0" "hypothesis>=6.0" "polars>=0.20" "pyarrow>=23.0.1"
+          uv pip install "maturin>=1.4" "pytest>=9.0" "hypothesis>=6.0" "polars>=0.20" "pyarrow>=23.0.1" "scipy>=1.10"
           uv run maturin develop --release
 
       - name: Run tests
