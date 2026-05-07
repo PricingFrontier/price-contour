@@ -513,6 +513,7 @@ maturin develop
 | Method | Description |
 |---|---|
 | `apply(df)` | Single-pass scoring with fixed lambdas. Returns `ApplyResult`. For ratio constraints, `min_pct`/`max_pct` resolve `L = pct × baseline_LR` from the **apply-time** DataFrame (live-scoring contract), not the solve-time baseline. |
+| `with_explainer_columns(df)` | Return the input scored candidate DataFrame with optimiser-consistent `decision_score`, `selected`, `is_baseline`, and per-constraint `linearised_*` / `lambda_term_*` columns appended. Ratio constraints use the same linearisation as `apply(df)`. |
 | `save(path)` | Save config + lambdas to JSON. Ratio specs round-trip verbatim. |
 | `ApplyOptimiser.load(path)` | Load from saved JSON. Rejects unknown keys. |
 

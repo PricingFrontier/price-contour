@@ -19,9 +19,20 @@ from price_contour.solver import (
     _none_threshold_constraints,
     _ratio_constraint_names,
     _reject_ratio_for_grid,
+    _spec_direction,
     _validate_constraint_dict,
     _validate_dataframe,
 )
+
+
+# Internal sentinel column names used by ``with_explainer_columns`` for
+# join scaffolding. The double-underscore prefix + ``__pc_explainer__``
+# stamp makes accidental collision with user data implausible; we drop
+# them before returning. Centralised here so the implementation reads
+# cleanly without inline magic strings.
+_EXPLAINER_OPT_STEP = "__pc_explainer_opt_step"
+_EXPLAINER_BASELINE_SI = "__pc_explainer_baseline_scenario_index"
+_EXPLAINER_BASELINE_DIST = "__pc_explainer_baseline_distance"
 
 
 class ApplyOptimiser:
@@ -163,6 +174,235 @@ class ApplyOptimiser:
             objective=self.objective,
             constraints=self.constraints,
         )
+
+    def with_explainer_columns(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Append optimiser-consistent explainer columns to ``df``.
+
+        Returns a new :class:`pl.DataFrame` with all input rows and
+        columns preserved, plus deterministic explainer columns that
+        reconcile with :meth:`apply` exactly:
+
+        * ``decision_score`` — fixed-lambda Lagrangian score per row,
+          satisfying ``decision_score == objective + sum(lambda_term_*)``
+          to floating-point precision.
+        * ``selected`` — ``True`` for the row that :meth:`apply` chose
+          for that quote (same row, same tie-break).
+        * ``is_baseline`` — ``True`` for the per-quote baseline row
+          (lowest ``scenario_index`` among rows minimising
+          ``|scenario_value - 1.0|``).
+        * ``linearised_<name>`` — value used in the score for each
+          constraint. For sum constraints this equals the original
+          constraint column, cast to apply's ``Float32`` precision. For
+          ratio constraints this is the internal ``num - L * denom``
+          value used by the fixed-lambda apply.
+        * ``lambda_term_<name>`` — signed contribution of the
+          constraint to ``decision_score``: ``+lambda`` for ``min``
+          direction, ``-lambda`` for ``max`` direction, multiplied by
+          ``linearised_<name>``.
+
+        With ``constraints == {}`` only ``decision_score``,
+        ``selected``, and ``is_baseline`` are appended; ``decision_score``
+        equals the objective column.
+
+        Validation matches :meth:`apply` (missing/null/NaN columns,
+        unknown lambda keys at construction); a column collision
+        between the input DataFrame and the appended explainer columns
+        raises :class:`ValueError` rather than silently overwriting.
+
+        Parameters
+        ----------
+        df : pl.DataFrame
+            Long-format scored DataFrame (same schema accepted by
+            :meth:`apply`).
+
+        Returns
+        -------
+        pl.DataFrame
+            Original ``df`` with explainer columns appended.
+        """
+        if not isinstance(df, pl.DataFrame):
+            raise TypeError(f"Expected pl.DataFrame, got {type(df).__name__}")
+
+        # Refuse to overwrite caller-supplied columns. Polars
+        # ``with_columns`` would silently shadow; we'd rather raise
+        # naming the offender. Runs before ``apply`` so a name
+        # collision surfaces with a method-specific message instead of
+        # being masked by the (also-valid) generic apply errors.
+        reserved: set[str] = {"decision_score", "selected", "is_baseline"}
+        for name in self.constraints:
+            reserved.add(f"linearised_{name}")
+            reserved.add(f"lambda_term_{name}")
+        collisions = sorted(c for c in df.columns if c in reserved)
+        if collisions:
+            raise ValueError(
+                f"Input DataFrame already contains column(s) {collisions} "
+                f"that with_explainer_columns would append. Rename or "
+                f"drop them before calling this method."
+            )
+
+        # Reuse the canonical apply pass: argmax (so ``selected`` is
+        # bit-identical to ``apply(df)`` including tie-breaking) AND
+        # schema validation (missing columns, null/NaN, ratio
+        # numerator/denominator existence) live there already. No
+        # standalone ``_validate_dataframe`` call here — that would
+        # duplicate apply's check and create a code path to keep in
+        # sync.
+        apply_result = self.apply(df)
+
+        # Linearise ratio constraints on a working copy. For sum-only
+        # configurations we keep ``df`` as-is so the no-ratio fast
+        # path skips the linearisation expression. For ratio configs,
+        # ``modified_df`` carries a synthetic column under the ratio
+        # label; we read it for ``linearised_<name>`` and project it
+        # away from the final output below so callers don't see a
+        # phantom column they didn't supply.
+        ratio_names: set[str] = set(_ratio_constraint_names(self.constraints))
+        if ratio_names:
+            modified_df, _sum_specs, _grid_cols, _ratio_columns, _shift = (
+                _linearise_ratio_constraints(
+                    df,
+                    self.constraints,
+                    scenario_value_col=self.scenario_value,
+                    quote_id_col=self.quote_id,
+                )
+            )
+        else:
+            modified_df = df
+
+        # ``linearised_<name>`` reads from ``modified_df[name]``: sum
+        # constraints pass through unchanged; ratio constraints expose
+        # the ``num - L * denom`` synthetic value computed by the
+        # apply-path linearisation. Cast to Float32 to mirror the Rust
+        # apply argmax exactly: QuoteGrid stores row values as f32 and
+        # ``compute_lambda_signs_f32`` casts lambdas to f32 before the
+        # per-row score is accumulated.
+        linearised_exprs: list[pl.Expr] = [
+            pl.col(name).cast(pl.Float32).alias(f"linearised_{name}")
+            for name in self.constraints
+        ]
+
+        # ``lambda_term_<name>`` = signed_lambda * linearised_<name>.
+        # Sign convention pinned by spec: +lambda for min, -lambda for
+        # max. ``self.lambdas.get(name, 0.0)`` mirrors apply's
+        # ``order_lambdas`` default for missing keys (apply-time
+        # __init__ already rejected unknown lambda keys at construction,
+        # so there is no ambiguity here).
+        lambda_term_exprs: list[pl.Expr] = []
+        for name, spec in self.constraints.items():
+            direction = _spec_direction(spec)
+            lam = float(self.lambdas.get(name, 0.0))
+            signed = lam if direction == "min" else -lam
+            lambda_term_exprs.append(
+                (pl.lit(signed, dtype=pl.Float32) * pl.col(f"linearised_{name}"))
+                .cast(pl.Float32)
+                .alias(f"lambda_term_{name}")
+            )
+
+        # ``decision_score`` = objective + sum(lambda_term_*), accumulated
+        # in the same precision and order as apply mode. The Rust binding
+        # sorts constraint columns before grid ingestion, so f32 addition
+        # must follow sorted constraint-name order here as well.
+        if self.constraints:
+            score_expr: pl.Expr = pl.col(self.objective).cast(pl.Float32)
+            for name in sorted(self.constraints):
+                score_expr = (
+                    score_expr + pl.col(f"lambda_term_{name}").cast(pl.Float32)
+                ).cast(pl.Float32)
+            decision_expr = score_expr.cast(pl.Float64).alias("decision_score")
+        else:
+            decision_expr = (
+                pl.col(self.objective)
+                .cast(pl.Float32)
+                .cast(pl.Float64)
+                .alias("decision_score")
+            )
+
+        # ``selected`` lookup: apply's result DataFrame uses literal
+        # ``"quote_id"`` regardless of ``self.quote_id`` (see
+        # ``crates/price-contour/src/solver_py.rs::build_result_dataframe``).
+        # Rename to the user's column so the join key matches; rename
+        # ``optimal_step`` to a sentinel so a user-supplied column of
+        # that name isn't shadowed during the join.
+        selected_lookup = (
+            apply_result.dataframe.select(["quote_id", "optimal_step"])
+            .rename(
+                {
+                    "quote_id": self.quote_id,
+                    "optimal_step": _EXPLAINER_OPT_STEP,
+                }
+            )
+            .with_columns(pl.col(self.quote_id).cast(df.schema[self.quote_id]))
+        )
+
+        # Per-quote baseline lookup: lowest ``scenario_index`` among
+        # rows minimising ``|scenario_value - 1.0|``. Matches
+        # ``grid.baseline_totals`` semantics in ``data.rs`` (``min_by``
+        # on ``|sv - 1.0|`` keeps the first occurrence) at portfolio
+        # level. In the current online-optimiser shape ``scenario_values``
+        # are grid-wide so this resolves to the same scenario_index for
+        # every quote; the per-quote computation is what the spec asks
+        # for and stays correct should that ever loosen.
+        baseline_lookup = (
+            modified_df.lazy()
+            .select(
+                [
+                    pl.col(self.quote_id),
+                    pl.col(self.scenario_index),
+                    (pl.col(self.scenario_value).cast(pl.Float64) - 1.0)
+                    .abs()
+                    .alias(_EXPLAINER_BASELINE_DIST),
+                ]
+            )
+            .group_by(self.quote_id, maintain_order=True)
+            .agg(
+                pl.col(self.scenario_index)
+                .sort_by([_EXPLAINER_BASELINE_DIST, self.scenario_index])
+                .first()
+                .alias(_EXPLAINER_BASELINE_SI)
+            )
+            .collect()
+        )
+
+        # Compose the final DataFrame. Order:
+        #   1. linearised_* columns (so lambda_term_* can reference them)
+        #   2. lambda_term_* columns
+        #   3. decision_score (sums the lambda_terms)
+        #   4. selected (join + compare against optimal_step)
+        #   5. is_baseline (join + compare against baseline_scenario_index)
+        # Final ``.select`` projects to (original columns + appended
+        # explainer columns), dropping the synthetic ratio-label columns
+        # that ``modified_df`` carried as scaffolding.
+        out = modified_df
+        if linearised_exprs:
+            out = out.with_columns(linearised_exprs)
+        if lambda_term_exprs:
+            out = out.with_columns(lambda_term_exprs)
+        out = out.with_columns(decision_expr)
+
+        out = (
+            out.join(selected_lookup, on=self.quote_id, how="left")
+            .with_columns(
+                (pl.col(self.scenario_index) == pl.col(_EXPLAINER_OPT_STEP))
+                .alias("selected")
+            )
+            .drop(_EXPLAINER_OPT_STEP)
+        )
+
+        out = (
+            out.join(baseline_lookup, on=self.quote_id, how="left")
+            .with_columns(
+                (pl.col(self.scenario_index) == pl.col(_EXPLAINER_BASELINE_SI))
+                .alias("is_baseline")
+            )
+            .drop(_EXPLAINER_BASELINE_SI)
+        )
+
+        appended = (
+            [f"linearised_{name}" for name in self.constraints]
+            + [f"lambda_term_{name}" for name in self.constraints]
+            + ["decision_score", "selected", "is_baseline"]
+        )
+        return out.select([*df.columns, *appended])
 
     def save(self, path: str | Path) -> None:
         """Save configuration to a JSON file.

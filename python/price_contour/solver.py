@@ -613,6 +613,30 @@ class OnlineOptimiser:
 _DIRECTION_KEYS = ("min", "max", "min_pct", "max_pct")
 
 
+def _spec_direction(spec: dict) -> str:
+    """Return ``"min"`` or ``"max"`` for a constraint spec (sum or ratio).
+
+    Folds ``min_pct`` / ``max_pct`` onto the underlying ``min`` / ``max``
+    direction — fraction-of-baseline thresholds preserve the inequality
+    sign, only the threshold magnitude differs. Used by the apply-time
+    Lagrangian sign-convention (``+lambda`` for ``min`` direction,
+    ``-lambda`` for ``max``) shared by ``apply_lambdas_py`` /
+    ``with_explainer_columns`` / ``_linearise_ratio_constraints``.
+
+    Validators (:func:`_validate_constraint_dict`,
+    :func:`_validate_ratio_spec`) enforce exactly one direction key per
+    spec; the loop short-circuits on the first match. The else-branch
+    is defensive — reachable only if a caller bypassed validation.
+    """
+    for k in _DIRECTION_KEYS:
+        if k in spec:
+            return "min" if k in ("min", "min_pct") else "max"
+    raise ValueError(
+        f"Constraint spec has no direction key (expected one of "
+        f"{list(_DIRECTION_KEYS)}); got keys {sorted(spec.keys())}."
+    )
+
+
 def _is_ratio_spec(spec: dict) -> bool:
     """Return True iff a spec is a ratio constraint.
 
@@ -1097,11 +1121,11 @@ def _linearise_ratio_constraints(
         else:
             L = float(threshold_value)
 
-        # Map ratio direction key onto the corresponding sum-direction.
-        # ``min`` / ``min_pct`` → sum ``min``; ``max`` / ``max_pct`` →
-        # sum ``max``. Threshold collapses to 0 because the linearisation
-        # rewrote the constraint as ``Sigma c_i ⟂ 0``.
-        sum_direction = "min" if direction_key in ("min", "min_pct") else "max"
+        # Map ratio direction key onto the corresponding sum-direction
+        # via the shared :func:`_spec_direction` helper. Threshold
+        # collapses to 0 because the linearisation rewrote the
+        # constraint as ``Sigma c_i ⟂ 0``.
+        sum_direction = _spec_direction(spec)
         sum_constraints[name] = {sum_direction: 0.0}
         threshold_shift[name] = 0.0
 
