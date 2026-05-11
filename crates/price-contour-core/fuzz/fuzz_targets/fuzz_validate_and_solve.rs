@@ -67,6 +67,7 @@ fuzz_target!(|data: &[u8]| {
         constraints,
         constraint_names: constraint_names.clone(),
         quote_ids,
+        quote_id_fingerprint: 0,
     };
 
     // Try validate — should not panic regardless of input
@@ -101,6 +102,6 @@ fuzz_target!(|data: &[u8]| {
 
     // If solve succeeded, also test apply_lambdas with the resulting lambdas
     if let Ok(ref solve_result) = result {
-        let _ = apply_lambdas(&grid, &specs, &solve_result.lambdas, None);
+        let _ = apply_lambdas(&grid, &specs, &solve_result.lambdas);
     }
 });

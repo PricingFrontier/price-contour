@@ -10,8 +10,8 @@ pub use data::{
     GroupMapping, GroupedSolveResult, IterationHistory, IterationRecord, LambdaStrategy, QuoteGrid,
     QuoteGridBuilder, SolveResult, SolverConfig,
 };
-pub use factor_context::{FactorContextBuilder, FactorContextsBuilt};
 pub use error::{PriceContourError, Result};
+pub use factor_context::{FactorContextBuilder, FactorContextsBuilt};
 pub use frontier::{
     sweep_frontier, FrontierConfig, FrontierPoint, FrontierResult, NonConvergenceReason,
     ScenarioValueStats, SolverPath,

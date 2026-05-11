@@ -58,6 +58,7 @@ fuzz_target!(|data: &[u8]| {
         constraints,
         constraint_names: (0..n_constraints).map(|k| format!("c{}", k)).collect(),
         quote_ids: (0..n_quotes).map(|q| format!("Q{}", q)).collect(),
+        quote_id_fingerprint: 0,
     };
 
     // Skip validation — we want to test argmax directly with potentially

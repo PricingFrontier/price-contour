@@ -242,7 +242,9 @@ class TestFrontierInternalRefactor:
         ranges = {"volume": (0.85, 0.95)}
 
         # Internal: frontier builds contexts from factors DataFrame.
-        fr_internal = opt.frontier(df, factors, threshold_ranges=ranges, n_points_per_dim=3)
+        fr_internal = opt.frontier(
+            df, factors, threshold_ranges=ranges, n_points_per_dim=3
+        )
 
         # External: user pre-builds the contexts via from_dataframe and
         # passes them in. Should produce the same numerics because both
@@ -455,9 +457,7 @@ class TestOrderingValidation:
 
 
 class TestValidationFailures:
-    def test_duplicate_quote_ids_in_parquet(
-        self, tmp_path: Path
-    ) -> None:
+    def test_duplicate_quote_ids_in_parquet(self, tmp_path: Path) -> None:
         """Spec #8: duplicate quote IDs in factor source fail loudly."""
         df = pl.DataFrame(
             {
@@ -492,9 +492,7 @@ class TestValidationFailures:
 
     def test_unexpected_quote_id_vs_expected(self, tmp_path: Path) -> None:
         """Spec #10: unexpected quote IDs fail loudly."""
-        df = pl.DataFrame(
-            {"quote_id": ["Q0", "Q1", "Q9"], "region": ["A", "B", "C"]}
-        )
+        df = pl.DataFrame({"quote_id": ["Q0", "Q1", "Q9"], "region": ["A", "B", "C"]})
         p = tmp_path / "extra.parquet"
         df.write_parquet(p)
         with pytest.raises(ValueError, match=r"not in expected"):
@@ -564,7 +562,10 @@ class TestValidationFailures:
     def test_empty_parquet_rejected(self, tmp_path: Path) -> None:
         """Spec #13: empty parquet fails loudly."""
         df = pl.DataFrame(
-            {"quote_id": pl.Series([], dtype=pl.Utf8), "region": pl.Series([], dtype=pl.Utf8)}
+            {
+                "quote_id": pl.Series([], dtype=pl.Utf8),
+                "region": pl.Series([], dtype=pl.Utf8),
+            }
         )
         p = tmp_path / "empty.parquet"
         df.write_parquet(p)
@@ -713,9 +714,7 @@ class TestSchemaValidation:
         with pytest.raises(ValueError, match=r"nonexistent_column"):
             opt.solve(df, factors)
 
-    def test_null_factor_value_rejected(
-        self, tmp_path: Path
-    ) -> None:
+    def test_null_factor_value_rejected(self, tmp_path: Path) -> None:
         """Spec #18: null factor values match current dataframe-mode
         behaviour (rejected with a clear error)."""
         df_factors = pl.DataFrame(
@@ -844,9 +843,7 @@ class TestDataframeModeLabelOrderingPinned:
         n = 5
         df = pl.DataFrame(
             {
-                "quote_id": (
-                    [f"Q{i:04d}" for i in range(n) for _ in range(2)]
-                ),
+                "quote_id": ([f"Q{i:04d}" for i in range(n) for _ in range(2)]),
                 "scenario_index": [0, 1] * n,
                 "scenario_value": [0.9, 1.1] * n,
                 "expected_income": [10.0, 11.0] * n,
@@ -861,9 +858,7 @@ class TestDataframeModeLabelOrderingPinned:
             },
         )
         # Factors aligned positionally to quote order Q0000..Q0004.
-        factors = pl.DataFrame(
-            {"region": ["South", "North", "South", "East", "North"]}
-        )
+        factors = pl.DataFrame({"region": ["South", "North", "South", "East", "North"]})
         grid = build_grid(
             df,
             constraint_columns=["volume"],
@@ -910,9 +905,7 @@ class TestDataframeModeLabelOrderingPinned:
 
 
 class TestProjectionAndMemory:
-    def test_parquet_builder_reads_only_required_columns(
-        self, tmp_path: Path
-    ) -> None:
+    def test_parquet_builder_reads_only_required_columns(self, tmp_path: Path) -> None:
         """Spec #25: the parquet builder reads only the required columns
         (quote_id + factor columns), ignoring unrelated columns in the
         file. We verify by writing a parquet with extra junk columns

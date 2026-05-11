@@ -68,6 +68,7 @@ fuzz_target!(|data: &[u8]| {
         constraints,
         constraint_names: constraint_names.clone(),
         quote_ids,
+        quote_id_fingerprint: 0,
     };
 
     if grid.validate().is_err() {

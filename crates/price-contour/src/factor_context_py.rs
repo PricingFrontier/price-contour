@@ -17,9 +17,7 @@
 use std::sync::Arc;
 
 use polars::prelude::*;
-use price_contour_core::{
-    FactorContextBuilder, FactorContextsBuilt, GroupMapping,
-};
+use price_contour_core::{FactorContextBuilder, FactorContextsBuilt, GroupMapping};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
@@ -77,7 +75,6 @@ impl PyRatebookFactorContexts {
             mappings,
         }
     }
-
 }
 
 #[pymethods]
@@ -335,7 +332,10 @@ fn cross_validate_expected(
 /// supplied) shouldn't also appear in any factor spec, and within the
 /// projection no factor column should collide with `quote_id`. The
 /// underlying parquet reader rejects unknown columns naturally.
-fn validate_factor_projection(quote_id: Option<&str>, factor_specs: &[Vec<String>]) -> PyResult<()> {
+fn validate_factor_projection(
+    quote_id: Option<&str>,
+    factor_specs: &[Vec<String>],
+) -> PyResult<()> {
     let Some(qid) = quote_id else {
         return Ok(());
     };
@@ -403,4 +403,3 @@ fn append_dataframe_chunk(
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     Ok(())
 }
-

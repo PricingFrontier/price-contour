@@ -336,5 +336,3 @@ class TestFrontierThreeMixedConstraints:
             f"close to volume baseline {baseline_vol} — possible "
             f"column transposition"
         )
-
-

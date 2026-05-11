@@ -195,4 +195,3 @@ fn cast_column_to_string_series(df: &DataFrame, column_name: &str) -> PyResult<S
     })?;
     Ok(casted.take_materialized_series())
 }
-

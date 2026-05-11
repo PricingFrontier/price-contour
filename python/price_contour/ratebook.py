@@ -873,9 +873,7 @@ class RatebookOptimiser:
             frontier_factor_contexts = RatebookFactorContexts.from_dataframe(
                 factors,
                 resolved_factor_specs,
-                quote_id=(
-                    self.quote_id if self.quote_id in factors.columns else None
-                ),
+                quote_id=(self.quote_id if self.quote_id in factors.columns else None),
                 separator="\x1f",
                 expected_quote_ids=expected_quote_ids,
             )

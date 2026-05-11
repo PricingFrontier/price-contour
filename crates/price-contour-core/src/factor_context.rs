@@ -491,10 +491,12 @@ mod tests {
             vec![vec![s("North"), s("East")], vec![s("A"), s("C")]],
         )
         .unwrap();
-        b.append(None, vec![vec![s("West")], vec![s("B")]])
-            .unwrap();
+        b.append(None, vec![vec![s("West")], vec![s("B")]]).unwrap();
         let built = b.build(None, None).unwrap();
-        assert_eq!(built.group_mappings[0].group_labels, vec!["North", "South", "East", "West"]);
+        assert_eq!(
+            built.group_mappings[0].group_labels,
+            vec!["North", "South", "East", "West"]
+        );
         assert_eq!(built.group_mappings[1].group_labels, vec!["A", "B", "C"]);
         assert_eq!(built.group_mappings[0].group_of, vec![0, 1, 0, 2, 3]);
         assert_eq!(built.group_mappings[1].group_of, vec![0, 1, 0, 2, 1]);
@@ -583,9 +585,7 @@ mod tests {
             vec![vec![s("a"), s("b"), s("c")]],
         )
         .unwrap();
-        let err = b
-            .build(Some(&[s("Q0"), s("Q1")]), None)
-            .unwrap_err();
+        let err = b.build(Some(&[s("Q0"), s("Q1")]), None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not in expected"), "msg: {msg}");
     }
@@ -604,8 +604,7 @@ mod tests {
         // per-row quote_id column was extracted. Builder honours this and
         // assigns the expected fingerprint.
         let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
-        b.append(None, vec![vec![s("a"), s("b"), s("a")]])
-            .unwrap();
+        b.append(None, vec![vec![s("a"), s("b"), s("a")]]).unwrap();
         let expected = vec![s("Q0"), s("Q1"), s("Q2")];
         let built = b.build(Some(&expected), None).unwrap();
         assert_eq!(
@@ -639,9 +638,7 @@ mod tests {
     fn test_expected_quote_ids_and_n_quotes_disagree() {
         let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
         b.append(Some(&[s("Q0")]), vec![vec![s("a")]]).unwrap();
-        let err = b
-            .build(Some(&[s("Q0")]), Some(7))
-            .unwrap_err();
+        let err = b.build(Some(&[s("Q0")]), Some(7)).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("7"), "msg: {msg}");
     }
@@ -650,9 +647,7 @@ mod tests {
     fn test_quote_id_contract_changes_mid_stream() {
         let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
         b.append(Some(&[s("Q0")]), vec![vec![s("a")]]).unwrap();
-        let err = b
-            .append(None, vec![vec![s("b")]])
-            .unwrap_err();
+        let err = b.append(None, vec![vec![s("b")]]).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("contract changed"), "msg: {msg}");
     }
@@ -694,16 +689,10 @@ mod tests {
         // The reorder works across chunks: append two chunks of unsorted
         // quote IDs and verify build() reorders correctly.
         let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
-        b.append(
-            Some(&[s("Q3"), s("Q1")]),
-            vec![vec![s("x"), s("y")]],
-        )
-        .unwrap();
-        b.append(
-            Some(&[s("Q0"), s("Q2")]),
-            vec![vec![s("z"), s("y")]],
-        )
-        .unwrap();
+        b.append(Some(&[s("Q3"), s("Q1")]), vec![vec![s("x"), s("y")]])
+            .unwrap();
+        b.append(Some(&[s("Q0"), s("Q2")]), vec![vec![s("z"), s("y")]])
+            .unwrap();
         let expected = vec![s("Q0"), s("Q1"), s("Q2"), s("Q3")];
         let built = b.build(Some(&expected), None).unwrap();
         // After reorder: Q0->z, Q1->y, Q2->y, Q3->x.

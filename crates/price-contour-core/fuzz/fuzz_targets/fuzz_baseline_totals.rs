@@ -63,6 +63,7 @@ fuzz_target!(|data: &[u8]| {
         constraints: vec![constraint],
         constraint_names: vec!["c0".into()],
         quote_ids: (0..n_quotes).map(|q| format!("Q{}", q)).collect(),
+        quote_id_fingerprint: 0,
     };
 
     // validate() should not panic

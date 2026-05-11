@@ -352,6 +352,7 @@ class TestSummaryAndSerialisationKeys:
         # The serialised key names are the new ones.
         assert "min_abs" not in path.read_text()
 
+
 # ---------------------------------------------------------------------------
 # 7. Issue 4 — edge cases on threshold values
 # ---------------------------------------------------------------------------
