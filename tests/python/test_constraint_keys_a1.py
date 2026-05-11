@@ -1,18 +1,12 @@
-"""Feature A1 — constraint key flip.
+"""Constraint key semantics.
 
-After A1, the constraint dict keys mean:
+The constraint dict keys mean:
 
 * ``min`` / ``max``       → **absolute** thresholds (no baseline scaling).
-* ``min_pct`` / ``max_pct`` → fraction-of-baseline thresholds (the old
-  ``min`` / ``max`` behaviour, renamed).
-* ``min_abs`` / ``max_abs`` → **removed**. Using either must raise
-  ``ValueError`` whose message names both the removed key (``min_abs`` /
-  ``max_abs``) and the replacement (``min`` / ``max``) so the user can
-  see the rename. The old ``min`` / ``max`` are now ``min_pct`` /
-  ``max_pct``.
+* ``min_pct`` / ``max_pct`` → fraction-of-baseline thresholds.
 
-These are hard-break tests: they should currently fail against the old
-implementation and pass once A1 lands.
+Covers absolute vs fraction semantics, validation at construction, NaN/inf
+rejection, and serialisation round-trips.
 """
 
 from __future__ import annotations
@@ -33,14 +27,6 @@ from helpers import make_small_df, CONSTRAINT_RTOL
 # thresholds exactly. Several multipliers used because some max-direction
 # constraints are particularly hard on synthetic data.
 RTOL = CONSTRAINT_RTOL * 3
-
-
-# Regex helpers used by ValueError tests.
-# These match against str(ValueError(...)). Each regex must mention BOTH
-# the removed key and its replacement so a developer reading the failure
-# can immediately see the rename.
-RE_MIN_ABS_REMOVED = r"(?s)min_abs.*\bmin\b|\bmin\b.*min_abs"
-RE_MAX_ABS_REMOVED = r"(?s)max_abs.*\bmax\b|\bmax\b.*max_abs"
 
 
 # ---------------------------------------------------------------------------
@@ -231,114 +217,13 @@ class TestMixedAbsoluteAndPct:
 
 
 # ---------------------------------------------------------------------------
-# 4. Removed `min_abs` / `max_abs` keys must raise
-# ---------------------------------------------------------------------------
-
-
-class TestRemovedAbsKeys:
-    """Old `min_abs` / `max_abs` keys must raise ValueError naming the
-    rename. The error message must mention both old and new key names so
-    users see the migration path immediately."""
-
-    def test_min_abs_raises_with_rename_message(self):
-        with pytest.raises(ValueError, match=RE_MIN_ABS_REMOVED):
-            pc.OnlineOptimiser(
-                objective="expected_income",
-                constraints={"volume": {"min_abs": 1000.0}},
-            )
-
-    def test_max_abs_raises_with_rename_message(self):
-        with pytest.raises(ValueError, match=RE_MAX_ABS_REMOVED):
-            pc.OnlineOptimiser(
-                objective="expected_income",
-                constraints={"loss_ratio": {"max_abs": 5.0}},
-            )
-
-    def test_validate_dict_rejects_min_abs(self):
-        """Direct `_validate_constraint_dict` rejects `min_abs`."""
-        with pytest.raises(ValueError, match=RE_MIN_ABS_REMOVED):
-            _validate_constraint_dict({"volume": {"min_abs": 1000.0}})
-
-    def test_validate_dict_rejects_max_abs(self):
-        with pytest.raises(ValueError, match=RE_MAX_ABS_REMOVED):
-            _validate_constraint_dict({"loss_ratio": {"max_abs": 5.0}})
-
-    def test_apply_optimiser_rejects_min_abs(self):
-        with pytest.raises(ValueError, match=RE_MIN_ABS_REMOVED):
-            pc.ApplyOptimiser(
-                lambdas={"volume": 0.1},
-                objective="expected_income",
-                constraints={"volume": {"min_abs": 1000.0}},
-            )
-
-    def test_apply_optimiser_rejects_max_abs(self):
-        with pytest.raises(ValueError, match=RE_MAX_ABS_REMOVED):
-            pc.ApplyOptimiser(
-                lambdas={"loss_ratio": 0.1},
-                objective="expected_income",
-                constraints={"loss_ratio": {"max_abs": 5.0}},
-            )
-
-    def test_ratebook_optimiser_rejects_min_abs(self):
-        """RatebookOptimiser must enforce the same rules."""
-        df = make_small_df(n_quotes=20, n_steps=5)
-        # The validation must trigger by solve-time at the latest.
-        # Ideally at construction — but accept either, since some
-        # optimisers may defer validation to solve.
-        with pytest.raises(ValueError, match=RE_MIN_ABS_REMOVED):
-            opt = pc.RatebookOptimiser(
-                objective="expected_income",
-                constraints={"volume": {"min_abs": 1000.0}},
-                factor_columns=[["region"]],
-            )
-            # If construction didn't raise, force solve to surface it.
-            import polars as pl
-
-            factors = pl.DataFrame(
-                {"region": ["A"] * 20},
-            )
-            opt.solve(df, factors)
-
-    def test_ratebook_optimiser_rejects_max_abs(self):
-        df = make_small_df(n_quotes=20, n_steps=5)
-        with pytest.raises(ValueError, match=RE_MAX_ABS_REMOVED):
-            opt = pc.RatebookOptimiser(
-                objective="expected_income",
-                constraints={"loss_ratio": {"max_abs": 5.0}},
-                factor_columns=[["region"]],
-            )
-            import polars as pl
-
-            factors = pl.DataFrame({"region": ["A"] * 20})
-            opt.solve(df, factors)
-
-
-# ---------------------------------------------------------------------------
-# 5. _validate_constraint_dict at construction time
+# 4. _validate_constraint_dict accepts the four valid direction keys
 # ---------------------------------------------------------------------------
 
 
 class TestValidationAtConstruction:
-    """Old keys must be rejected at construction, before any solve."""
-
-    def test_online_construction_rejects_min_abs_no_solve(self):
-        """`min_abs` raises during ``__init__``, never reaching solve."""
-        with pytest.raises(ValueError, match=RE_MIN_ABS_REMOVED):
-            pc.OnlineOptimiser(
-                objective="expected_income",
-                constraints={"volume": {"min_abs": 1000.0}},
-            )
-
-    def test_apply_construction_rejects_min_abs_no_apply(self):
-        with pytest.raises(ValueError, match=RE_MIN_ABS_REMOVED):
-            pc.ApplyOptimiser(
-                lambdas={"volume": 0.1},
-                constraints={"volume": {"min_abs": 1000.0}},
-            )
-
     def test_validate_function_accepts_new_keys(self):
-        """Sanity check: the new key set is accepted by the validator."""
-        # All four valid keys, one constraint each — should not raise.
+        """Sanity check: the four valid keys are accepted by the validator."""
         _validate_constraint_dict({"volume": {"min": 100.0}})
         _validate_constraint_dict({"loss_ratio": {"max": 1.5}})
         _validate_constraint_dict({"volume": {"min_pct": 0.9}})
@@ -351,12 +236,10 @@ class TestValidationAtConstruction:
 
 
 class TestSummaryAndSerialisationKeys:
-    """The new constraint key names (``min``/``max`` absolute,
+    """The constraint key names (``min``/``max`` absolute,
     ``min_pct``/``max_pct`` relative) must round-trip cleanly through
     ``OnlineOptimiser.summary()``, ``config_dict()``, and the
-    ``ApplyOptimiser.save()`` / ``load()`` cycle. Loading a legacy
-    config containing the removed ``min_abs`` / ``max_abs`` keys must
-    raise the same migration error as construction does.
+    ``ApplyOptimiser.save()`` / ``load()`` cycle.
     """
 
     def test_summary_uses_new_constraint_keys(self):
@@ -468,48 +351,6 @@ class TestSummaryAndSerialisationKeys:
         assert on_disk["constraints"] == constraints
         # The serialised key names are the new ones.
         assert "min_abs" not in path.read_text()
-
-    def test_apply_optimiser_load_rejects_legacy_min_abs(self, tmp_path):
-        """A hand-written legacy config file containing ``min_abs``
-        must be rejected at load time with a migration ``ValueError``
-        that names both ``min_abs`` and ``min``.
-
-        This forces ``ApplyOptimiser.load()`` to re-validate
-        constraints rather than trusting a stale on-disk config that
-        predates the rename.
-        """
-        legacy = {
-            "version": 1,
-            "lambdas": {"volume": 0.1},
-            "objective": "expected_income",
-            "constraints": {"volume": {"min_abs": 8000.0}},
-            "quote_id": "quote_id",
-            "scenario_index": "scenario_index",
-            "scenario_value": "scenario_value",
-        }
-        path = tmp_path / "legacy_config.json"
-        path.write_text(json.dumps(legacy))
-
-        with pytest.raises(ValueError, match=RE_MIN_ABS_REMOVED):
-            pc.ApplyOptimiser.load(path)
-
-    def test_apply_optimiser_load_rejects_legacy_max_abs(self, tmp_path):
-        """Symmetric check for ``max_abs`` on load."""
-        legacy = {
-            "version": 1,
-            "lambdas": {"loss_ratio": 0.1},
-            "objective": "expected_income",
-            "constraints": {"loss_ratio": {"max_abs": 5.0}},
-            "quote_id": "quote_id",
-            "scenario_index": "scenario_index",
-            "scenario_value": "scenario_value",
-        }
-        path = tmp_path / "legacy_max_abs.json"
-        path.write_text(json.dumps(legacy))
-
-        with pytest.raises(ValueError, match=RE_MAX_ABS_REMOVED):
-            pc.ApplyOptimiser.load(path)
-
 
 # ---------------------------------------------------------------------------
 # 7. Issue 4 — edge cases on threshold values

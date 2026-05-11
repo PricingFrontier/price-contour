@@ -752,41 +752,20 @@ def _validate_constraint_dict(
 ) -> None:
     """Validate constraint specification dict structure and values.
 
-    Post-A1 valid keys for **sum** constraints:
+    Valid keys for **sum** constraints:
     * ``min`` / ``max``         → absolute thresholds.
     * ``min_pct`` / ``max_pct`` → fraction-of-baseline thresholds.
 
-    Ratio constraints (C1) are detected by the presence of BOTH a
+    Ratio constraints are detected by the presence of BOTH a
     ``numerator`` and a ``denominator`` key. The dict key on the outer
     constraints map is a *display label* for ratio constraints (not a
     column name), in contrast to sum constraints where the key is the
     column name.
-
-    The old ``min_abs`` / ``max_abs`` keys have been removed and raise a
-    migration ``ValueError`` naming both the removed key and its
-    replacement. The migration error fires BEFORE the ratio-detection
-    branch so that a user porting old code who happens to add ratio
-    fields still sees the rename hint first.
     """
     for name, spec in constraints.items():
         if not isinstance(spec, dict):
             raise ValueError(
                 f"Constraint '{name}' value must be a dict, got {type(spec).__name__}"
-            )
-        # Surface the rename hint BEFORE the generic invalid-key error so
-        # users see the migration path instead of "invalid key". This
-        # also takes precedence over the ratio-detection branch — a user
-        # porting code who accidentally added ratio fields still sees the
-        # rename hint first.
-        if "min_abs" in spec:
-            raise ValueError(
-                "'min_abs' has been renamed to 'min'; "
-                "the previous fraction-of-baseline 'min' is now 'min_pct'"
-            )
-        if "max_abs" in spec:
-            raise ValueError(
-                "'max_abs' has been renamed to 'max'; "
-                "the previous fraction-of-baseline 'max' is now 'max_pct'"
             )
         # Ratio detection: route into the ratio validator if either pair
         # key is present (the ratio validator itself enforces "both must
@@ -838,9 +817,9 @@ def _none_threshold_constraints(
     and by ``frontier()`` paths to confirm a matching ``threshold_ranges``
     entry exists for each.
 
-    Post-A1 each sum spec has exactly one direction key (``min`` / ``max`` /
-    ``min_pct`` / ``max_pct``). For ratio specs (C1), the direction key
-    sits alongside ``numerator`` / ``denominator`` so we look it up
+    Each sum spec has exactly one direction key (``min`` / ``max`` /
+    ``min_pct`` / ``max_pct``). For ratio specs the direction key sits
+    alongside ``numerator`` / ``denominator``, so we look it up
     explicitly rather than reading the first dict value.
     """
     out: list[str] = []
@@ -932,7 +911,7 @@ def _reject_none_for_solve(
     value or use ``frontier()`` with a matching ``threshold_ranges`` entry.
 
     The error names the offending constraint AND mentions ``frontier()``
-    so the user immediately sees the migration path.
+    so the user immediately sees where to route the call.
     """
     none_names = _none_threshold_constraints(constraints)
     if none_names:

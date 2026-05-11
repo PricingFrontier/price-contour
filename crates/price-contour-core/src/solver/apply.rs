@@ -111,6 +111,7 @@ mod tests {
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         };
 
         let (_, baseline_cons) = grid.baseline_totals();

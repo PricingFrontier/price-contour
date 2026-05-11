@@ -7,7 +7,8 @@ use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
 use price_contour_core::{
-    solve_online, ConstraintDirection, ConstraintSpec, QuoteGrid, SolveResult, SolverConfig,
+    fingerprint_quote_ids, solve_online, ConstraintDirection, ConstraintSpec, QuoteGrid,
+    SolveResult, SolverConfig,
 };
 
 use crate::constraint_parsing::validate_constraints_dict;
@@ -229,6 +230,7 @@ pub(crate) fn ingest_dataframe(
         }
     }
 
+    let quote_id_fingerprint = fingerprint_quote_ids(&quote_ids);
     let grid = QuoteGrid {
         n_quotes,
         n_steps,
@@ -237,6 +239,7 @@ pub(crate) fn ingest_dataframe(
         constraints,
         constraint_names: constraint_cols.to_vec(),
         quote_ids,
+        quote_id_fingerprint,
     };
     grid.validate()
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
@@ -430,11 +433,9 @@ impl PySolveResult {
 
 /// Parse constraint dict from Python.
 ///
-/// New (post-A1) semantics:
+/// Direction keys:
 /// * ``min`` / ``max``         → absolute thresholds.
 /// * ``min_pct`` / ``max_pct`` → fraction-of-baseline thresholds.
-/// * ``min_abs`` / ``max_abs`` → removed; raises a migration ``ValueError``
-///   that names both the old and new key.
 ///
 /// We walk `grid.constraint_names` (NOT the user `HashMap`) when
 /// emitting specs so `specs[k]` aligns with `grid.constraints[k]` —
@@ -442,7 +443,7 @@ impl PySolveResult {
 /// `HashMap` directly would produce nondeterministic ordering and
 /// silently mix up which constraint each lambda controls.
 ///
-/// Validation (migration errors, multi-key, NaN/inf, unknown name) is
+/// Validation (multi-key, NaN/inf, unknown name) is
 /// shared with `frontier_py::sweep_frontier_py` via
 /// `crate::constraint_parsing::validate_constraints_dict` so the two
 /// entry points can never drift.

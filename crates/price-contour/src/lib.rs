@@ -1,10 +1,11 @@
 mod apply_py;
 mod builder_py;
 pub(crate) mod constraint_parsing;
+mod factor_context_py;
 mod frontier_py;
 mod grid_py;
 mod grouped_py;
-mod parquet_grid_py;
+pub(crate) mod parquet_grid_py;
 pub(crate) mod quote_id;
 mod ratebook_helpers_py;
 mod solver_py;
@@ -42,16 +43,9 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_class::<ratebook_helpers_py::PyFactorContext>()?;
+    m.add_class::<factor_context_py::PyRatebookFactorContexts>()?;
     m.add_function(wrap_pyfunction!(
-        ratebook_helpers_py::build_factor_contexts_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        ratebook_helpers_py::build_interaction_labels_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        ratebook_helpers_py::extract_factor_labels_py,
+        factor_context_py::build_ratebook_factor_contexts_from_parquet_chunked_py,
         m
     )?)?;
     Ok(())

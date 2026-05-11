@@ -918,6 +918,7 @@ mod tests {
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         }
     }
 
@@ -1008,6 +1009,7 @@ mod tests {
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         }
     }
 
@@ -1125,6 +1127,7 @@ mod tests {
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: vec!["Q0".to_string()],
+            quote_id_fingerprint: 0,
         };
         let labels = vec!["G".to_string()];
         let group_mapping = build_group_mapping(&labels);

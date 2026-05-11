@@ -46,6 +46,14 @@ impl PyQuoteGrid {
         self.inner.quote_ids.clone()
     }
 
+    /// 64-bit fingerprint of `quote_ids`, used by the ratebook factor-context
+    /// path to validate alignment between the grid and prebuilt contexts in
+    /// constant time. See [`price_contour_core::fingerprint_quote_ids`].
+    #[getter]
+    fn quote_id_fingerprint(&self) -> u64 {
+        self.inner.quote_id_fingerprint
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "QuoteGrid(n_quotes={}, n_steps={}, constraints={:?})",

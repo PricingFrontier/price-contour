@@ -21,6 +21,10 @@ pub struct QuoteGrid {
     pub constraint_names: Vec<String>,
     /// Unique identifier for each quote (length `n_quotes`).
     pub quote_ids: Vec<String>,
+    /// 64-bit fingerprint of `quote_ids` for O(1) alignment checks
+    /// against external structures (e.g. `RatebookFactorContexts`). See
+    /// [`fingerprint_quote_ids`].
+    pub quote_id_fingerprint: u64,
 }
 
 impl QuoteGrid {
@@ -412,6 +416,7 @@ impl QuoteGridBuilder {
             &mut self.quote_ids,
         );
 
+        let quote_id_fingerprint = fingerprint_quote_ids(&self.quote_ids);
         let grid = QuoteGrid {
             n_quotes: self.n_quotes,
             n_steps: self.n_steps,
@@ -420,6 +425,7 @@ impl QuoteGridBuilder {
             constraints: self.constraints,
             constraint_names: self.constraint_names,
             quote_ids: self.quote_ids,
+            quote_id_fingerprint,
         };
         grid.validate()?;
         Ok(grid)
@@ -520,6 +526,46 @@ fn apply_quote_permutation(
     }
 }
 
+/// FNV-1a 64-bit hash of a quote-id sequence, used as the alignment
+/// fingerprint shared by `QuoteGrid` and `RatebookFactorContexts`.
+///
+/// The hash is order-sensitive (so the lex-sorted post-build order of a
+/// `QuoteGrid` produces a different fingerprint from any other
+/// permutation of the same IDs), and it length-delimits each string with
+/// its byte length so adjacent IDs like `["ab", "cd"]` and `["a", "bcd"]`
+/// cannot collide before hashing. The count is also mixed in first so
+/// `["abc"]` and `["", "abc"]` differ.
+///
+/// FNV-1a is deterministic across Rust versions and platforms — important
+/// because this fingerprint is the equality test used to gate the
+/// ratebook solver's quote-axis alignment check. Cryptographic strength
+/// is not required; we want a fast, fully-reproducible 64-bit digest.
+pub fn fingerprint_quote_ids(quote_ids: &[String]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    #[inline]
+    fn mix_u64(h: u64, v: u64) -> u64 {
+        let mut h = h;
+        for b in v.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+
+    let mut h = FNV_OFFSET;
+    h = mix_u64(h, quote_ids.len() as u64);
+    for id in quote_ids {
+        h = mix_u64(h, id.len() as u64);
+        for b in id.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+    h
+}
+
 /// Mapping from quote index to group index, for grouped optimisation.
 #[derive(Debug, Clone)]
 pub struct GroupMapping {
@@ -616,6 +662,7 @@ mod tests {
             constraints: vec![vec![1.0; n_quotes * n_steps]],
             constraint_names: vec!["volume".to_string()],
             quote_ids: (0..n_quotes).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         }
     }
 
@@ -657,6 +704,7 @@ mod tests {
             ]],
             constraint_names: vec!["volume".to_string()],
             quote_ids: vec!["Q0".to_string(), "Q1".to_string()],
+            quote_id_fingerprint: 0,
         };
 
         let (obj, cons) = grid.baseline_totals();
@@ -1235,6 +1283,7 @@ mod tests {
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: vec!["Q0".to_string()],
+            quote_id_fingerprint: 0,
         };
         let err = grid.validate().unwrap_err();
         let msg = format!("{err}");
@@ -1254,12 +1303,86 @@ mod tests {
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: vec![],
+            quote_id_fingerprint: 0,
         };
         let err = grid.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("n_quotes"),
             "error should mention n_quotes: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // fingerprint_quote_ids tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fingerprint_quote_ids_deterministic() {
+        // Same input must produce the same hash on every call within a run.
+        let ids = vec![
+            "Q0001".to_string(),
+            "Q0002".to_string(),
+            "Q0003".to_string(),
+        ];
+        let h1 = fingerprint_quote_ids(&ids);
+        let h2 = fingerprint_quote_ids(&ids);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_fingerprint_quote_ids_order_sensitive() {
+        // The QuoteGridBuilder sorts by quote_id, so source-order vs
+        // grid-order fingerprints must differ.
+        let a = vec!["Q1".to_string(), "Q2".to_string()];
+        let b = vec!["Q2".to_string(), "Q1".to_string()];
+        assert_ne!(fingerprint_quote_ids(&a), fingerprint_quote_ids(&b));
+    }
+
+    #[test]
+    fn test_fingerprint_quote_ids_length_delimited() {
+        // Without length-delimiting, ["ab","cd"] could collide with
+        // ["a","bcd"] (concatenated byte streams). Verify they don't.
+        let a = vec!["ab".to_string(), "cd".to_string()];
+        let b = vec!["a".to_string(), "bcd".to_string()];
+        assert_ne!(fingerprint_quote_ids(&a), fingerprint_quote_ids(&b));
+    }
+
+    #[test]
+    fn test_fingerprint_quote_ids_count_mixed() {
+        // ["abc"] and ["","abc"] share byte payload; the count prefix
+        // must distinguish them.
+        let a = vec!["abc".to_string()];
+        let b = vec!["".to_string(), "abc".to_string()];
+        assert_ne!(fingerprint_quote_ids(&a), fingerprint_quote_ids(&b));
+    }
+
+    #[test]
+    fn test_fingerprint_quote_ids_empty_stable() {
+        let empty: Vec<String> = vec![];
+        let h1 = fingerprint_quote_ids(&empty);
+        let h2 = fingerprint_quote_ids(&empty);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_quote_grid_builder_sets_post_sort_fingerprint() {
+        // The builder must compute the fingerprint AFTER the
+        // cycle-following sort, so it reflects the post-sort order of
+        // quote_ids — that's what external callers compare against.
+        let mut builder =
+            QuoteGridBuilder::new(2, vec![0.9, 1.1], vec!["volume".to_string()]).unwrap();
+        append_uniquely_tagged(&mut builder, &[3, 1, 2], 2);
+        let grid = builder.build().unwrap();
+        let expected_post_sort_ids = vec![
+            "Q0001".to_string(),
+            "Q0002".to_string(),
+            "Q0003".to_string(),
+        ];
+        assert_eq!(
+            grid.quote_id_fingerprint,
+            fingerprint_quote_ids(&expected_post_sort_ids),
+            "builder fingerprint must hash the post-sort quote_ids",
         );
     }
 
@@ -1273,6 +1396,7 @@ mod tests {
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: vec!["Q0".to_string()],
+            quote_id_fingerprint: 0,
         };
         let err = grid.validate().unwrap_err();
         let msg = format!("{err}");

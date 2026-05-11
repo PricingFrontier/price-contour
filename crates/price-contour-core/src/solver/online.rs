@@ -219,6 +219,7 @@ mod tests {
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+            quote_id_fingerprint: 0,
         };
         let config = SolverConfig {
             max_iter: 1,
@@ -260,6 +261,7 @@ mod tests {
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         };
 
         let (_, baseline_cons) = grid.baseline_totals();
@@ -295,6 +297,7 @@ mod tests {
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: grid.quote_ids.clone(),
+            quote_id_fingerprint: 0,
         };
         let unconstrained_result = solve_online(
             &unconstrained_grid,
@@ -336,6 +339,7 @@ mod tests {
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         };
 
         let (_, baseline_cons) = grid.baseline_totals();
@@ -373,6 +377,7 @@ mod tests {
             ]],
             constraint_names: vec!["volume".to_string()],
             quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+            quote_id_fingerprint: 0,
         };
         let (_, bc) = grid.baseline_totals();
         let specs = vec![ConstraintSpec {
@@ -401,6 +406,7 @@ mod tests {
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+            quote_id_fingerprint: 0,
         };
         let config = SolverConfig {
             max_iter: 1,
@@ -421,6 +427,7 @@ mod tests {
             constraints: vec![],
             constraint_names: vec![],
             quote_ids: vec!["Q0".into(), "Q1".into()],
+            quote_id_fingerprint: 0,
         };
         let config = SolverConfig {
             max_iter: 1,
@@ -462,6 +469,7 @@ mod tests {
             constraints: vec![vol, lr],
             constraint_names: vec!["volume".to_string(), "loss_ratio".to_string()],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         }
     }
 
@@ -527,6 +535,7 @@ mod tests {
             constraints: vec![vec![1.0; 9]], // 1 constraint
             constraint_names: vec!["volume".to_string()],
             quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+            quote_id_fingerprint: 0,
         };
 
         // 2 specs but only 1 constraint in grid
@@ -563,6 +572,7 @@ mod tests {
             constraints: vec![vec![1.0; 9]],
             constraint_names: vec!["volume".to_string()],
             quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+            quote_id_fingerprint: 0,
         };
 
         let specs = vec![ConstraintSpec {

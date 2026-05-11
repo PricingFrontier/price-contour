@@ -21,6 +21,12 @@ class QuoteGrid:
     def constraint_names(self) -> list[str]: ...
     @property
     def quote_ids(self) -> list[str]: ...
+    @property
+    def quote_id_fingerprint(self) -> int:
+        """64-bit FNV-1a hash of ``quote_ids`` computed at build time.
+        Used as the O(1) alignment check between a grid and a
+        :class:`RatebookFactorContexts`."""
+        ...
 
 class QuoteGridBuilder:
     """Incrementally build a QuoteGrid from DataFrame chunks."""
@@ -276,22 +282,59 @@ class FactorContext:
     @property
     def group_labels(self) -> list[str]: ...
 
-def build_factor_contexts_py(
-    factors: pl.DataFrame,
-    factor_specs: list[list[str]],
-    separator: str = "\x1f",
-) -> list[FactorContext]: ...
-def build_interaction_labels_py(
-    columns: list[list[str]],
-    separator: str,
-) -> list[str]:
-    """Deprecated: prefer ``extract_factor_labels_py`` which casts inside
-    Rust and avoids the per-element ``PyUnicode`` round-trip. Retained for
-    backwards compatibility with downstream callers."""
-    ...
+class RatebookFactorContexts:
+    """Opaque per-quote factor contexts used by the ratebook solver.
 
-def extract_factor_labels_py(
-    factors: pl.DataFrame,
+    Owns one ``Arc<GroupMapping>`` per factor spec plus an alignment
+    fingerprint over the quote IDs. Two construction paths share one
+    internal builder:
+
+    * :meth:`from_dataframe` — single-shot from a ``pl.DataFrame``.
+    * :func:`price_contour.build_ratebook_factor_contexts_from_parquet_chunked`
+      — streams a parquet file in row slices.
+
+    The wrapper is intentionally opaque: ``FactorContext`` is internal
+    and not exposed as a list attribute. Read-only metadata
+    (``factor_specs``, ``n_factors``, ``n_quotes``,
+    ``quote_id_fingerprint``) is all that's surfaced.
+    """
+
+    @property
+    def factor_specs(self) -> list[list[str]]: ...
+    @property
+    def n_factors(self) -> int: ...
+    @property
+    def n_quotes(self) -> int: ...
+    @property
+    def separator(self) -> str: ...
+    @property
+    def quote_id_fingerprint(self) -> int | None:
+        """64-bit FNV-1a hash of the quote IDs the contexts are aligned
+        to, or ``None`` when neither ``expected_quote_ids`` nor a
+        per-row ``quote_id`` column was supplied at construction.
+
+        ``solve(QuoteGrid, contexts)`` rejects contexts with a ``None``
+        fingerprint because quote-axis alignment cannot be proven."""
+        ...
+    @classmethod
+    def from_dataframe(
+        cls,
+        factors: pl.DataFrame,
+        factor_specs: list[list[str]],
+        *,
+        quote_id: str | None = "quote_id",
+        separator: str = "\x1f",
+        expected_quote_ids: list[str] | None = None,
+        expected_n_quotes: int | None = None,
+    ) -> RatebookFactorContexts: ...
+
+def build_ratebook_factor_contexts_from_parquet_chunked_py(
+    path: str,
     factor_specs: list[list[str]],
+    chunk_size: int,
+    *,
+    quote_id: str | None = "quote_id",
     separator: str = "\x1f",
-) -> list[list[str]]: ...
+    expected_quote_ids: list[str] | None = None,
+    expected_n_quotes: int | None = None,
+) -> RatebookFactorContexts: ...

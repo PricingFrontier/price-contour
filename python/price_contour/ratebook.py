@@ -10,18 +10,19 @@ from typing import Any, Protocol
 
 import polars as pl
 
+from price_contour._frontier_helpers import (
+    _cartesian_product,
+    _linspace,
+)
 from price_contour._grid_utils import build_grid
 from price_contour._price_contour import (
     FactorContext,
     FrontierResult,
     QuoteGrid,
-    build_factor_contexts_py,
+    RatebookFactorContexts,
+    build_ratebook_factor_contexts_from_parquet_chunked_py,
     run_cd_pass_py,
     solve_grouped_py,
-)
-from price_contour._frontier_helpers import (
-    _cartesian_product,
-    _linspace,
 )
 from price_contour._ratio_results import (
     _safe_ratio_from_columns,
@@ -39,6 +40,69 @@ from price_contour.solver import (
     _validate_constraint_dict,
     _validate_dataframe,
 )
+
+
+def build_ratebook_factor_contexts_from_parquet_chunked(
+    path: str,
+    factor_specs: list[list[str]],
+    chunk_size: int,
+    *,
+    quote_id: str | None = "quote_id",
+    separator: str = "\x1f",
+    expected_quote_ids: list[str] | None = None,
+    expected_n_quotes: int | None = None,
+) -> RatebookFactorContexts:
+    """Build factor contexts from a Parquet file by streaming row slices.
+
+    Re-exported as ``price_contour.build_ratebook_factor_contexts_from_parquet_chunked``
+    by ``__init__.py``. The underlying Rust function has a ``_py``
+    suffix (PyO3 convention); the public name drops it.
+
+    Reads only ``quote_id`` plus the columns referenced by
+    ``factor_specs`` — the rest of the parquet schema is never decoded.
+    Memory for the IO buffer scales with ``chunk_size``, not the full
+    file size.
+
+    Parameters
+    ----------
+    path
+        Path to the factor parquet file. Each row is one quote.
+    factor_specs
+        List of factor specs; each spec is a list of column names whose
+        interaction defines a rating factor.
+    chunk_size
+        Rows per IO slice. Must be > 0.
+    quote_id
+        Column name whose values are the alignment fingerprint source.
+        Pass ``None`` when the parquet is already positionally aligned
+        to your quote grid; combine with ``expected_quote_ids`` to give
+        the contexts a verifiable fingerprint.
+    separator
+        Interaction separator for multi-column factor specs. ASCII 31
+        (unit separator) by default.
+    expected_quote_ids
+        When supplied, the builder reorders the contexts to this exact
+        quote order and stores ``hash(expected_quote_ids)`` as the
+        fingerprint. Use ``quote_grid.quote_ids`` here to align with a
+        previously built grid.
+    expected_n_quotes
+        Cross-check: the total number of rows read must equal this.
+
+    Returns
+    -------
+    RatebookFactorContexts
+        Opaque handle suitable for ``RatebookOptimiser.solve()`` /
+        ``RatebookOptimiser.frontier()``.
+    """
+    return build_ratebook_factor_contexts_from_parquet_chunked_py(
+        path,
+        factor_specs,
+        chunk_size,
+        quote_id=quote_id,
+        separator=separator,
+        expected_quote_ids=expected_quote_ids,
+        expected_n_quotes=expected_n_quotes,
+    )
 
 
 class PerFactorRecord(Protocol):
@@ -133,8 +197,10 @@ class RatebookResult:
                 values = [table[k] for k in levels]
                 result[factor_name] = pl.DataFrame({cols[0]: levels, "factor": values})
             else:
-                # Interaction factor: keys use unit separator (\x1f) between
-                # values, falling back to colon for backward compatibility
+                # Interaction factor: keys use the unit separator (\x1f)
+                # in-memory but the colon when round-tripped through
+                # save/load (which substitutes \x1f → ':' for JSON
+                # readability). Accept either at this seam.
                 rows = []
                 for key, val in table.items():
                     if "\x1f" in key:
@@ -275,12 +341,11 @@ class RatebookOptimiser:
     def solve(
         self,
         df_or_grid: pl.DataFrame | QuoteGrid,
-        factors: pl.DataFrame,
+        factors: pl.DataFrame | RatebookFactorContexts,
         *,
         factor_columns: list[list[str]] | None = None,
         lambdas: dict[str, float] | None = None,
         _constraints_override: dict[str, dict[str, float]] | None = None,
-        _factor_contexts_override: list[FactorContext] | None = None,
     ) -> RatebookResult:
         """Run ratebook optimisation.
 
@@ -288,11 +353,19 @@ class RatebookOptimiser:
         ----------
         df_or_grid : pl.DataFrame | QuoteGrid
             Scored DataFrame or pre-built QuoteGrid.
-        factors : pl.DataFrame
-            Per-quote factors DataFrame with N rows (one per quote).
-            Must contain the columns referenced by factor_columns.
+        factors : pl.DataFrame | RatebookFactorContexts
+            Either a per-quote factors DataFrame (one row per quote,
+            columns referenced by ``factor_columns``) or a prebuilt
+            :class:`RatebookFactorContexts` opaque handle. The contexts
+            handle is what production pipelines should use: it
+            short-circuits per-call label extraction and validates
+            quote-axis alignment against the grid in O(1) via a 64-bit
+            fingerprint.
         factor_columns : list[list[str]], optional
-            Override factor_columns from init.
+            Override factor_columns from init. Rejected when ``factors``
+            is a :class:`RatebookFactorContexts` whose own
+            ``factor_specs`` disagrees — the contexts' specs are the
+            source of truth in that mode.
         lambdas : dict[str, float], optional
             Initial lambda values for warm-start. Typically from a prior
             solve or adjacent frontier point.
@@ -326,30 +399,42 @@ class RatebookOptimiser:
         if ratio_names and not isinstance(df_or_grid, pl.DataFrame):
             _reject_ratio_for_grid(constraints, mode="solve")
 
-        factor_specs = factor_columns or self.factor_columns
-        if factor_specs is None:
-            factor_specs = self._discover_structure(df_or_grid, factors)
+        # Resolve `factor_specs` based on the `factors` argument shape.
+        # When `factors` is a `RatebookFactorContexts`, its own specs
+        # are authoritative and auto-discovery is unavailable
+        # (contexts already encode the chosen factors). When `factors`
+        # is a DataFrame, fall through to the legacy resolution path.
+        if isinstance(factors, RatebookFactorContexts):
+            factor_specs = _resolve_factor_specs_from_contexts(
+                factors, factor_columns, self.factor_columns
+            )
+        else:
+            factor_specs = factor_columns or self.factor_columns
+            if factor_specs is None:
+                factor_specs = self._discover_structure(df_or_grid, factors)
 
-        # Validate factors DataFrame
-        if isinstance(df_or_grid, pl.DataFrame):
-            n_steps = _count_steps(df_or_grid, self.quote_id)
-            if n_steps > 0:
-                expected_quotes = df_or_grid.shape[0] // n_steps
-                if factors.shape[0] != expected_quotes:
-                    raise ValueError(
-                        f"factors row count {factors.shape[0]} != "
-                        f"DataFrame quote count {expected_quotes} "
-                        f"(rows={df_or_grid.shape[0]} / n_steps={n_steps})"
-                    )
+            # Pre-grid-build validation: rows align by count, columns
+            # referenced by specs exist. The fingerprint check below
+            # gives us the stricter alignment proof, but these checks
+            # surface human-friendly errors before any grid-build cost.
+            if isinstance(df_or_grid, pl.DataFrame):
+                n_steps = _count_steps(df_or_grid, self.quote_id)
+                if n_steps > 0:
+                    expected_quotes = df_or_grid.shape[0] // n_steps
+                    if factors.shape[0] != expected_quotes:
+                        raise ValueError(
+                            f"factors row count {factors.shape[0]} != "
+                            f"DataFrame quote count {expected_quotes} "
+                            f"(rows={df_or_grid.shape[0]} / n_steps={n_steps})"
+                        )
 
-        # Validate factor_columns reference columns that exist in factors
-        for spec in factor_specs:
-            for col in spec:
-                if col not in factors.columns:
-                    raise ValueError(
-                        f"Factor column '{col}' not found in factors DataFrame. "
-                        f"Available: {list(factors.columns)}"
-                    )
+            for spec in factor_specs:
+                for col in spec:
+                    if col not in factors.columns:
+                        raise ValueError(
+                            f"Factor column '{col}' not found in factors DataFrame. "
+                            f"Available: {list(factors.columns)}"
+                        )
 
         # When ratio constraints are present, validate the DataFrame
         # schema (existence + non-null + non-NaN of numerator /
@@ -412,31 +497,22 @@ class RatebookOptimiser:
         # Build candidates
         candidates = self._build_candidates()
 
-        # Build per-factor `FactorContext`s from the factors DataFrame.
-        #
-        # Each context wraps a Rust-side `Arc<GroupMapping>` (per-quote
-        # group index + per-group label vector) built once and reused
-        # across every CD iteration's calls into the Rust solver and
-        # helpers. The previous flow re-ferried `Vec<String>` per call
-        # (~100k Python strings × 165 calls per frontier sweep through
-        # PyO3 → owned `String` allocations); the context lets the
-        # orchestrator pass `&PyFactorContext` references and
-        # group-indexed `Vec<f32>` factor values, eliminating the
-        # per-call string traffic and the inner `build_group_mapping`
-        # rebuild. ASCII 31 (unit separator) is the canonical interaction
-        # join character; it avoids collisions with colons that
-        # legitimately appear in factor values.
-        #
-        # `_factor_contexts_override` lets the frontier sweep build the
-        # contexts once and reuse them across every visited point — the
-        # `factors` DataFrame is constant across a sweep, so without the
-        # override each `solve()` call re-walks the dataframe and
-        # re-hashes the same group labels.
-        factor_contexts: list[FactorContext]
-        if _factor_contexts_override is not None:
-            factor_contexts = _factor_contexts_override
-        else:
-            factor_contexts = build_factor_contexts_py(factors, factor_specs, "\x1f")
+        # Resolve factors to a `RatebookFactorContexts` whose fingerprint
+        # matches the grid's quote axis. The wrapper owns one
+        # `Arc<GroupMapping>` per factor; we hand the underlying
+        # `list[FactorContext]` to the solver. The fingerprint check is
+        # O(1) — a single u64 compare on every solve, including the
+        # ones a frontier sweep makes — so we can safely repeat it
+        # at every entry instead of relying on a private override.
+        factor_contexts_obj = _resolve_factor_contexts(
+            factors,
+            factor_specs,
+            grid=grid,
+            quote_id_col=self.quote_id,
+        )
+        factor_contexts: list[FactorContext] = (
+            factor_contexts_obj._factor_contexts_for_solver()
+        )
 
         # Per-factor group label lists for stitching the final `dict[str,
         # float]` factor tables back together. These are the unique
@@ -463,12 +539,12 @@ class RatebookOptimiser:
             lambdas=lambdas,
         )
 
-        # Lightweight per-call records for backwards-compat consumers
-        # of `RatebookResult.per_factor_results` (e.g. CD-monotonicity
-        # tests). Each element exposes ``.total_objective`` and
-        # ``.lambdas`` fields — the only attributes the existing
-        # consumers read. Building real `GroupedSolveResult` objects per
-        # call would defeat the FFI saving we just landed.
+        # Lightweight per-call records for the CD-monotonicity tests
+        # that consume `RatebookResult.per_factor_results`. Each element
+        # exposes ``.total_objective`` and ``.lambdas`` — the only
+        # attributes those tests read. Building real `GroupedSolveResult`
+        # objects per call would defeat the FFI saving the Rust CD
+        # pass landed.
         per_call_objectives = cd_result.per_call_total_objectives
         per_call_lambdas = cd_result.per_call_lambdas
         per_factor_results: list[PerFactorRecord] = [
@@ -561,13 +637,19 @@ class RatebookOptimiser:
         n_quotes = grid.n_quotes
         candidates = self._build_candidates()
 
-        # Build a `FactorContext` per candidate column in one Rust-side
-        # pass. Column order matches `factors.columns`; the contexts own
-        # the precomputed group mappings so the screening loop below
-        # avoids per-call string ferrying and group-mapping rebuilds.
-        all_contexts = build_factor_contexts_py(
-            factors, [[col] for col in factors.columns], "\x1f"
+        # Build a `FactorContext` per candidate column via the same
+        # opaque wrapper the public path uses. The wrapper does
+        # alignment validation against `grid.quote_ids`; even though
+        # the screening loop only uses each per-factor `FactorContext`
+        # to drive `solve_grouped_py`, routing through the public
+        # builder keeps the dataframe-extraction path in one place.
+        contexts_wrapper = RatebookFactorContexts.from_dataframe(
+            factors,
+            [[col] for col in factors.columns],
+            quote_id=self.quote_id if self.quote_id in factors.columns else None,
+            expected_quote_ids=grid.quote_ids,
         )
+        all_contexts = contexts_wrapper._factor_contexts_for_solver()
 
         lifts: list[tuple[str, float]] = []
         for col, ctx in zip(factors.columns, all_contexts):
@@ -608,7 +690,7 @@ class RatebookOptimiser:
     def frontier(
         self,
         df_or_grid: pl.DataFrame | QuoteGrid,
-        factors: pl.DataFrame,
+        factors: pl.DataFrame | RatebookFactorContexts,
         *,
         threshold_ranges: dict[str, tuple[float, float]],
         n_points_per_dim: int = 5,
@@ -762,19 +844,41 @@ class RatebookOptimiser:
         # so omitting them is equivalent to including them.
         order = _nn_order(combos, [threshold_ranges[n] for n in swept_names])
 
-        # Pre-build factor contexts once for the whole sweep. The
-        # `factors` DataFrame is constant across every visited point, so
-        # without this hoist each per-point `self.solve()` would
-        # re-cast the factor columns to Utf8 and re-hash ~100k labels per
-        # factor through `build_group_mapping`. Resolving
-        # `factor_columns` once here also avoids re-running the
-        # `_discover_structure` screen on every point.
-        resolved_factor_specs = factor_columns or self.factor_columns
-        if resolved_factor_specs is None:
-            resolved_factor_specs = self._discover_structure(df_or_grid, factors)
-        frontier_factor_contexts = build_factor_contexts_py(
-            factors, resolved_factor_specs, "\x1f"
-        )
+        # Pre-build a `RatebookFactorContexts` once for the whole
+        # sweep. The same opaque handle is threaded through the public
+        # `factors` argument on every per-point `self.solve()` call,
+        # so each point pays only an O(1) fingerprint check rather
+        # than re-extracting labels and re-hashing the factor source.
+        if isinstance(factors, RatebookFactorContexts):
+            # Contexts mode: take the specs from the wrapper. Reject
+            # an explicit `factor_columns` that disagrees.
+            resolved_factor_specs = _resolve_factor_specs_from_contexts(
+                factors, factor_columns, self.factor_columns
+            )
+            frontier_factor_contexts = factors
+        else:
+            # DataFrame mode: resolve specs (auto-discovery permitted),
+            # then build contexts once with `expected_quote_ids` set so
+            # every per-point solve's fingerprint check passes
+            # trivially. For sum-only sweeps we already have a grid
+            # built; ratio sweeps build per-point grids inside
+            # solve(), so we derive expected quote IDs from the
+            # DataFrame directly.
+            resolved_factor_specs = factor_columns or self.factor_columns
+            if resolved_factor_specs is None:
+                resolved_factor_specs = self._discover_structure(df_or_grid, factors)
+            expected_quote_ids = _expected_quote_ids_for_frontier(
+                df_or_grid, grid, self.quote_id
+            )
+            frontier_factor_contexts = RatebookFactorContexts.from_dataframe(
+                factors,
+                resolved_factor_specs,
+                quote_id=(
+                    self.quote_id if self.quote_id in factors.columns else None
+                ),
+                separator="\x1f",
+                expected_quote_ids=expected_quote_ids,
+            )
 
         # Sweep — predictor-corrector warm starting. The frontier visits
         # points in nearest-neighbour order, so the optimal λ vector
@@ -834,11 +938,10 @@ class RatebookOptimiser:
 
             result = self.solve(
                 grid,
-                factors,
+                frontier_factor_contexts,
                 factor_columns=resolved_factor_specs,
                 lambdas=init_lambdas,
                 _constraints_override=modified_constraints,
-                _factor_contexts_override=frontier_factor_contexts,
             )
 
             prev2_thresholds = prev_thresholds
@@ -1060,3 +1163,134 @@ def _count_steps(df: pl.DataFrame, quote_id_col: str) -> int:
         return 0
     first_qid = df[quote_id_col][0]
     return int((df[quote_id_col] == first_qid).sum())
+
+
+def _resolve_factor_specs_from_contexts(
+    factors: RatebookFactorContexts,
+    factor_columns_arg: list[list[str]] | None,
+    optimiser_factor_columns: list[list[str]] | None,
+) -> list[list[str]]:
+    """Pick the authoritative factor specs when the caller supplied a
+    :class:`RatebookFactorContexts`. The contexts' own
+    ``factor_specs`` are the source of truth; any other source must
+    either match or be absent.
+
+    Auto-discovery is unavailable in contexts mode because the contexts
+    already encode the chosen factors — re-discovering would either
+    contradict them or be a wasted scan.
+    """
+    contexts_specs = factors.factor_specs
+    if factor_columns_arg is not None and factor_columns_arg != contexts_specs:
+        raise ValueError(
+            f"factor_columns argument {factor_columns_arg} conflicts with "
+            f"RatebookFactorContexts.factor_specs {contexts_specs}. The "
+            f"contexts' specs are authoritative; either omit factor_columns "
+            f"or rebuild the contexts with the desired specs."
+        )
+    if (
+        optimiser_factor_columns is not None
+        and optimiser_factor_columns != contexts_specs
+    ):
+        raise ValueError(
+            f"RatebookOptimiser.factor_columns={optimiser_factor_columns} "
+            f"conflicts with RatebookFactorContexts.factor_specs={contexts_specs}. "
+            f"The contexts' specs are authoritative; either reconstruct the "
+            f"optimiser with matching factor_columns=None (or matching specs) "
+            f"or rebuild the contexts."
+        )
+    return contexts_specs
+
+
+def _resolve_factor_contexts(
+    factors: pl.DataFrame | RatebookFactorContexts,
+    factor_specs: list[list[str]],
+    *,
+    grid: QuoteGrid,
+    quote_id_col: str,
+) -> RatebookFactorContexts:
+    """Coerce ``factors`` into a :class:`RatebookFactorContexts` whose
+    fingerprint matches ``grid.quote_id_fingerprint``.
+
+    For DataFrame inputs we build the contexts here with
+    ``expected_quote_ids=grid.quote_ids`` so the resulting fingerprint
+    is, by construction, identical to the grid's. For pre-built
+    contexts we verify the fingerprint instead and reject mismatches.
+
+    Validation rules:
+
+    * contexts with ``quote_id_fingerprint is None`` are rejected —
+      they were built without a quote-id source AND without
+      ``expected_quote_ids``, so no alignment can be proven.
+    * contexts with a fingerprint that disagrees with the grid are
+      rejected — they were built against a different quote axis.
+    * contexts whose ``n_quotes`` disagrees with the grid are rejected
+      with both counts in the message.
+    """
+    if isinstance(factors, RatebookFactorContexts):
+        if factors.n_quotes != grid.n_quotes:
+            raise ValueError(
+                f"RatebookFactorContexts has n_quotes={factors.n_quotes} "
+                f"but QuoteGrid has n_quotes={grid.n_quotes}"
+            )
+        if factors.quote_id_fingerprint is None:
+            raise ValueError(
+                "RatebookFactorContexts has no quote_id_fingerprint; build "
+                "the contexts with expected_quote_ids=quote_grid.quote_ids "
+                "(or include a quote_id column) so solve-time alignment can "
+                "be proven."
+            )
+        if factors.quote_id_fingerprint != grid.quote_id_fingerprint:
+            raise ValueError(
+                f"RatebookFactorContexts quote_id_fingerprint "
+                f"0x{factors.quote_id_fingerprint:016x} does not match "
+                f"QuoteGrid fingerprint 0x{grid.quote_id_fingerprint:016x}. "
+                f"The contexts were built against a different quote axis; "
+                f"rebuild them against this grid's quote_ids."
+            )
+        return factors
+
+    # DataFrame mode: build contexts aligned to the grid quote axis.
+    # If the DataFrame happens to include a quote_id column, pass it
+    # through so the chunked-builder path validates IDs explicitly;
+    # otherwise fall back to positional-trust against
+    # expected_quote_ids=grid.quote_ids.
+    return RatebookFactorContexts.from_dataframe(
+        factors,
+        factor_specs,
+        quote_id=quote_id_col if quote_id_col in factors.columns else None,
+        separator="\x1f",
+        expected_quote_ids=grid.quote_ids,
+    )
+
+
+def _expected_quote_ids_for_frontier(
+    df_or_grid: pl.DataFrame | QuoteGrid,
+    grid: pl.DataFrame | QuoteGrid,
+    quote_id_col: str,
+) -> list[str]:
+    """Derive the canonical (lex-sorted) quote-id sequence the frontier
+    will solve against.
+
+    In sum-constraint frontier mode ``grid`` is already a built
+    :class:`QuoteGrid` — we just return its ``quote_ids``. In
+    ratio-constraint mode the frontier defers grid-build to per-point
+    solves (each point linearises with a different ``L``), so ``grid``
+    here is still the raw DataFrame. In that case we compute the
+    sorted unique ``quote_id`` values from the DataFrame, matching the
+    order ``QuoteGridBuilder`` will lex-sort them into on every
+    per-point build.
+    """
+    if isinstance(grid, QuoteGrid):
+        return grid.quote_ids
+    # Ratio-frontier path: grid is still a DataFrame. Derive the
+    # canonical quote_ids the same way QuoteGridBuilder.build() will,
+    # via cast-to-str then lex-sort over unique values.
+    df = grid if isinstance(grid, pl.DataFrame) else df_or_grid
+    assert isinstance(df, pl.DataFrame), (
+        "frontier(): expected DataFrame for quote-id derivation in ratio mode"
+    )
+    return (
+        df.select(pl.col(quote_id_col).cast(pl.Utf8).unique().sort())
+        .to_series()
+        .to_list()
+    )

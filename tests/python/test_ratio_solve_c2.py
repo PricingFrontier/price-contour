@@ -1127,8 +1127,13 @@ class TestRatioSolvePerformance:
         sum_solver.solve(df)
         ratio_solver.solve(df)
 
-        sum_time = _measure_min(lambda: sum_solver.solve(df), repeats=3)
-        ratio_time = _measure_min(lambda: ratio_solver.solve(df), repeats=3)
+        # 10 repeats (rather than the default 3) so the per-call wall
+        # time of ~2-20ms can hit the noise floor even on a CI box
+        # under concurrent load. With 3 reps the min was occasionally
+        # inflated by scheduler stalls, tripping the 8x budget on
+        # otherwise-regression-free runs.
+        sum_time = _measure_min(lambda: sum_solver.solve(df), repeats=10)
+        ratio_time = _measure_min(lambda: ratio_solver.solve(df), repeats=10)
 
         # Sanity: both must complete in finite time.
         assert math.isfinite(sum_time) and sum_time > 0

@@ -5,17 +5,14 @@
 //! receive a `HashMap<String, HashMap<String, Option<f64>>>` from Python
 //! and need to:
 //!
-//! 1. Surface a migration `ValueError` for the removed `min_abs` /
-//!    `max_abs` keys (mentioning both old and new key names so the
-//!    message stays in sync with the Python-side validator).
-//! 2. Reject zero or multiple direction keys per constraint
+//! 1. Reject zero or multiple direction keys per constraint
 //!    (`{"volume": {"min": 100, "max": 200}}` is ambiguous).
-//! 3. Reject NaN / inf threshold values when the value is numeric. A
-//!    `None` value is permitted (B1 frontier-only marker); the finite
+//! 2. Reject NaN / inf threshold values when the value is numeric. A
+//!    `None` value is permitted (frontier-only marker); the finite
 //!    check is guarded by an `if let Some(v)` so it does not fire for
 //!    `None`.
-//! 4. Confirm the constraint name is a column in the grid.
-//! 5. Iterate `grid.constraint_names` (NOT the user `HashMap`) when
+//! 3. Confirm the constraint name is a column in the grid.
+//! 4. Iterate `grid.constraint_names` (NOT the user `HashMap`) when
 //!    emitting the spec vector so spec[k] aligns with grid column k —
 //!    `argmax.rs` assumes that alignment.
 //!
@@ -24,7 +21,7 @@
 //! solve() requires a fixed threshold); the frontier emits a template
 //! with threshold=0 plus a (lo, hi) range and is happy with `None` (the
 //! sweep supplies the value). Both share `validate_constraints_dict`
-//! for (1)–(4) and `direction_for` / `is_pct_key` for direction
+//! for (1)–(3) and `direction_for` / `is_pct_key` for direction
 //! extraction.
 
 use std::collections::HashMap;
@@ -33,38 +30,20 @@ use price_contour_core::{ConstraintDirection, QuoteGrid};
 use pyo3::exceptions::PyValueError;
 use pyo3::PyResult;
 
-/// The four valid post-A1 direction keys.
+/// The four valid direction keys.
 pub(crate) const VALID_KEYS: [&str; 4] = ["min", "max", "min_pct", "max_pct"];
 
 /// Validate a user-supplied constraints dict against the grid.
 ///
 /// Surfaces the same errors the Python-side `_validate_constraint_dict`
-/// would, with messages that stay close enough to keep the regex tests
-/// (e.g. `RE_MIN_ABS_REMOVED`) passing on either side.
-///
-/// Does NOT walk the dict in any particular order for emission — the
-/// caller is responsible for iterating `grid.constraint_names` when
+/// would. Does NOT walk the dict in any particular order for emission —
+/// the caller is responsible for iterating `grid.constraint_names` when
 /// building the spec vector. We only validate here.
 pub(crate) fn validate_constraints_dict(
     constraints: &HashMap<String, HashMap<String, Option<f64>>>,
     grid: &QuoteGrid,
 ) -> PyResult<()> {
     for (name, spec_dict) in constraints {
-        // Surface the migration hint BEFORE the multi-key / unknown-key
-        // errors so users see the rename path immediately.
-        if spec_dict.contains_key("min_abs") {
-            return Err(PyValueError::new_err(
-                "'min_abs' has been renamed to 'min'; \
-                 the previous fraction-of-baseline 'min' is now 'min_pct'",
-            ));
-        }
-        if spec_dict.contains_key("max_abs") {
-            return Err(PyValueError::new_err(
-                "'max_abs' has been renamed to 'max'; \
-                 the previous fraction-of-baseline 'max' is now 'max_pct'",
-            ));
-        }
-
         if !grid.constraint_names.iter().any(|n| n == name) {
             return Err(PyValueError::new_err(format!(
                 "Constraint '{}' not found in DataFrame columns. Available: {:?}",

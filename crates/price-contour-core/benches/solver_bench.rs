@@ -26,6 +26,7 @@ fn make_grid(n_quotes: usize, n_steps: usize) -> QuoteGrid {
         constraints: vec![constraint],
         constraint_names: vec!["volume".to_string()],
         quote_ids,
+        quote_id_fingerprint: 0,
     };
     grid.validate().unwrap();
     grid

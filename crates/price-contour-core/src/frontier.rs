@@ -575,25 +575,18 @@ pub fn sweep_frontier(
     // a threshold range and `n_constraints == 1` means a genuinely
     // 1-D lambda search.
     //
-    // Direct-Rust callers with `n_constraints >= 2` and one degenerate
-    // axis (`lo == hi` for that axis) effectively reduce to a 1-D
-    // problem but still take the subgradient path here. The
-    // `debug_assert!` below pins the contract that the Python wrapper
-    // upholds; if a Rust caller hits it, the right move is to collapse
-    // the degenerate axis upstream.
+    // `n_constraints >= 2` with degenerate axes (lo == hi for one or
+    // more) is a valid request — e.g. "evaluate at this single point
+    // under the full multi-axis subgradient solver" or "scan one
+    // axis with the other pinned to a constant". The math handles
+    // pinned axes correctly: the solver still has to find a λ that
+    // satisfies the pinned threshold; it just doesn't sweep it. We
+    // accept a small perf wart on multi-axis sweeps that could be
+    // collapsed to bisection upstream — the wart is documented but
+    // not enforced, because enforcement breaks legitimate callers
+    // (e.g. `test_subgradient_iteration_budget_exhausted_reason_emitted`
+    // pins both axes to a corner point to force non-convergence).
     let use_bisection = n_constraints == 1;
-    debug_assert!(
-        use_bisection
-            || frontier_config
-                .threshold_ranges
-                .iter()
-                .all(|&(lo, hi)| lo != hi),
-        "sweep_frontier called with n_constraints={n_constraints} and a \
-         degenerate threshold_range axis (lo == hi). Collapse the \
-         degenerate axis upstream so dispatch picks the 1-D bisection \
-         fast path; otherwise the subgradient solver wastes lambda \
-         updates on the pinned axis."
-    );
 
     // Pre-compute baselines once. The subgradient path additionally
     // needs scale factors; the bisection path doesn't, so skip that
@@ -912,6 +905,7 @@ mod tests {
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         }
     }
 
@@ -1003,6 +997,7 @@ mod tests {
             constraints: vec![vol, loss],
             constraint_names: vec!["volume".to_string(), "loss".to_string()],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         }
     }
 
@@ -1221,6 +1216,7 @@ mod tests {
             constraints: vec![vol],
             constraint_names: vec!["volume".to_string()],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         }
     }
 
@@ -1655,6 +1651,7 @@ mod tests {
             constraints: vec![signed],
             constraint_names: vec!["signed".to_string()],
             quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
         };
         let baseline_abs = grid.baseline_totals().1[0].abs();
         // Target 50 (well above the lambda=0 zero baseline) — needs

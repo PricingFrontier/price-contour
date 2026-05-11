@@ -137,6 +137,7 @@ mod tests {
             ]],
             constraint_names: vec!["volume".to_string()],
             quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+            quote_id_fingerprint: 0,
         }
     }
 

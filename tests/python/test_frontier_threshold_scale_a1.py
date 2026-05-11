@@ -15,8 +15,6 @@ the user supplied** in ``threshold_ranges``:
 
 This rule applies to both numeric AND ``None`` threshold constraints,
 in Online and Ratebook frontier paths.
-
-Old ``min_abs`` / ``max_abs`` keys must error in the frontier path too.
 """
 
 from __future__ import annotations
@@ -25,12 +23,6 @@ import pytest
 
 import price_contour as pc
 from helpers import make_small_df
-
-
-# Match against str(ValueError) — the message must mention both the
-# removed key and its replacement.
-RE_MIN_ABS_REMOVED = r"(?s)min_abs.*\bmin\b|\bmin\b.*min_abs"
-RE_MAX_ABS_REMOVED = r"(?s)max_abs.*\bmax\b|\bmax\b.*max_abs"
 
 
 def _baseline_volume(df) -> float:
@@ -226,7 +218,7 @@ class TestFrontierMixed:
 
 
 # ---------------------------------------------------------------------------
-# 4. Frontier with old `min_abs` / `max_abs` keys must error
+# 4. Three-axis frontier with mixed absolute/relative threshold units
 # ---------------------------------------------------------------------------
 
 
@@ -346,35 +338,3 @@ class TestFrontierThreeMixedConstraints:
         )
 
 
-class TestFrontierRejectsOldAbsKeys:
-    def test_frontier_with_min_abs_raises(self):
-        """Frontier called with old ``min_abs`` constraint must raise
-        ``ValueError`` mentioning both old and new key names."""
-        df = make_small_df(n_quotes=50, n_steps=5)
-        # Constructor must reject before frontier even runs.
-        with pytest.raises(ValueError, match=RE_MIN_ABS_REMOVED):
-            solver = pc.OnlineOptimiser(
-                objective="expected_income",
-                constraints={"volume": {"min_abs": 50.0}},
-                max_iter=50,
-            )
-            # Guard: if construction did not raise, frontier must.
-            solver.frontier(
-                df,
-                threshold_ranges={"volume": (40.0, 60.0)},
-                n_points_per_dim=3,
-            )
-
-    def test_frontier_with_max_abs_raises(self):
-        df = make_small_df(n_quotes=50, n_steps=5)
-        with pytest.raises(ValueError, match=RE_MAX_ABS_REMOVED):
-            solver = pc.OnlineOptimiser(
-                objective="expected_income",
-                constraints={"loss_ratio": {"max_abs": 1.0}},
-                max_iter=50,
-            )
-            solver.frontier(
-                df,
-                threshold_ranges={"loss_ratio": (0.8, 1.0)},
-                n_points_per_dim=3,
-            )

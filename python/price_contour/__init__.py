@@ -19,12 +19,17 @@ except PackageNotFoundError:
 from price_contour.apply import ApplyOptimiser, apply_from_grid
 from price_contour.builder import QuoteGrid, QuoteGridBuilder
 from price_contour.frontier import FrontierResult, FrontierResultLike, frontier_summary
-from price_contour.ratebook import RatebookOptimiser, RatebookResult
+from price_contour.ratebook import (
+    RatebookOptimiser,
+    RatebookResult,
+    build_ratebook_factor_contexts_from_parquet_chunked,
+)
 from price_contour.solver import OnlineOptimiser
 from price_contour._price_contour import (
     ApplyResult,
     ChunkedApplyResult,
     GroupedSolveResult,
+    RatebookFactorContexts,
     SolveResult,
     apply_lambdas_to_parquet_chunked_py as _apply_lambdas_to_parquet_chunked_inner,
     build_grid_from_parquet_py as _build_grid_from_parquet_inner,
@@ -293,11 +298,13 @@ __all__ = [
     "OnlineOptimiser",
     "QuoteGrid",
     "QuoteGridBuilder",
+    "RatebookFactorContexts",
     "RatebookOptimiser",
     "RatebookResult",
     "SolverPath",
     "SolveResult",
     "build_grid_from_parquet",
     "build_grid_from_parquet_chunked",
+    "build_ratebook_factor_contexts_from_parquet_chunked",
     "frontier_summary",
 ]

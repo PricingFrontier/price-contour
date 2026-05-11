@@ -20,8 +20,6 @@ Validation rules (all enforced at construction):
 * Exactly one direction key alongside the pair (matching the sum-constraint
   rule); zero or multiple → error.
 * Direction values follow B1: numeric or ``None``; NaN/inf rejected.
-* The ``min_abs`` / ``max_abs`` migration error fires before the ratio
-  detection branch.
 
 Schema validation against the DataFrame:
 * Both numerator and denominator columns must exist.
@@ -93,10 +91,6 @@ def make_ratio_df_with_nulls(
 # implemented", AND it must name the offending constraint label so the user
 # can act on it.
 RE_C2_STUB = r"(?si)C2|not yet supported|not yet implemented|ratio constraints"
-
-
-# Migration regexes shared with A1.
-RE_MIN_ABS_REMOVED = r"(?s)min_abs.*\bmin\b|\bmin\b.*min_abs"
 
 
 # ---------------------------------------------------------------------------
@@ -454,21 +448,6 @@ class TestRatioConstraintValidation:
                         "denominator": "premium",
                         "max": 0.65,
                         "max_pct": 1.05,
-                    },
-                }
-            )
-
-    def test_min_abs_alongside_ratio_still_raises_migration_error(self):
-        """``min_abs`` is removed; the migration error must fire even
-        when the spec is otherwise a ratio shape. Pinned so the ratio
-        detection branch does NOT short-circuit the rename hint."""
-        with pytest.raises(ValueError, match=RE_MIN_ABS_REMOVED):
-            _validate_constraint_dict(
-                {
-                    "loss_ratio": {
-                        "numerator": "incurred",
-                        "denominator": "premium",
-                        "min_abs": 0.65,
                     },
                 }
             )

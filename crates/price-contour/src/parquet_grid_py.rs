@@ -284,23 +284,11 @@ pub(crate) fn build_projection(
     cols
 }
 
-/// Detect `n_steps` from a probe DataFrame, confirming with a one-row peek
-/// past the probe if the probe didn't observe a quote boundary itself.
-//
-// `pub(crate)` so the chunked apply path can reuse this exact detection
-// logic — keeps the chunked-parquet contract consistent across read/apply.
-///
-/// A correct sorted probe runs `scenario_index` from `0..n_steps`, then
-/// resets to `0` for the next quote. The position of the first reset is
-/// `n_steps`. When no reset is observed within the probe, the inference
-/// `n_steps = max + 1` is only a lower bound, so we read one extra row
-/// (`probe.height()`) and confirm its `scenario_index == 0`. The peek is
-/// skipped when the probe IS the whole file (no more rows to peek at).
 /// Stream a parquet file in aligned chunks, invoking `callback` for each
 /// chunk's DataFrame. The chunked-parquet ingest contract — column-name
-/// validation, metadata caching, n_steps detection, divisibility check, and
-/// quote-aligned slicing — is handled here once so every chunked-parquet
-/// entry point shares a single implementation.
+/// validation, metadata caching, `n_steps` detection, divisibility check,
+/// and quote-aligned slicing — is handled here once so every
+/// chunked-parquet entry point shares a single implementation.
 ///
 /// Returns the resolved `n_steps` so the caller can configure downstream
 /// state (e.g., `PyQuoteGridBuilder` with `n_steps` locked).
@@ -389,6 +377,21 @@ where
     Ok(n_steps)
 }
 
+/// Detect `n_steps` from a probe DataFrame, confirming with a one-row
+/// peek past the probe if the probe didn't observe a quote boundary
+/// itself.
+///
+/// A correct sorted probe runs `scenario_index` from `0..n_steps`, then
+/// resets to `0` for the next quote. The position of the first reset is
+/// `n_steps`. When no reset is observed within the probe, the inference
+/// `n_steps = max + 1` is only a lower bound, so we read one extra row
+/// (`probe.height()`) and confirm its `scenario_index == 0`. The peek
+/// is skipped when the probe IS the whole file (no more rows to peek
+/// at).
+///
+/// `pub(crate)` so the chunked apply path can reuse this exact detection
+/// logic — keeps the chunked-parquet contract consistent across
+/// read/apply.
 pub(crate) fn detect_n_steps(
     probe: &DataFrame,
     scenario_index_col: &str,
