@@ -1,56 +1,31 @@
-Review this plan thoroughly before making any code changes. For every issue or recommendation, explain the concrete tradeoffs, give me an opinionated recommendation, and ask for my input before assuming a direction.
-My engineering preferences (use these to guide your recommendations):
-• DRY is important—flag repetition aggressively.
-• Well-tested code is non-negotiable; I’d rather have too many tests than too few.
-• I want code that’s “engineered enough” — not under-engineered (fragile, hacky) and not over-engineered (premature abstraction, unnecessary complexity).
-• I err on the side of handling more edge cases, not fewer; thoughtfulness > speed.
-• Bias toward explicit over clever.
+# Repository instructions
 
-Architecture review
-Evaluate:
-• Overall system design and component boundaries.
-• Dependency graph and coupling concerns.
-• Data flow patterns and potential bottlenecks.
-• Scaling characteristics and single points of failure.
-• Security architecture (auth, data access, API boundaries).
+Read and follow `AGENTS.md` in this repository root. It is the authoritative source for engineering priorities, GitHub access, models and delegation, the fix-and-tweak workflow, targeted verification, releases, and the steps before a pull request. Do not layer older interactive plan-review, agent-pair, or review-team rules on top of these files.
 
-Code quality review
-Evaluate:
-• Code organization and module structure.
-• DRY violations—be aggressive here.
-• Error handling patterns and missing edge cases (call these out explicitly).
-• Technical debt hotspots.
-• Areas that are over-engineered or under-engineered relative to my preferences.
+# Model
 
-Test review
-Evaluate:
-• Test coverage gaps (unit, integration, e2e).
-• Test quality and assertion strength.
-• Missing edge case coverage—be thorough.
-• Untested failure modes and error paths.
+Run Claude Code sessions on Opus 5.5 (`/model opus`); it is the best value for both judgment and implementation. Subagents inherit it; do not pin cheaper tiers or set `CLAUDE_CODE_SUBAGENT_MODEL`. When to delegate is in AGENTS.md's "Models and delegation". Do not enable Fast mode for routine repository work.
 
-Performance review
-Evaluate:
-• N+1 queries and database access patterns.
-• Memory-usage concerns.
-• Caching opportunities.
-• Slow or high-complexity code paths.
+# Review policy: Codex reviews once per pull request
 
-For each issue you find
-For every specific issue (bug, smell, design concern, or risk):
-• Describe the problem concretely, with file and line references.
-• Present 2–3 options, including “do nothing” where that’s reasonable.
-• For each option, specify: implementation effort, risk, impact on other code, and maintenance burden.
-• Give me your recommended option and why, mapped to my preferences above.
-• Then explicitly ask whether I agree or want to choose a different direction before proceeding.
+Reviews use a Codex model, because a review from another model family catches failures that a same-family review shares. AGENTS.md's "Code review with Codex" has the commands, the checklist, the severity scale and the approval gate. The review surface is exactly:
 
-Workflow and interaction
-• Do not assume my priorities on timeline or scale.
-• After each section, pause and ask for my feedback before moving on.
+- Code / PR / diff review: once over the whole branch diff before the PR is opened or updated (AGENTS.md "Before a pull request"). Do not review each commit or package separately.
+- Plan, design, or spec review: the same command with the plan-review prompt.
+- Second opinion on a judgment call: the same command, advisory and never gating.
 
-BEFORE YOU START:
-Ask if I want one of two options:
-1/ BIG CHANGE: Work through this interactively, one section at a time (Architecture → Code Quality → Tests → Performance) with at most 4 top issues in each section.
-2/ SMALL CHANGE: Work through interactively ONE question per review section.
+Run the Codex commands in the background and keep their state in the session scratchpad.
 
-FOR EACH STAGE OF REVIEW: output the explanation and pros and cons of each stage’s questions AND your opinionated recommendation and why, then use AskUserQuestion. Also NUMBER issues and give LETTERS for options and when using AskUserQuestion make sure each option clearly labels the issue NUMBER and option LETTER so the user doesn’t get confused. Make the recommended option always the 1st option.
+Do not delegate review to Claude subagents and do not run Claude-vs-Claude review workflows. The main session still inspects every subagent diff itself (that is verification, not review) and owns the completion decision after Codex findings are resolved or rebutted.
+
+# Tests and CI
+
+Run only the affected tests locally, as AGENTS.md's "Targeted verification" describes, and never the full Rust or Python suite unless the user asks; this applies to subagents too. Push and let CI run the full suite. Watch the PR's checks with a `Monitor` on `gh pr checks`, not a sleep loop. On red, read the failing job's log with `gh`, reproduce only that test locally if the cause is unclear, fix it, and push again until CI is green.
+
+# Downstream consumer
+
+haute (`../haute`) consumes this library, usually through an editable install of this checkout. A change to the public Python API, a result's shape, or a numerical rule is a change to haute's contract: say so in the PR, and bump the version according to "Releases" in AGENTS.md.
+
+# Workflows
+
+Dynamic workflows are opt-in ("use a workflow" / `ultracode`). Stages run on Opus 5.5; set effort per stage (`low` for mechanical fan-out, `medium` for bounded implementation). Keep the medium size guideline (under 15 agents) unless the task genuinely calls for more.
