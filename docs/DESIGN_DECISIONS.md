@@ -205,7 +205,7 @@ Output: optimal_factor_value per group (G,), λ values (K,)
 If `residual × candidate` falls outside the scored grid range (e.g. residual=1.15, candidate=1.15 → target=1.32 but grid max=1.20), the lookup clamps to the grid boundary. This is handled by:
 
 1. **Wider scored grid for ratebook.** Recommend scoring at e.g. [0.60, 1.50] instead of [0.80, 1.20] when ratebook mode is intended. The price scenario node in haute would use a wider range.
-2. **Clamping diagnostics.** The solver reports what percentage of lookups hit the boundary, so the user knows if the grid is too narrow.
+2. **Clamping diagnostics.** `clamp_rate` reports the fraction of (quote, candidate) lookups that fell outside the grid during the search, and `n_quotes_clamped_low` / `n_quotes_clamped_high` count the quotes whose final product lies outside it (§13.11).
 3. **Natural constraint.** CD tends toward moderate factor values — extreme values perform poorly in the Lagrangian because they push many quotes to grid boundaries where values are suboptimal.
 
 ### Rust Structs
@@ -1086,3 +1086,267 @@ class OptimiserConfig(TypedDict, total=False):
 | 16 | **Factor selection from upstream banding nodes** | Following RatingStepEditor's `extractBandingLevels()` pattern, factor columns are discovered from upstream banding nodes rather than typed manually. The user sees checkboxes with level counts, not raw column names. |
 | 17 | **Frontier point selection in results panel** | The frontier is generated as part of the solve, then the user interactively picks a point on the Pareto curve. The selected point's lambdas are what gets logged to MLflow and deployed. This separates "explore the tradeoff space" from "commit to a solution". |
 | 18 | **Async solve with polling** | The solve runs as an async backend job (same pattern as ModellingConfig training). The UI polls for progress (iteration count, objective, constraint satisfaction, elapsed time). User can cancel early and get the best feasible solution found so far. |
+| 19 | **One canonical ratebook evaluation** | Every reported ratebook number (solve totals, frontier rows, per-quote results) comes from one Rust kernel that evaluates each quote at the nearest grid step of the f32 product of the final factor tables. The CD loop's incrementally updated multiplier is a search device, never a reported value. See §13.1. |
+| 20 | **Per-quote ratebook results are public** | `RatebookResult.quote_results` and `RatebookOptimiser.evaluate()` expose each quote's step, scenario value, objective, constraints, factor product and clamp flags, so consumers never reconstruct the step rule. See §13.2–13.3. |
+| 21 | **Absolute bounds are reported, not derived** | Every frontier row and solve result carries the absolute bound of every constraint (`bound_<c>`, `constraint_bounds`), so a consumer never multiplies a pct fraction by a baseline itself. See §13.5. |
+| 22 | **One baseline rule** | The baseline is one grid-wide step: the scenario value nearest 1.0 in f32, lowest index on a tie. Sum, pct and ratio constraints all use it. See §13.6. |
+| 23 | **Fail loud at the consumer boundary** | No reported value is a silent default (0.0, NaN, empty). Missing data raises; data that is not persisted raises `ResultUnavailableError` on access. See §13.7 and §13.10. |
+| 24 | **Deterministic outputs** | Dicts follow constraint order, reductions have a fixed order, and repeated runs give bit-identical results. See §13.8. |
+
+---
+
+## 13. Consumer Contract (0.5.0)
+
+### Context
+
+haute consumes price_contour's results directly: it shows them to reviewers,
+publishes them, and deploys ratebook factor tables. A 25 September 2026
+review of the seam (haute `specs/roadmap/optimiser-validation.md`, "Price-contour
+context") found that several numbers a consumer needs were private,
+positional, inferred, or silently defaulted:
+
+- ratebook solves computed a per-quote frame and discarded it;
+- reported ratebook totals came from an incrementally updated f32 multiplier
+  that no consumer can reproduce from the published factor tables;
+- a ratebook frontier point could be reproduced only by re-solving, which can
+  land on different factor tables than the row the user picked;
+- frontier `threshold_*` holds a fraction for pct constraints, so consumers
+  derived absolute bounds themselves;
+- ratio constraints used an exact `scenario_value == 1.0` baseline while every
+  other baseline used nearest-1.0;
+- `per_factor_results` identified factors by position and was silently empty
+  after `load()`;
+- several outputs filled missing values with `0.0`, and dict outputs came out
+  in hash order.
+
+0.5.0 fixes all of these. It changes public result shapes and adds raised
+errors, so it is a minor version bump.
+
+### 13.1 The canonical ratebook evaluation
+
+A new Rust kernel, `evaluate_ratebook(grid, mappings, factor_values)` in
+`crates/price-contour-core/src/solver/ratebook_eval.rs`, is the only place a
+ratebook result is evaluated for reporting.
+
+For each quote *i*, in factor-spec order:
+
+1. **Product.** `p_i = 1.0f32`, then `p_i *= factor_values[f][group_of_f[i]]`
+   for each factor *f*, in f32, left to right.
+2. **Step.** `step_i = nearest_step(p_i)`, the same function the grouped
+   solver uses: the nearest scenario value; `p ≤ sv[0]` gives 0 and
+   `p ≥ sv[n−1]` gives n−1; an exact midpoint gives the lower step.
+3. **Clamp flags.** `clamped_low_i = p_i < sv[0]` and
+   `clamped_high_i = p_i > sv[n−1]` (strict: a product exactly on an end value
+   is not clamped).
+4. **Totals.** The objective and every constraint are read at `step_i` (f32)
+   and accumulated in f64. The reduction is deterministic: fixed-size chunks
+   summed in parallel, then combined sequentially in chunk order.
+
+Validation, all raising: at least one factor; one factor-value vector per
+mapping; every mapping covers every quote; each factor-value vector has one
+value per group; every value is finite and > 0.
+
+`RatebookOptimiser.solve()` runs the CD loop exactly as before, then calls the
+kernel once on the final factor tables. The result's `total_objective`,
+`total_constraints`, clamp counts and per-quote frame all come from that call.
+`lambdas` still come from the last inner solve. The CD loop's incremental
+multiplier (`overall_mult`) is a search device only; reported totals can differ
+from 0.4.x by f32 rounding, and a quote whose incremental product sat on a
+midpoint can change step.
+
+The kernel costs one O(n_quotes × n_factors) pass, negligible next to CD.
+
+### 13.2 `RatebookResult` additions
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `quote_results` | `pl.DataFrame` | Per-quote evaluation (schema below). Built lazily and cached. |
+| `n_quotes` | `int` | Quotes evaluated. |
+| `n_quotes_clamped_low` / `n_quotes_clamped_high` | `int` | Quotes whose factor product lies strictly below / above the scenario range. |
+| `scenario_values` | `tuple[float, ...]` | The grid's scenario values, ascending. |
+| `baseline_scenario_value` | `float` | The scenario value used as the baseline (§13.6). |
+| `constraint_bounds` | `dict[str, float]` | Absolute bound of every constraint (§13.5). |
+
+`quote_results` schema, in this column order (`quote_results_schema(constraint_names)`
+returns it):
+
+| Column | Dtype |
+|---|---|
+| `quote_id` | String |
+| `optimal_step` | Int32 |
+| `optimal_scenario_value` | Float32 |
+| `optimal_objective` | Float32 |
+| `optimal_<c>` for each constraint, in constraint order | Float32 |
+| `factor_product` | Float32 |
+| `clamped_low` | Boolean |
+| `clamped_high` | Boolean |
+
+Rows follow the grid's quote order (quote IDs cast to string and sorted).
+With ratio constraints, the frame gains the numerator and denominator columns
+exactly as the online `SolveResult.dataframe` does. The retained state is
+compact (steps, products and flags: about 50 MB at 5M quotes); the frame is
+built on first access.
+
+### 13.3 `RatebookOptimiser.evaluate()`
+
+```python
+def evaluate(
+    self,
+    df_or_grid: pl.DataFrame | QuoteGrid,
+    factors: pl.DataFrame | RatebookFactorContexts,
+    factor_tables: Mapping[str, Mapping[str, float]],
+) -> RatebookEvaluation
+```
+
+Runs the §13.1 kernel at the given factor tables and returns a
+`RatebookEvaluation` with `quote_results`, `total_objective`,
+`total_constraints`, `n_quotes`, the clamp counts, `scenario_values` and
+`baseline_scenario_value`. It does not depend on λ: given the factor values,
+the evaluation is fully determined.
+
+Tables are matched to factor specs by name (`":".join(columns)`) and applied
+in the contexts' spec order, never dict order. It raises `ValueError` for an
+unknown or missing factor, a level present in the data but missing from the
+table, a table level absent from the data, a non-finite or non-positive value,
+and ratio constraints (the grid cannot linearise them).
+
+`evaluate(grid, factors, result.factor_tables)` reproduces `result`'s totals
+and `quote_results` exactly (`==`), because it is the same kernel on the same
+inputs.
+
+### 13.4 Ratebook frontier
+
+- `frontier()` keeps each point's factor tables: `factor_tables` is a list
+  aligned with `points` rows, and `point_factor_tables(i)` returns one
+  (`IndexError` when out of range). Per-point `RatebookResult` objects, and
+  with them their per-quote evaluations, are released as soon as the point's
+  row is recorded, so a sweep's memory does not grow with its point count.
+- A point's totals come from §13.1, so
+  `evaluate(grid, factors, frontier.factor_tables[i])` reproduces row *i*
+  exactly. This is the supported way to materialise a point; re-solving with
+  the point's λ is **not** guaranteed to land on the same factor tables.
+- New columns: `bound_<c>` (§13.5), `n_quotes_clamped_low`,
+  `n_quotes_clamped_high`.
+- `parallel=True` raises (the ratebook frontier is sequential); it was
+  previously ignored.
+
+### 13.5 Absolute bounds
+
+- Every frontier (online Rust, online orchestrated, ratebook) emits
+  `bound_<c>` for every constraint, swept or not, directly after the
+  `threshold_*` columns. `threshold_<c>` keeps its current meaning (the
+  user's units: a fraction for pct constraints).
+- `SolveResult` and `RatebookResult` expose `constraint_bounds: dict[str, float]`.
+  A `RatebookEvaluation` has none: it evaluates factor tables against no
+  thresholds.
+- The bound is in the constraint's reported units: `threshold` for `min`/`max`;
+  `baseline_total × fraction` for `min_pct`/`max_pct`; for ratio constraints
+  the ratio bound (`threshold`, or `baseline_ratio × fraction` for pct).
+- A pct constraint whose baseline total is 0 raises
+  (`"min_pct/max_pct on '<c>' is undefined: baseline total is 0"`); previously
+  the report scale silently became 1.0. A pct ratio constraint whose baseline
+  ratio is 0 raises the same way (`"... baseline ratio is 0"`).
+
+### 13.6 One baseline rule
+
+`baseline_step(scenario_values)` (Rust, `data.rs`) returns the index of the
+scenario value nearest 1.0, compared in f32, lowest index on a tie. It is the
+baseline for sum totals, pct bounds and ratio constraints alike, and it is
+exposed as `QuoteGrid.baseline_step` and `baseline_scenario_value` on grids and
+results. Ratio baselines no longer filter for an exact `scenario_value == 1.0`;
+a quote missing its baseline row raises. Grids that contain an exact 1.0
+behave exactly as before.
+
+### 13.7 Fail loud
+
+Each of these raises instead of returning a default:
+
+- a solve result missing a constraint total or λ while building a frontier row
+  (previously `0.0` or NaN);
+- `summary()` missing a constraint;
+- a quote with no row at the baseline step (ratio baselines);
+- `sv_*` statistics over zero quotes;
+- a warm-start λ for an unknown constraint name (missing names still default
+  to 0.0, which is a documented warm-start default, not an error mask);
+- a pct constraint with a zero baseline (§13.5);
+- `candidate_min ≤ 0`, a non-finite candidate bound, `candidate_max <
+  candidate_min`, or `candidate_steps < 1`;
+- scenario values that are not strictly increasing;
+- a constraint named `objective`, `step` or `scenario_value` (they collide with
+  output columns), a factor column name containing `:` or the composite-label
+  separator `\x1f`, the same factor specified twice, and
+  `RatebookFactorContexts` built with a separator other than `\x1f` (results
+  label composite levels with `FACTOR_SEPARATOR`);
+- `summary()` of a result missing any configured constraint;
+- `frontier(parallel=True)` where the sweep runs sequentially (the ratebook
+  frontier, and the Python-orchestrated online frontier).
+
+### 13.8 Deterministic ordering
+
+`lambdas`, `total_constraints`, `baseline_constraints` and
+`constraint_bounds` are ordered dicts in constraint order. `factor_tables`
+follows factor-spec order; levels follow first appearance in quote order.
+Reductions over quotes have a fixed order, so repeated runs are bit-identical.
+Every total, including a reported ratio's numerator and denominator,
+accumulates the f32 grid values in f64, so a reported ratio agrees with the
+ratio bound derived from the same baseline.
+
+### 13.9 `per_factor_results`
+
+`per_factor_results` is a tuple of frozen `PerFactorRecord` dataclasses, one per
+grouped solve, in (CD pass, factor) order:
+
+`cd_iteration`, `factor` (the spec name), `factor_index`, `total_objective`,
+`total_constraints`, `lambdas`, `clamp_rate`, `inner_iterations`,
+`inner_converged`.
+
+The pass and factor are explicit fields, emitted by the bindings; nothing is
+reconstructed from position.
+
+### 13.10 Persistence (format 2)
+
+`RatebookResult.save()` writes `config.json` with `"format_version": 2`,
+adding `per_factor_results`, `constraint_bounds`, `scenario_values`,
+`baseline_scenario_value`, `n_quotes` and the clamp counts. Factor-table keys
+are written verbatim (JSON escapes `\x1f`). Two factors that map to the same
+file name raise.
+
+The per-quote frame is not persisted: `evaluate()` reproduces it exactly from
+the persisted tables. On a loaded result, `quote_results` raises
+`ResultUnavailableError` naming `evaluate()`. `load()` accepts only known
+config keys, and raises on a missing factor file or table. A format-1 file
+loads; its missing fields raise `ResultUnavailableError` on access.
+`ResultUnavailableError` subclasses `RuntimeError`, not `AttributeError`, so
+`hasattr` cannot hide it.
+
+### 13.11 `clamp_rate`
+
+`clamp_rate` is a search-space diagnostic. Within one grouped solve it is the
+fraction of (quote, candidate) pairs whose target `residual × candidate` lies
+strictly outside `[scenario_values[0], scenario_values[-1]]`, counted over every
+candidate tried, not only the one chosen. `RatebookResult.clamp_rate` is the
+unweighted mean over every grouped solve in every CD pass
+(`per_factor_results[i].clamp_rate`). A high value means the candidate range is
+wider than the scenario grid. It does not count quotes that end at a grid
+edge; `n_quotes_clamped_low` / `n_quotes_clamped_high` and `quote_results` do.
+
+### 13.12 Schemas and typing
+
+- `quote_results_schema(constraint_names)` and
+  `frontier_points_schema(mode, constraint_names)` return the exact
+  `{column: dtype}` of those outputs; tests assert every code path against
+  them. The online Rust sweep and the Python-orchestrated online sweep share
+  one schema (the orchestrated sweep reports `solver_path = "subgradient"`
+  and, when a point does not converge, `non_convergence_reason =
+  "iteration_budget_exhausted"`).
+- `frontier_summary` reads per-constraint values by constraint name, not by
+  parsing column prefixes.
+- The package ships `py.typed`, and `_price_contour.pyi` matches the bindings.
+
+### 13.13 Performance
+
+- The per-quote frame is gathered in parallel, in order, into owned column
+  vectors that move into Polars without a second copy.
+- The canonical evaluation is one O(n_quotes × n_factors) pass after the CD
+  loop; its retained state is about 50 MB at 5M quotes, and the frame is
+  built only on access.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 import polars as pl
+import pytest
 
 import price_contour as pc
 from helpers import make_small_df, CONSTRAINT_RTOL
@@ -137,23 +138,31 @@ class TestNumericalStability:
     def test_all_zero_constraint_values(self):
         """All-zero constraint column — the constraint is meaningless.
 
-        The solver may or may not converge (there is no gradient signal in
-        the constraint), but it must not crash or produce NaN/Inf.
+        An absolute bound still solves (there is no gradient signal in the
+        constraint, but no crash and no NaN/Inf). A pct bound is a fraction
+        of a zero baseline, which is undefined, so it raises (§13.5) rather
+        than silently becoming a 0 bound.
         """
         df = make_small_df(n_quotes=50, n_steps=5)
         df = df.with_columns(pl.lit(0.0).cast(pl.Float32).alias("volume"))
 
         solver = pc.OnlineOptimiser(
             objective="expected_income",
-            constraints={"volume": {"min_pct": 0.90}},
+            constraints={"volume": {"min": 0.0}},
             max_iter=50,
         )
         result = solver.solve(df)
-
-        # Must not crash; objective must be finite
         assert math.isfinite(result.total_objective), (
             f"total_objective is not finite: {result.total_objective}"
         )
+
+        pct_solver = pc.OnlineOptimiser(
+            objective="expected_income",
+            constraints={"volume": {"min_pct": 0.90}},
+            max_iter=50,
+        )
+        with pytest.raises(ValueError, match="baseline total is 0"):
+            pct_solver.solve(df)
 
     def test_f32_precision_boundary(self):
         """Objectives near 2^23 where Float32 loses integer precision.

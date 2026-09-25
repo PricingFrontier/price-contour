@@ -668,9 +668,9 @@ dependencies = [
 
 [[package]]
 name = "ethnum"
-version = "1.5.2"
+version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca81e6b4777c89fd810c25a4be2b1bd93ea034fbe58e6a75216a34c6b82c539b"
+checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 
 [[package]]
 name = "event-listener"
@@ -2184,6 +2184,7 @@ dependencies = [
 name = "price-contour"
 version = "0.1.0"
 dependencies = [
+ "indexmap",
  "polars",
  "price-contour-core",
  "pyo3",
@@ -2226,6 +2227,7 @@ version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ba0117f4212101ee6544044dae45abe1083d30ce7b29c4b5cbdfa2354e07383"
 dependencies = [
+ "indexmap",
  "indoc",
  "libc",
  "memoffset",

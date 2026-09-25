@@ -15,13 +15,11 @@ __all__ = ["FrontierResult", "FrontierResultLike", "frontier_summary"]
 class FrontierResultLike(Protocol):
     """Protocol for frontier results (both online and ratebook).
 
-    Both ``FrontierResult`` (from the Rust frontier via ``sweep_frontier``)
-    and ``_RatebookFrontierResult`` (from ``RatebookOptimiser.frontier``)
-    satisfy this protocol.
-
-    Note: ratebook frontier results lack ``sv_*`` columns in their
-    ``points`` DataFrame because ratebook optimisation does not produce
-    per-quote scenario value distributions.
+    ``FrontierResult`` (the Rust online sweep), the Python-orchestrated
+    online sweep and ``RatebookFrontierResult`` (``RatebookOptimiser.frontier``)
+    all satisfy it. ``points`` follows ``frontier_points_schema(mode,
+    constraint_names)``: ratebook points carry ``clamp_rate`` and clamp
+    counts instead of the online ``sv_*`` distribution columns.
     """
 
     @property
@@ -32,6 +30,11 @@ class FrontierResultLike(Protocol):
     @property
     def n_points(self) -> int:
         """Number of frontier points."""
+        ...
+
+    @property
+    def constraint_names(self) -> list[str]:
+        """Constraint names, in column order."""
         ...
 
 
@@ -71,17 +74,13 @@ def frontier_summary(
         "selected_converged": float(selected_row["converged"]),
     }
 
-    # Add threshold and constraint values from selected point
-    for col in df.columns:
-        if col.startswith("threshold_"):
-            name = col.removeprefix("threshold_")
-            metrics[f"selected_threshold_{name}"] = float(selected_row[col])
-        elif col.startswith("total_") and col != "total_objective":
-            name = col.removeprefix("total_")
-            metrics[f"selected_total_{name}"] = float(selected_row[col])
-        elif col.startswith("lambda_"):
-            name = col.removeprefix("lambda_")
-            metrics[f"selected_lambda_{name}"] = float(selected_row[col])
+    # Per-constraint values of the selected point, by constraint name (not
+    # by parsing column prefixes, which a constraint name could collide with).
+    for name in frontier_result.constraint_names:
+        for prefix in ("threshold", "bound", "total", "lambda"):
+            metrics[f"selected_{prefix}_{name}"] = float(
+                selected_row[f"{prefix}_{name}"]
+            )
 
     artifacts: dict[str, Any] = {
         "frontier": df,

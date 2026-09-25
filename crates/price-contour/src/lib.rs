@@ -28,8 +28,11 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_class::<builder_py::PyQuoteGridBuilder>()?;
     m.add_class::<grid_py::PyQuoteGrid>()?;
+    m.add_function(wrap_pyfunction!(grid_py::_baseline_step_index, m)?)?;
     m.add_class::<grouped_py::PyGroupedSolveResult>()?;
     m.add_class::<grouped_py::PyRatebookCDResult>()?;
+    m.add_class::<grouped_py::PyRatebookEvaluation>()?;
+    m.add_function(wrap_pyfunction!(grouped_py::evaluate_ratebook_py, m)?)?;
     m.add_function(wrap_pyfunction!(grouped_py::solve_grouped_py, m)?)?;
     m.add_function(wrap_pyfunction!(grouped_py::run_cd_pass_py, m)?)?;
     m.add_class::<frontier_py::PyFrontierResult>()?;

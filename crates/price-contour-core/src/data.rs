@@ -52,6 +52,7 @@ impl QuoteGrid {
             ));
         }
 
+        validate_strictly_increasing(&self.scenario_values)?;
         if self.scenario_values.len() != self.n_steps {
             return Err(PriceContourError::DimensionMismatch(format!(
                 "scenario_values length {} != n_steps {}",
@@ -93,16 +94,15 @@ impl QuoteGrid {
         Ok(())
     }
 
-    /// Find the step index closest to scenario_value=1.0 and compute baseline totals.
+    /// Index of the baseline step. See [`baseline_step`].
+    pub fn baseline_step(&self) -> usize {
+        baseline_step(&self.scenario_values)
+    }
+
+    /// Baseline totals: every quote at the [`baseline_step`].
     /// Returns (baseline_objective_total, baseline_constraint_totals) as f64.
     pub fn baseline_totals(&self) -> (f64, Vec<f64>) {
-        let baseline_step = self
-            .scenario_values
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| ((**a) - 1.0f32).abs().total_cmp(&((**b) - 1.0f32).abs()))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let baseline_step = self.baseline_step();
 
         let mut obj_total: f64 = 0.0;
         let mut con_totals = vec![0.0f64; self.constraints.len()];
@@ -137,6 +137,37 @@ impl QuoteGrid {
             .collect();
         (baseline_obj, baseline_cons, scale_factors)
     }
+}
+
+/// The baseline ("no price change") step of a scenario grid: the index of the
+/// scenario value nearest 1.0, compared in f32, taking the lowest index on a
+/// tie. This is the single baseline rule for sum totals, pct bounds and ratio
+/// constraints. An empty slice has no baseline and panics; every caller holds
+/// a validated grid (`n_steps > 0`).
+pub fn baseline_step(scenario_values: &[f32]) -> usize {
+    scenario_values
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| ((**a) - 1.0f32).abs().total_cmp(&((**b) - 1.0f32).abs()))
+        .map(|(i, _)| i)
+        .expect("baseline_step requires at least one scenario value")
+}
+
+/// Scenario values must be strictly increasing: the nearest-step lookups
+/// (binary search and the two-pointer remap) are only unambiguous without
+/// duplicate values.
+fn validate_strictly_increasing(scenario_values: &[f32]) -> Result<()> {
+    for i in 1..scenario_values.len() {
+        if scenario_values[i] <= scenario_values[i - 1] {
+            return Err(PriceContourError::InvalidValue(format!(
+                "scenario_values must be sorted and strictly increasing, but [{i}]={} <= [{}]={}",
+                scenario_values[i],
+                i - 1,
+                scenario_values[i - 1]
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Direction of a constraint bound.
@@ -285,17 +316,7 @@ impl QuoteGridBuilder {
                 n_steps
             )));
         }
-        // Validate sorted
-        for i in 1..scenario_values.len() {
-            if scenario_values[i] < scenario_values[i - 1] {
-                return Err(PriceContourError::InvalidValue(format!(
-                    "scenario_values must be sorted, but [{i}]={} < [{}]={}",
-                    scenario_values[i],
-                    i - 1,
-                    scenario_values[i - 1]
-                )));
-            }
-        }
+        validate_strictly_increasing(&scenario_values)?;
         let n_constraints = constraint_names.len();
         Ok(Self {
             n_steps,
@@ -1404,5 +1425,95 @@ mod tests {
             msg.contains("NaN") || msg.contains("Inf") || msg.contains("finite"),
             "error should mention NaN/Inf: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 0.5.0 consumer contract: one baseline rule, strictly increasing grid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_baseline_step_nearest_one_on_even_f32_grid() {
+        // np.linspace(0.9, 1.1, 6, dtype=float32): no exact 1.0; 0.98 and
+        // 1.02 are equidistant in exact arithmetic but not in f32 — the
+        // rule is "compare |sv - 1.0| in f32, lowest index on a tie".
+        let sv: Vec<f32> = (0..6).map(|i| 0.9f32 + 0.04f32 * i as f32).collect();
+        let expected = sv
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (**a - 1.0f32).abs().total_cmp(&(**b - 1.0f32).abs()))
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(baseline_step(&sv), expected);
+    }
+
+    #[test]
+    fn test_baseline_step_exact_tie_takes_lower_index() {
+        // 0.75 and 1.25 are exactly representable and exactly 0.25 from 1.0.
+        assert_eq!(baseline_step(&[0.75, 1.25]), 0);
+    }
+
+    #[test]
+    fn test_baseline_step_exact_one() {
+        assert_eq!(baseline_step(&[0.8, 0.9, 1.0, 1.1]), 2);
+    }
+
+    #[test]
+    fn test_baseline_step_single_step() {
+        assert_eq!(baseline_step(&[1.3]), 0);
+    }
+
+    #[test]
+    fn test_baseline_totals_uses_baseline_step() {
+        let grid = QuoteGrid {
+            n_quotes: 1,
+            n_steps: 2,
+            scenario_values: vec![0.75, 1.25],
+            objective: vec![3.0, 7.0],
+            constraints: vec![vec![1.0, 2.0]],
+            constraint_names: vec!["volume".to_string()],
+            quote_ids: vec!["Q0".to_string()],
+            quote_id_fingerprint: 0,
+        };
+        let (obj, cons) = grid.baseline_totals();
+        assert_eq!(obj, 3.0);
+        assert_eq!(cons, vec![1.0]);
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_scenario_values() {
+        let grid = QuoteGrid {
+            n_quotes: 1,
+            n_steps: 3,
+            scenario_values: vec![0.9, 1.0, 1.0],
+            objective: vec![1.0, 2.0, 3.0],
+            constraints: vec![],
+            constraint_names: vec![],
+            quote_ids: vec!["Q0".to_string()],
+            quote_id_fingerprint: 0,
+        };
+        let msg = format!("{}", grid.validate().unwrap_err());
+        assert!(msg.contains("strictly increasing"), "{msg}");
+    }
+
+    #[test]
+    fn test_validate_rejects_decreasing_scenario_values() {
+        let grid = QuoteGrid {
+            n_quotes: 1,
+            n_steps: 2,
+            scenario_values: vec![1.1, 0.9],
+            objective: vec![1.0, 2.0],
+            constraints: vec![],
+            constraint_names: vec![],
+            quote_ids: vec!["Q0".to_string()],
+            quote_id_fingerprint: 0,
+        };
+        let msg = format!("{}", grid.validate().unwrap_err());
+        assert!(msg.contains("strictly increasing"), "{msg}");
+    }
+
+    #[test]
+    fn test_builder_rejects_duplicate_scenario_values() {
+        let err = QuoteGridBuilder::new(3, vec![0.9, 0.9, 1.1], vec![]).unwrap_err();
+        assert!(format!("{err}").contains("strictly increasing"), "{err}");
     }
 }

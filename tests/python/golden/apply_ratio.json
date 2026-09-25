@@ -8,7 +8,7 @@
   },
   "expected": {
     "baseline_constraints": {
-      "loss_ratio": 0.6550663169341512
+      "loss_ratio": 0.6550663619945511
     },
     "baseline_objective": 2395.059501647949,
     "lambdas": {
@@ -119,7 +119,7 @@
       1
     ],
     "total_constraints": {
-      "loss_ratio": 0.6418365324923093
+      "loss_ratio": 0.6418366988750573
     },
     "total_objective": 2429.608242034912
   },

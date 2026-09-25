@@ -17,7 +17,7 @@ use crate::builder_py::PyQuoteGridBuilder;
 use crate::grid_py::PyQuoteGrid;
 use crate::parquet_grid_py::{read_parquet_in_aligned_chunks, validate_column_names};
 use crate::solver_py::{build_result_dataframe, ingest_dataframe, parse_constraints};
-use crate::utils::{order_lambdas, zip_to_dict};
+use crate::utils::{order_lambdas, zip_to_dict, OrderedDict};
 
 /// Python-visible apply result.
 #[pyclass(name = "ApplyResult")]
@@ -31,7 +31,7 @@ pub struct PyApplyResult {
 #[pymethods]
 impl PyApplyResult {
     #[getter]
-    fn lambdas(&self) -> HashMap<String, f64> {
+    fn lambdas(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.inner.lambdas)
     }
 
@@ -41,7 +41,7 @@ impl PyApplyResult {
     }
 
     #[getter]
-    fn total_constraints(&self) -> HashMap<String, f64> {
+    fn total_constraints(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.inner.total_constraints)
     }
 
@@ -51,7 +51,7 @@ impl PyApplyResult {
     }
 
     #[getter]
-    fn baseline_constraints(&self) -> HashMap<String, f64> {
+    fn baseline_constraints(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.inner.baseline_constraints)
     }
 
@@ -105,7 +105,7 @@ pub fn apply_lambdas_py(
     let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
     // Order lambdas to match specs
-    let lambda_vec = order_lambdas(&lambdas, &constraint_names);
+    let lambda_vec = order_lambdas(&lambdas, &constraint_names).map_err(PyValueError::new_err)?;
 
     let result = py
         .detach(|| apply_lambdas(&grid, &specs, &lambda_vec))
@@ -134,7 +134,7 @@ pub fn apply_from_grid_py(
     let specs = parse_constraints(constraints, &grid.inner)?;
     let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
-    let lambda_vec = order_lambdas(&lambdas, &constraint_names);
+    let lambda_vec = order_lambdas(&lambdas, &constraint_names).map_err(PyValueError::new_err)?;
 
     let grid_arc = Arc::clone(&grid.inner);
     let result = py
@@ -170,7 +170,7 @@ pub struct PyChunkedApplyResult {
 #[pymethods]
 impl PyChunkedApplyResult {
     #[getter]
-    fn lambdas(&self) -> HashMap<String, f64> {
+    fn lambdas(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.lambdas_vec)
     }
 
@@ -180,7 +180,7 @@ impl PyChunkedApplyResult {
     }
 
     #[getter]
-    fn total_constraints(&self) -> HashMap<String, f64> {
+    fn total_constraints(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.total_constraints_vec)
     }
 
@@ -190,7 +190,7 @@ impl PyChunkedApplyResult {
     }
 
     #[getter]
-    fn baseline_constraints(&self) -> HashMap<String, f64> {
+    fn baseline_constraints(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.baseline_constraints_vec)
     }
 
@@ -523,7 +523,7 @@ impl<'a> ChunkedApplyState<'a> {
         if self.specs.is_none() {
             let parsed = parse_constraints(self.constraints.clone(), grid)?;
             let names: Vec<String> = parsed.iter().map(|s| s.name.clone()).collect();
-            let lvec = order_lambdas(&self.lambdas, &names);
+            let lvec = order_lambdas(&self.lambdas, &names).map_err(PyValueError::new_err)?;
             self.specs = Some(parsed);
             self.constraint_names = Some(names);
             self.lambda_vec = Some(lvec);

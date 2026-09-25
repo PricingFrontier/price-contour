@@ -38,10 +38,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Ruff check
-        run: uvx ruff check python/ tests/
+        # Same ruff as .pre-commit-config.yaml; an unpinned uvx picks up new
+        # default rules on every ruff release.
+        run: uvx ruff@0.9.10 check python/ tests/
 
       - name: Ruff format
-        run: uvx ruff format --check python/ tests/
+        run: uvx ruff@0.9.10 format --check python/ tests/
 
   rust:
     name: Rust tests

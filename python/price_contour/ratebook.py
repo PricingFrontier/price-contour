@@ -3,24 +3,27 @@
 from __future__ import annotations
 
 import json
-import types
-from dataclasses import dataclass, field
+import math
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import polars as pl
 
 from price_contour._frontier_helpers import (
     _cartesian_product,
     _linspace,
+    frontier_points_schema,
 )
 from price_contour._grid_utils import build_grid
 from price_contour._price_contour import (
     FactorContext,
-    FrontierResult,
     QuoteGrid,
+    RatebookEvaluation,
     RatebookFactorContexts,
     build_ratebook_factor_contexts_from_parquet_chunked_py,
+    evaluate_ratebook_py,
     run_cd_pass_py,
     solve_grouped_py,
 )
@@ -29,6 +32,7 @@ from price_contour._ratio_results import (
     _stitch_optimal_ratio_columns,
 )
 from price_contour.solver import (
+    _baseline_rows,
     _is_ratio_spec,
     _linearise_ratio_constraints,
     _override_thresholds,
@@ -105,22 +109,101 @@ def build_ratebook_factor_contexts_from_parquet_chunked(
     )
 
 
-class PerFactorRecord(Protocol):
-    """Lightweight per-(cd_iter × factor) record exposed on
-    :attr:`RatebookResult.per_factor_results`. Carries only the fields
-    consumers need (CD-monotonicity tests, debugging) — the full
-    `GroupedSolveResult` shape is not preserved because materialising one
-    PyClass per inner solve would defeat the FFI saving in
-    ``run_cd_pass_py``.
+FACTOR_SEPARATOR = "\x1f"
+"""Separator between the constituent levels of a composite factor label."""
+
+_FORMAT_VERSION = 2
+
+# ``config.json`` keys by save format. ``load`` accepts exactly these.
+_CONFIG_KEYS_V1 = frozenset(
+    {
+        "lambdas",
+        "constraints",
+        "baseline_constraints",
+        "total_objective",
+        "baseline_objective",
+        "cd_iterations",
+        "converged",
+        "clamp_rate",
+        "factor_order",
+    }
+)
+_CONFIG_KEYS_V2 = _CONFIG_KEYS_V1 | {
+    "format_version",
+    "factor_separator",
+    "per_factor_results",
+    "constraint_bounds",
+    "scenario_values",
+    "baseline_scenario_value",
+    "n_quotes",
+    "n_quotes_clamped_low",
+    "n_quotes_clamped_high",
+}
+
+
+class ResultUnavailableError(RuntimeError):
+    """A result field that was not computed or not persisted was accessed.
+
+    Subclasses ``RuntimeError`` rather than ``AttributeError`` so ``hasattr``
+    cannot silently hide it.
     """
 
+
+def quote_results_schema(constraint_names: list[str]) -> dict[str, pl.DataType]:
+    """Exact ``{column: dtype}`` of ``quote_results`` for sum constraints
+    ``constraint_names`` (DESIGN_DECISIONS §13.2), in column order."""
+    schema: dict[str, pl.DataType] = {
+        "quote_id": pl.String(),
+        "optimal_step": pl.Int32(),
+        "optimal_scenario_value": pl.Float32(),
+        "optimal_objective": pl.Float32(),
+    }
+    for name in constraint_names:
+        schema[f"optimal_{name}"] = pl.Float32()
+    schema["factor_product"] = pl.Float32()
+    schema["clamped_low"] = pl.Boolean()
+    schema["clamped_high"] = pl.Boolean()
+    return schema
+
+
+@dataclass(frozen=True)
+class PerFactorRecord:
+    """One inner grouped solve of the coordinate-descent loop."""
+
+    cd_iteration: int
+    """1-based coordinate-descent pass."""
+    factor: str
+    """Factor spec name (``":".join(columns)``)."""
+    factor_index: int
+    """Position of the factor in the spec order."""
     total_objective: float
+    total_constraints: dict[str, float]
     lambdas: dict[str, float]
+    clamp_rate: float
+    """Fraction of (quote, candidate) targets outside the grid in this solve."""
+    inner_iterations: int
+    inner_converged: bool
+
+
+def _unavailable(field_name: str, why: str) -> ResultUnavailableError:
+    return ResultUnavailableError(f"RatebookResult.{field_name} is unavailable: {why}")
+
+
+_LOADED_V1 = "this result was loaded from a format-1 save, which did not persist it"
 
 
 @dataclass
 class RatebookResult:
-    """Result of ratebook coordinate descent optimisation."""
+    """Result of ratebook coordinate descent optimisation.
+
+    Every total is the canonical evaluation of ``factor_tables``
+    (DESIGN_DECISIONS §13.1): each quote at the grid step nearest the f32
+    product of its factor values. ``RatebookOptimiser.evaluate(grid,
+    factors, result.factor_tables)`` reproduces them exactly.
+
+    Fields that a loaded result does not carry raise
+    :class:`ResultUnavailableError` on access instead of returning a default.
+    """
 
     factor_tables: dict[str, dict[str, float]]
     lambdas: dict[str, float]
@@ -130,11 +213,97 @@ class RatebookResult:
     baseline_constraints: dict[str, float]
     cd_iterations: int
     converged: bool
+    """Coordinate-descent convergence only: the largest factor-value change
+    over the last pass fell below ``cd_tolerance``. It does not check that
+    the constraints are met."""
     clamp_rate: float
-    per_factor_results: list[PerFactorRecord] = field(default_factory=list)
+    """Search-space diagnostic (§13.11): the mean, over every grouped solve,
+    of the fraction of (quote, candidate) targets outside the scenario range.
+    It does not count quotes at a grid edge; see ``n_quotes_clamped_low`` /
+    ``n_quotes_clamped_high``."""
+    _per_factor_results: tuple[PerFactorRecord, ...] | None = field(
+        default=None, repr=False
+    )
+    _constraint_bounds: dict[str, float] | None = field(default=None, repr=False)
+    _scenario_values: tuple[float, ...] | None = field(default=None, repr=False)
+    _baseline_scenario_value: float | None = field(default=None, repr=False)
+    _n_quotes: int | None = field(default=None, repr=False)
+    _n_quotes_clamped_low: int | None = field(default=None, repr=False)
+    _n_quotes_clamped_high: int | None = field(default=None, repr=False)
+    _evaluation: RatebookEvaluation | None = field(
+        default=None, repr=False, compare=False
+    )
+    _quote_results_frame: pl.DataFrame | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    @property
+    def per_factor_results(self) -> tuple[PerFactorRecord, ...]:
+        """One record per inner grouped solve, in (CD pass, factor) order."""
+        if self._per_factor_results is None:
+            raise _unavailable("per_factor_results", _LOADED_V1)
+        return self._per_factor_results
+
+    @property
+    def constraint_bounds(self) -> dict[str, float]:
+        """Absolute bound of each constraint (§13.5), in constraint order."""
+        if self._constraint_bounds is None:
+            raise _unavailable("constraint_bounds", _LOADED_V1)
+        return self._constraint_bounds
+
+    @property
+    def scenario_values(self) -> tuple[float, ...]:
+        """The grid's scenario values, ascending."""
+        if self._scenario_values is None:
+            raise _unavailable("scenario_values", _LOADED_V1)
+        return self._scenario_values
+
+    @property
+    def baseline_scenario_value(self) -> float:
+        """Scenario value of the baseline step (nearest 1.0, §13.6)."""
+        if self._baseline_scenario_value is None:
+            raise _unavailable("baseline_scenario_value", _LOADED_V1)
+        return self._baseline_scenario_value
+
+    @property
+    def n_quotes(self) -> int:
+        if self._n_quotes is None:
+            raise _unavailable("n_quotes", _LOADED_V1)
+        return self._n_quotes
+
+    @property
+    def n_quotes_clamped_low(self) -> int:
+        """Quotes whose factor product lies strictly below the scenario range."""
+        if self._n_quotes_clamped_low is None:
+            raise _unavailable("n_quotes_clamped_low", _LOADED_V1)
+        return self._n_quotes_clamped_low
+
+    @property
+    def n_quotes_clamped_high(self) -> int:
+        """Quotes whose factor product lies strictly above the scenario range."""
+        if self._n_quotes_clamped_high is None:
+            raise _unavailable("n_quotes_clamped_high", _LOADED_V1)
+        return self._n_quotes_clamped_high
+
+    @property
+    def quote_results(self) -> pl.DataFrame:
+        """Per-quote evaluation (§13.2); see :func:`quote_results_schema`.
+
+        Not persisted by :meth:`save`: on a loaded result, reproduce it with
+        ``RatebookOptimiser.evaluate(grid, factors, result.factor_tables)``.
+        """
+        if self._quote_results_frame is not None:
+            return self._quote_results_frame
+        if self._evaluation is None:
+            raise _unavailable(
+                "quote_results",
+                "per-quote results are not persisted; call "
+                "RatebookOptimiser.evaluate(grid, factors, result.factor_tables)",
+            )
+        return self._evaluation.quote_results
 
     def save(self, path: str | Path) -> None:
-        """Save factor tables to a parameters folder.
+        """Save the result to a parameters folder (format 2, §13.10).
 
         Creates one JSON per factor plus a config.json:
 
@@ -144,43 +313,46 @@ class RatebookResult:
               age_band.json
               ...
 
-        Parameters
-        ----------
-        path : str | Path
-            Directory to write the parameters folder into.
+        Factor-table keys are written verbatim. The per-quote frame is not
+        saved; :meth:`RatebookOptimiser.evaluate` reproduces it exactly from
+        the saved tables.
         """
         path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
-
         factor_order = list(self.factor_tables.keys())
-
+        filenames = {name: _factor_filename(name) for name in factor_order}
+        clashes = _duplicates(filenames.values())
+        if clashes:
+            raise ValueError(
+                f"factor names {sorted(n for n, f in filenames.items() if f in clashes)} "
+                f"map to the same file name; rename a factor column"
+            )
         config = {
+            "format_version": _FORMAT_VERSION,
+            "factor_separator": FACTOR_SEPARATOR,
             "lambdas": self.lambdas,
-            "constraints": dict(self.total_constraints.items())
-            if isinstance(self.total_constraints, dict)
-            else {},
-            "baseline_constraints": dict(self.baseline_constraints.items())
-            if isinstance(self.baseline_constraints, dict)
-            else {},
+            "constraints": self.total_constraints,
+            "baseline_constraints": self.baseline_constraints,
             "total_objective": self.total_objective,
             "baseline_objective": self.baseline_objective,
             "cd_iterations": self.cd_iterations,
             "converged": self.converged,
             "clamp_rate": self.clamp_rate,
             "factor_order": factor_order,
+            "per_factor_results": [asdict(r) for r in self.per_factor_results],
+            "constraint_bounds": self.constraint_bounds,
+            "scenario_values": list(self.scenario_values),
+            "baseline_scenario_value": self.baseline_scenario_value,
+            "n_quotes": self.n_quotes,
+            "n_quotes_clamped_low": self.n_quotes_clamped_low,
+            "n_quotes_clamped_high": self.n_quotes_clamped_high,
         }
+        path.mkdir(parents=True, exist_ok=True)
         (path / "config.json").write_text(json.dumps(config, indent=2))
-
         for factor_name, table in self.factor_tables.items():
-            cols = factor_name.split(":")
-            # Convert unit separator in keys to colon for JSON serialisation
-            serialised_table = {k.replace("\x1f", ":"): v for k, v in table.items()}
-            factor_data = {
-                "columns": cols,
-                "table": serialised_table,
-            }
-            filename = factor_name.replace(":", "_") + ".json"
-            (path / filename).write_text(json.dumps(factor_data, indent=2))
+            factor_data = {"columns": factor_name.split(":"), "table": table}
+            (path / filenames[factor_name]).write_text(
+                json.dumps(factor_data, indent=2)
+            )
 
     def to_rating_entries(self) -> dict[str, pl.DataFrame]:
         """Convert factor tables to rating-step DataFrames.
@@ -191,78 +363,134 @@ class RatebookResult:
         result = {}
         for factor_name, table in self.factor_tables.items():
             cols = factor_name.split(":")
-            if len(cols) == 1:
-                # Single column factor
-                levels = list(table.keys())
-                values = [table[k] for k in levels]
-                result[factor_name] = pl.DataFrame({cols[0]: levels, "factor": values})
-            else:
-                # Interaction factor: keys use the unit separator (\x1f)
-                # in-memory but the colon when round-tripped through
-                # save/load (which substitutes \x1f → ':' for JSON
-                # readability). Accept either at this seam.
-                rows = []
-                for key, val in table.items():
-                    if "\x1f" in key:
-                        parts = key.split("\x1f")
-                    else:
-                        parts = key.split(":")
-                    row = {c: p for c, p in zip(cols, parts)}
-                    row["factor"] = val
-                    rows.append(row)
-                result[factor_name] = pl.DataFrame(rows)
+            rows = []
+            for key, value in table.items():
+                parts = _split_label(key, len(cols), factor_name)
+                row: dict[str, Any] = dict(zip(cols, parts))
+                row["factor"] = value
+                rows.append(row)
+            result[factor_name] = pl.DataFrame(
+                rows, schema={**{c: pl.String for c in cols}, "factor": pl.Float64}
+            )
         return result
 
     @classmethod
-    def load(cls, path: str | Path) -> "RatebookResult":
-        """Load a RatebookResult from a saved parameters folder.
+    def load(cls, path: str | Path) -> RatebookResult:
+        """Load a result saved by :meth:`save` (format 1 or 2).
 
-        Parameters
-        ----------
-        path : str | Path
-            Directory containing config.json and per-factor JSON files.
-
-        Returns
-        -------
-        RatebookResult
+        The loaded result has no per-quote frame. A format-1 save lacks the
+        0.5.0 fields; they raise :class:`ResultUnavailableError` on access.
         """
         path = Path(path)
         config_path = path / "config.json"
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
         config = json.loads(config_path.read_text())
-
-        def _required(key: str) -> Any:
-            if key not in config:
-                raise ValueError(
-                    f"missing required field '{key}' in saved RatebookResult"
-                )
-            return config[key]
+        version = config.get("format_version", 1)
+        allowed = {1: _CONFIG_KEYS_V1, 2: _CONFIG_KEYS_V2}.get(version)
+        if allowed is None:
+            raise ValueError(f"unsupported RatebookResult format_version {version!r}")
+        unknown = set(config) - allowed
+        if unknown:
+            raise ValueError(
+                f"unknown field(s) {sorted(unknown)} in saved RatebookResult "
+                f"(format {version})"
+            )
+        missing = (allowed - {"format_version"}) - set(config)
+        if missing:
+            raise ValueError(
+                f"missing field(s) {sorted(missing)} in saved RatebookResult "
+                f"(format {version})"
+            )
+        if version == 2 and config["factor_separator"] != FACTOR_SEPARATOR:
+            raise ValueError(
+                f"saved factor_separator {config['factor_separator']!r} != "
+                f"{FACTOR_SEPARATOR!r}"
+            )
 
         factor_tables: dict[str, dict[str, float]] = {}
-        # ``factor_order`` is required (the on-disk shape always writes it
-        # via :meth:`save`); the ``"factors"`` fallback was a transitional
-        # alias and is no longer supported.
-        factor_order = _required("factor_order")
-        for factor_name in factor_order:
-            filename = factor_name.replace(":", "_") + ".json"
-            factor_path = path / filename
-            if factor_path.exists():
-                factor_data = json.loads(factor_path.read_text())
-                factor_tables[factor_name] = factor_data.get("table", {})
+        for factor_name in config["factor_order"]:
+            factor_path = path / _factor_filename(factor_name)
+            if not factor_path.exists():
+                raise FileNotFoundError(
+                    f"factor table for '{factor_name}' not found: {factor_path}"
+                )
+            factor_data = json.loads(factor_path.read_text())
+            if "table" not in factor_data:
+                raise ValueError(f"factor file {factor_path} has no 'table'")
+            table = factor_data["table"]
+            if version == 1:
+                table = _v1_table_labels(table, factor_name)
+            factor_tables[factor_name] = table
 
+        common: dict[str, Any] = {
+            "factor_tables": factor_tables,
+            "lambdas": config["lambdas"],
+            "total_objective": config["total_objective"],
+            "total_constraints": config["constraints"],
+            "baseline_objective": config["baseline_objective"],
+            "baseline_constraints": config["baseline_constraints"],
+            "converged": config["converged"],
+            "cd_iterations": config["cd_iterations"],
+            "clamp_rate": config["clamp_rate"],
+        }
+        if version == 1:
+            return cls(**common)
         return cls(
-            factor_tables=factor_tables,
-            lambdas=_required("lambdas"),
-            total_objective=_required("total_objective"),
-            total_constraints=_required("constraints"),
-            baseline_objective=_required("baseline_objective"),
-            baseline_constraints=_required("baseline_constraints"),
-            converged=_required("converged"),
-            cd_iterations=_required("cd_iterations"),
-            clamp_rate=_required("clamp_rate"),
-            per_factor_results=[],
+            **common,
+            _per_factor_results=tuple(
+                PerFactorRecord(**record) for record in config["per_factor_results"]
+            ),
+            _constraint_bounds=config["constraint_bounds"],
+            _scenario_values=tuple(config["scenario_values"]),
+            _baseline_scenario_value=config["baseline_scenario_value"],
+            _n_quotes=config["n_quotes"],
+            _n_quotes_clamped_low=config["n_quotes_clamped_low"],
+            _n_quotes_clamped_high=config["n_quotes_clamped_high"],
         )
+
+
+def _factor_filename(factor_name: str) -> str:
+    return factor_name.replace(":", "_") + ".json"
+
+
+def _duplicates(values: Any) -> set[Any]:
+    seen: set[Any] = set()
+    dupes: set[Any] = set()
+    for v in values:
+        (dupes if v in seen else seen).add(v)
+    return dupes
+
+
+def _split_label(label: str, n_columns: int, factor_name: str) -> list[str]:
+    """Split a (possibly composite) factor level label into its parts."""
+    if n_columns == 1:
+        return [label]
+    parts = label.split(FACTOR_SEPARATOR)
+    if len(parts) != n_columns:
+        raise ValueError(
+            f"level {label!r} of composite factor '{factor_name}' does not split "
+            f"into {n_columns} parts on the factor separator"
+        )
+    return parts
+
+
+def _v1_table_labels(table: dict[str, float], factor_name: str) -> dict[str, float]:
+    """Format 1 wrote composite labels with ':' in place of the separator.
+    Convert back, refusing any label that is ambiguous."""
+    n_columns = len(factor_name.split(":"))
+    if n_columns == 1:
+        return table
+    converted: dict[str, float] = {}
+    for key, value in table.items():
+        parts = key.split(":")
+        if len(parts) != n_columns:
+            raise ValueError(
+                f"format-1 level {key!r} of composite factor '{factor_name}' is "
+                f"ambiguous: it does not split into {n_columns} parts on ':'"
+            )
+        converted[FACTOR_SEPARATOR.join(parts)] = value
+    return converted
 
 
 class RatebookOptimiser:
@@ -327,6 +555,9 @@ class RatebookOptimiser:
         self.max_iter = max_iter
         self.tolerance = tolerance
         _validate_constraint_dict(self.constraints)
+        _validate_candidate_settings(
+            candidate_min, candidate_max, candidate_steps, max_cd_iterations
+        )
 
     def _build_candidates(self) -> list[float]:
         """Build the evenly-spaced candidate factor values."""
@@ -460,21 +691,19 @@ class RatebookOptimiser:
         # so the existing fast path is preserved bit-for-bit.
         original_df = df_or_grid if isinstance(df_or_grid, pl.DataFrame) else None
         ratio_columns: list[tuple[str, str, str]] = []
+        ratio_bounds: dict[str, float] = {}
         if ratio_names and original_df is not None:
-            (
-                modified_df,
-                sum_constraints,
-                _grid_cols,
-                ratio_columns,
-                _threshold_shift,
-            ) = _linearise_ratio_constraints(
+            linearised = _linearise_ratio_constraints(
                 original_df,
                 constraints,
                 scenario_value_col=self.scenario_value,
+                scenario_index_col=self.scenario_index,
                 quote_id_col=self.quote_id,
             )
-            grid_input: pl.DataFrame | QuoteGrid = modified_df
-            cd_constraints: dict[str, dict[str, float]] = sum_constraints
+            ratio_columns = linearised.ratio_columns
+            ratio_bounds = linearised.ratio_bounds
+            grid_input: pl.DataFrame | QuoteGrid = linearised.df
+            cd_constraints: dict[str, dict[str, float]] = linearised.sum_constraints
         else:
             grid_input = df_or_grid
             cd_constraints = constraints
@@ -539,76 +768,147 @@ class RatebookOptimiser:
             lambdas=lambdas,
         )
 
-        # Lightweight per-call records for the CD-monotonicity tests
-        # that consume `RatebookResult.per_factor_results`. Each element
-        # exposes ``.total_objective`` and ``.lambdas`` — the only
-        # attributes those tests read. Building real `GroupedSolveResult`
-        # objects per call would defeat the FFI saving the Rust CD
-        # pass landed.
-        per_call_objectives = cd_result.per_call_total_objectives
-        per_call_lambdas = cd_result.per_call_lambdas
-        per_factor_results: list[PerFactorRecord] = [
-            types.SimpleNamespace(total_objective=obj, lambdas=lams)
-            for obj, lams in zip(per_call_objectives, per_call_lambdas)
-        ]
-        cd_converged = cd_result.converged
-        cd_iter = cd_result.cd_iterations
-        factor_values_rust = cd_result.factor_values
+        evaluation = cd_result.evaluation
+        spec_names = [":".join(spec) for spec in factor_specs]
+        per_factor_results = tuple(
+            PerFactorRecord(factor=spec_names[record["factor_index"]], **record)
+            for record in cd_result.per_call_records
+        )
 
         # Convert per-group `Vec<f32>` factor values back to the public
         # `dict[str, float]` shape that `RatebookResult.factor_tables`
         # carries (and that callers persist via `save()`).
-        factor_tables: list[dict[str, float]] = [
-            {label: float(value) for label, value in zip(labels, values)}
-            for labels, values in zip(factor_group_labels, factor_values_rust)
-        ]
         named_tables = {
-            ":".join(spec): table for spec, table in zip(factor_specs, factor_tables)
+            name: {label: float(value) for label, value in zip(labels, values)}
+            for name, labels, values in zip(
+                spec_names, factor_group_labels, cd_result.factor_values
+            )
         }
 
-        avg_clamp = cd_result.clamp_rate
-
-        # C5 (carries C3 reporting through to ratebook): each ratio
-        # label's ``total_constraints`` / ``baseline_constraints`` entry
-        # reports the **actual** ratio at the optimum / baseline rather
-        # than the linearised total. We recompute these from the original
-        # DataFrame at the last grouped result's optimal steps; sum
-        # entries pass through unchanged. ``cd_result.dataframe`` is the
-        # last grouped solve's per-quote results (built lazily Rust-side
-        # from `optimal_steps_per_quote` + grid).
-        total_constraints = dict(cd_result.total_constraints)
-        baseline_constraints = dict(cd_result.baseline_constraints)
+        # Every total is the canonical evaluation of the final factor
+        # tables (§13.1). Ratio labels are then reported as the actual ratio
+        # at the optimum / baseline rather than the linearised total, with
+        # the numerator / denominator columns stitched onto the per-quote
+        # frame, and the ratio bound in ratio units (§13.5).
+        total_constraints = dict(evaluation.total_constraints)
+        baseline_constraints = dict(evaluation.baseline_constraints)
+        constraint_bounds = dict(cd_result.constraint_bounds)
+        quote_results_frame: pl.DataFrame | None = None
         if ratio_columns and original_df is not None:
-            optimum_df = _stitch_optimal_ratio_columns(
-                base_df=cd_result.dataframe,
+            quote_results_frame = _stitch_optimal_ratio_columns(
+                base_df=evaluation.quote_results,
                 original_df=original_df,
                 ratio_columns=ratio_columns,
                 quote_id_col=self.quote_id,
                 scenario_index_col=self.scenario_index,
             )
+            baseline_slice = _baseline_rows(
+                original_df,
+                quote_id_col=self.quote_id,
+                scenario_index_col=self.scenario_index,
+                scenario_value_col=self.scenario_value,
+            )
             for label, num_col, denom_col in ratio_columns:
                 total_constraints[label] = _safe_ratio_from_columns(
-                    optimum_df, f"optimal_{num_col}", f"optimal_{denom_col}"
+                    quote_results_frame, f"optimal_{num_col}", f"optimal_{denom_col}"
                 )
-            # Actual baseline ratio: ``Sigma_baseline num / Sigma_baseline
-            # denom`` from rows where ``scenario_value == 1.0``.
-            baseline_slice = original_df.filter(pl.col(self.scenario_value) == 1.0)
-            for label, num_col, denom_col in ratio_columns:
                 baseline_constraints[label] = _safe_ratio_from_columns(
                     baseline_slice, num_col, denom_col
                 )
+                constraint_bounds[label] = ratio_bounds[label]
 
         return RatebookResult(
             factor_tables=named_tables,
             lambdas=cd_result.lambdas,
-            total_objective=cd_result.total_objective,
+            total_objective=evaluation.total_objective,
             total_constraints=total_constraints,
-            baseline_objective=cd_result.baseline_objective,
+            baseline_objective=evaluation.baseline_objective,
             baseline_constraints=baseline_constraints,
-            cd_iterations=cd_iter,
-            converged=cd_converged,
-            clamp_rate=avg_clamp,
-            per_factor_results=per_factor_results,
+            cd_iterations=cd_result.cd_iterations,
+            converged=cd_result.converged,
+            clamp_rate=cd_result.clamp_rate,
+            _per_factor_results=per_factor_results,
+            _constraint_bounds=constraint_bounds,
+            _scenario_values=tuple(evaluation.scenario_values),
+            _baseline_scenario_value=evaluation.baseline_scenario_value,
+            _n_quotes=evaluation.n_quotes,
+            _n_quotes_clamped_low=evaluation.n_quotes_clamped_low,
+            _n_quotes_clamped_high=evaluation.n_quotes_clamped_high,
+            _evaluation=evaluation,
+            _quote_results_frame=quote_results_frame,
+        )
+
+    def evaluate(
+        self,
+        df_or_grid: pl.DataFrame | QuoteGrid,
+        factors: pl.DataFrame | RatebookFactorContexts,
+        factor_tables: Mapping[str, Mapping[str, float]],
+    ) -> RatebookEvaluation:
+        """Evaluate ratebook factor tables per quote (DESIGN_DECISIONS §13.3).
+
+        Runs the same kernel ``solve()`` reports from: each quote is priced at
+        the grid step nearest the f32 product of its factor values. Given the
+        tables, the result does not depend on λ.
+        ``evaluate(grid, factors, result.factor_tables)`` reproduces
+        ``result``'s totals and ``quote_results`` exactly, which makes it the
+        supported way to materialise a frontier point or a loaded result.
+
+        Parameters
+        ----------
+        df_or_grid : pl.DataFrame | QuoteGrid
+            Scored DataFrame or pre-built QuoteGrid.
+        factors : pl.DataFrame | RatebookFactorContexts
+            Per-quote factors, as for ``solve()``.
+        factor_tables : Mapping[str, Mapping[str, float]]
+            One table per factor spec (``":".join(columns)``), covering
+            exactly the levels present in ``factors``. Rates must be finite
+            and > 0.
+
+        Returns
+        -------
+        RatebookEvaluation
+            ``quote_results``, ``total_objective``, ``total_constraints``,
+            ``baseline_objective``, ``baseline_constraints``, ``n_quotes``,
+            ``n_quotes_clamped_low``, ``n_quotes_clamped_high``,
+            ``scenario_values`` and ``baseline_scenario_value``.
+        """
+        ratio_names = _ratio_constraint_names(self.constraints)
+        if ratio_names:
+            raise ValueError(
+                f"RatebookOptimiser.evaluate() does not support ratio "
+                f"constraints ({ratio_names}): a ratio has no per-step sum to "
+                f"read from the grid. Use solve() for ratio reporting."
+            )
+        if isinstance(factors, RatebookFactorContexts):
+            factor_specs = _resolve_factor_specs_from_contexts(
+                factors, None, self.factor_columns
+            )
+        elif self.factor_columns is None:
+            raise ValueError(
+                "evaluate() with a factors DataFrame needs factor_columns on "
+                "the optimiser (or pass a RatebookFactorContexts)"
+            )
+        else:
+            factor_specs = self.factor_columns
+        if isinstance(df_or_grid, pl.DataFrame):
+            grid = build_grid(
+                df_or_grid,
+                constraint_columns=list(self.constraints.keys()),
+                quote_id=self.quote_id,
+                scenario_index=self.scenario_index,
+                scenario_value=self.scenario_value,
+                objective=self.objective,
+            )
+        else:
+            grid = df_or_grid
+        contexts = _resolve_factor_contexts(
+            factors, factor_specs, grid=grid, quote_id_col=self.quote_id
+        )
+        solver_contexts = contexts._factor_contexts_for_solver()
+        return evaluate_ratebook_py(
+            grid,
+            solver_contexts,
+            _factor_values_for_contexts(factor_specs, solver_contexts, factor_tables),
         )
 
     def _discover_structure(
@@ -698,7 +998,7 @@ class RatebookOptimiser:
         initial_lambdas: dict[str, float] | None = None,
         max_total_points: int = 10_000,
         parallel: bool = False,
-    ) -> FrontierResult:
+    ) -> RatebookFrontierResult:
         """Sweep the efficient frontier by running coordinate descent at each threshold.
 
         Each frontier point is a full CD solve with modified constraint
@@ -723,15 +1023,26 @@ class RatebookOptimiser:
         initial_lambdas : dict[str, float], optional
             Lambdas to warm-start the first frontier point.
         parallel : bool
-            Accepted for API consistency with ``OnlineOptimiser.frontier()``,
-            but has no effect. Ratebook frontier is Python-orchestrated and
-            always runs sequentially with warm-starting.
+            Must be False: the ratebook frontier runs sequentially, each
+            point warm-started from its neighbours. True raises rather than
+            being silently ignored.
 
         Returns
         -------
-        FrontierResult
-            Result with ``.points`` (DataFrame) and ``.n_points``.
+        RatebookFrontierResult
+            ``.points`` (one row per point; see ``frontier_points_schema``),
+            ``.n_points``, ``.constraint_names`` and ``.factor_tables`` (one
+            table set per row). A point's totals are the canonical
+            evaluation of its tables, so
+            ``evaluate(grid, factors, frontier.point_factor_tables(i))``
+            reproduces row ``i`` exactly; re-solving with the row's λ is not
+            guaranteed to.
         """
+        if parallel:
+            raise ValueError(
+                "RatebookOptimiser.frontier() runs sequentially (each point is "
+                "warm-started from its neighbours); parallel=True is not supported"
+            )
         constraint_names = list(self.constraints.keys())
         if not constraint_names:
             raise ValueError("frontier requires at least one constraint")
@@ -894,7 +1205,7 @@ class RatebookOptimiser:
         )
         prev2_thresholds: list[float] | None = None
         prev2_lambdas: dict[str, float] | None = None
-        points: list[tuple[int, dict[str, Any]]] = []
+        points: list[tuple[int, list[float], _FrontierRow]] = []
 
         for idx in order:
             thresholds = combos[idx]
@@ -947,55 +1258,46 @@ class RatebookOptimiser:
             prev_thresholds = list(thresholds)
             prev_lambdas = result.lambdas
 
-            points.append(
-                (
-                    idx,
-                    {
-                        "thresholds": thresholds,
-                        "total_objective": result.total_objective,
-                        "total_constraints": result.total_constraints,
-                        "lambdas": result.lambdas,
-                        "cd_iterations": result.cd_iterations,
-                        "converged": result.converged,
-                        "clamp_rate": result.clamp_rate,
-                    },
-                )
-            )
+            # Record only what the row and the point's tables need, so the
+            # point's per-quote evaluation is released before the next solve.
+            points.append((idx, thresholds, _FrontierRow.from_result(result)))
+            del result
 
         # Sort back to original (cartesian product) order
         points.sort(key=lambda x: x[0])
+        results = [row for _, _, row in points]
 
-        # Build a Polars DataFrame matching the FrontierResult.points
-        # format. Threshold columns: swept axes echo per-point combo
-        # values; unswept axes echo the constructor threshold verbatim
-        # at every row.
+        # Threshold columns: swept axes echo per-point combo values; unswept
+        # axes echo the constructor threshold verbatim at every row (user
+        # units). ``bound_*`` is the absolute bound each point was solved
+        # against (§13.5).
         columns: dict[str, list[Any]] = {}
         swept_index = {name: idx for idx, name in enumerate(swept_names)}
         for name in constraint_names:
             if name in swept_index:
                 k = swept_index[name]
-                columns[f"threshold_{name}"] = [p[1]["thresholds"][k] for p in points]
+                columns[f"threshold_{name}"] = [t[k] for _, t, _ in points]
             else:
-                fixed_val = unswept_thresholds[name]
-                columns[f"threshold_{name}"] = [fixed_val for _ in points]
-
-        columns["total_objective"] = [p[1]["total_objective"] for p in points]
-
+                columns[f"threshold_{name}"] = [unswept_thresholds[name]] * len(points)
         for name in constraint_names:
-            columns[f"total_{name}"] = [
-                p[1]["total_constraints"].get(name, 0.0) for p in points
-            ]
-
+            columns[f"bound_{name}"] = [r.constraint_bounds[name] for r in results]
+        columns["total_objective"] = [r.total_objective for r in results]
         for name in constraint_names:
-            columns[f"lambda_{name}"] = [p[1]["lambdas"].get(name, 0.0) for p in points]
+            columns[f"total_{name}"] = [r.total_constraints[name] for r in results]
+        for name in constraint_names:
+            columns[f"lambda_{name}"] = [r.lambdas[name] for r in results]
+        columns["iterations"] = [r.cd_iterations for r in results]
+        columns["converged"] = [r.converged for r in results]
+        columns["clamp_rate"] = [r.clamp_rate for r in results]
+        columns["n_quotes_clamped_low"] = [r.n_quotes_clamped_low for r in results]
+        columns["n_quotes_clamped_high"] = [r.n_quotes_clamped_high for r in results]
 
-        columns["iterations"] = [p[1]["cd_iterations"] for p in points]
-        columns["converged"] = [p[1]["converged"] for p in points]
-        columns["clamp_rate"] = [p[1]["clamp_rate"] for p in points]
-
-        return _RatebookFrontierResult(
-            df=pl.DataFrame(columns),
-            _constraint_names=constraint_names,
+        return RatebookFrontierResult(
+            points=pl.DataFrame(
+                columns, schema=frontier_points_schema("ratebook", constraint_names)
+            ),
+            constraint_names=constraint_names,
+            factor_tables=[r.factor_tables for r in results],
         )
 
     def summary(self, result: RatebookResult) -> dict[str, Any]:
@@ -1026,12 +1328,10 @@ class RatebookOptimiser:
                 / abs(result.baseline_objective)
             ) * 100
 
-        for name, val in result.total_constraints.items():
-            metrics[f"constraint_{name}_total"] = val
-        for name, val in result.baseline_constraints.items():
-            metrics[f"constraint_{name}_baseline"] = val
-        for name, val in result.lambdas.items():
-            metrics[f"lambda_{name}"] = val
+        for name in self.constraints:
+            metrics[f"constraint_{name}_total"] = result.total_constraints[name]
+            metrics[f"constraint_{name}_baseline"] = result.baseline_constraints[name]
+            metrics[f"lambda_{name}"] = result.lambdas[name]
 
         artifacts: dict[str, Any] = {
             "factor_tables": result.factor_tables,
@@ -1045,6 +1345,64 @@ class RatebookOptimiser:
             "metrics": metrics,
             "artifacts": artifacts,
         }
+
+
+def _validate_candidate_settings(
+    candidate_min: float,
+    candidate_max: float,
+    candidate_steps: int,
+    max_cd_iterations: int,
+) -> None:
+    """Candidate factor values must be a finite, positive, ordered range: a
+    zero or negative rate would zero or flip a quote's price."""
+    if not (math.isfinite(candidate_min) and candidate_min > 0):
+        raise ValueError(f"candidate_min must be finite and > 0, got {candidate_min}")
+    if not (math.isfinite(candidate_max) and candidate_max >= candidate_min):
+        raise ValueError(
+            f"candidate_max must be finite and >= candidate_min "
+            f"({candidate_min}), got {candidate_max}"
+        )
+    if candidate_steps < 1:
+        raise ValueError(f"candidate_steps must be >= 1, got {candidate_steps}")
+    if max_cd_iterations < 1:
+        raise ValueError(f"max_cd_iterations must be >= 1, got {max_cd_iterations}")
+
+
+def _factor_values_for_contexts(
+    factor_specs: list[list[str]],
+    contexts: list[FactorContext],
+    factor_tables: Mapping[str, Mapping[str, float]],
+) -> list[list[float]]:
+    """Order ``factor_tables`` into per-context value lists (context spec
+    order, each context's ``group_labels`` order). Tables must cover exactly
+    the factors and the levels present in the data."""
+    names = [":".join(spec) for spec in factor_specs]
+    unknown = sorted(set(factor_tables) - set(names))
+    if unknown:
+        raise ValueError(
+            f"factor tables for unknown factor(s) {unknown}; factors: {names}"
+        )
+    missing = [name for name in names if name not in factor_tables]
+    if missing:
+        raise ValueError(f"no factor table for factor(s) {missing}")
+    values: list[list[float]] = []
+    for name, context in zip(names, contexts):
+        table = factor_tables[name]
+        labels = context.group_labels
+        absent = [label for label in labels if label not in table]
+        if absent:
+            raise ValueError(
+                f"factor table '{name}' has no rate for level(s) {absent[:10]!r}"
+                f"{' …' if len(absent) > 10 else ''}"
+            )
+        extra = sorted(set(table) - set(labels))
+        if extra:
+            raise ValueError(
+                f"factor table '{name}' has level(s) {extra[:10]!r} that no quote "
+                f"has{' …' if len(extra) > 10 else ''}"
+            )
+        values.append([table[label] for label in labels])
+    return values
 
 
 def _extrapolate_lambdas(
@@ -1131,28 +1489,85 @@ def _nn_order(
     return order
 
 
-class _RatebookFrontierResult:
-    """Lightweight frontier result for ratebook mode.
+@dataclass(frozen=True)
+class _FrontierRow:
+    """The scalars and factor tables a ratebook frontier row needs from one
+    point's solve (not its per-quote evaluation)."""
 
-    Mirrors the interface of ``FrontierResult`` (from the Rust frontier)
-    so Haute can handle both modes uniformly.
+    factor_tables: dict[str, dict[str, float]]
+    total_objective: float
+    total_constraints: dict[str, float]
+    constraint_bounds: dict[str, float]
+    lambdas: dict[str, float]
+    cd_iterations: int
+    converged: bool
+    clamp_rate: float
+    n_quotes_clamped_low: int
+    n_quotes_clamped_high: int
+
+    @classmethod
+    def from_result(cls, result: RatebookResult) -> _FrontierRow:
+        return cls(
+            factor_tables=result.factor_tables,
+            total_objective=result.total_objective,
+            total_constraints=result.total_constraints,
+            constraint_bounds=result.constraint_bounds,
+            lambdas=result.lambdas,
+            cd_iterations=result.cd_iterations,
+            converged=result.converged,
+            clamp_rate=result.clamp_rate,
+            n_quotes_clamped_low=result.n_quotes_clamped_low,
+            n_quotes_clamped_high=result.n_quotes_clamped_high,
+        )
+
+
+class RatebookFrontierResult:
+    """Frontier result for ratebook mode.
+
+    Mirrors the interface of ``FrontierResult`` (``points``, ``n_points``,
+    ``constraint_names``) and adds each point's factor tables.
     """
 
-    def __init__(self, df: pl.DataFrame, _constraint_names: list[str]) -> None:
-        self._df = df
-        self._constraint_names = _constraint_names
+    def __init__(
+        self,
+        points: pl.DataFrame,
+        constraint_names: list[str],
+        factor_tables: list[dict[str, dict[str, float]]],
+    ) -> None:
+        if len(factor_tables) != points.height:
+            raise ValueError(
+                f"{len(factor_tables)} factor-table sets for {points.height} points"
+            )
+        self._points = points
+        self._constraint_names = constraint_names
+        self._factor_tables = factor_tables
 
     @property
     def points(self) -> pl.DataFrame:
-        return self._df
+        return self._points
 
     @property
     def n_points(self) -> int:
-        return self._df.shape[0]
+        return self._points.height
 
     @property
     def constraint_names(self) -> list[str]:
         return self._constraint_names
+
+    @property
+    def n_converged(self) -> int:
+        return int(self._points["converged"].sum())
+
+    @property
+    def factor_tables(self) -> list[dict[str, dict[str, float]]]:
+        """One ``factor_tables`` dict per row of ``points``."""
+        return self._factor_tables
+
+    def point_factor_tables(self, index: int) -> dict[str, dict[str, float]]:
+        """The factor tables of point ``index`` (a row of ``points``)."""
+        if not 0 <= index < self.n_points:
+            raise IndexError(f"point index {index} out of range [0, {self.n_points})")
+        return self._factor_tables[index]
 
 
 def _count_steps(df: pl.DataFrame, quote_id_col: str) -> int:
@@ -1199,6 +1614,23 @@ def _resolve_factor_specs_from_contexts(
     return contexts_specs
 
 
+def _validate_factor_specs(factor_specs: list[list[str]]) -> None:
+    """Factor names are ``":".join(columns)`` and composite levels join their
+    parts with ``FACTOR_SEPARATOR``, so a column containing either character,
+    or two specs with the same name, would make results ambiguous."""
+    for spec in factor_specs:
+        for column in spec:
+            if ":" in column or FACTOR_SEPARATOR in column:
+                raise ValueError(
+                    f"factor column {column!r} contains ':' or the factor "
+                    f"separator; rename it (factor names are ':'-joined columns)"
+                )
+    names = [":".join(spec) for spec in factor_specs]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise ValueError(f"factor(s) {repeated} are specified more than once")
+
+
 def _resolve_factor_contexts(
     factors: pl.DataFrame | RatebookFactorContexts,
     factor_specs: list[list[str]],
@@ -1224,7 +1656,15 @@ def _resolve_factor_contexts(
     * contexts whose ``n_quotes`` disagrees with the grid are rejected
       with both counts in the message.
     """
+    _validate_factor_specs(factor_specs)
     if isinstance(factors, RatebookFactorContexts):
+        if factors.separator != FACTOR_SEPARATOR:
+            raise ValueError(
+                f"RatebookFactorContexts were built with separator "
+                f"{factors.separator!r}; ratebook results label composite levels "
+                f"with {FACTOR_SEPARATOR!r} (FACTOR_SEPARATOR). Rebuild the "
+                f"contexts with the default separator."
+            )
         if factors.n_quotes != grid.n_quotes:
             raise ValueError(
                 f"RatebookFactorContexts has n_quotes={factors.n_quotes} "

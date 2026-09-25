@@ -19,22 +19,40 @@ use crate::utils::order_lambdas;
 #[pyclass(name = "FrontierResult")]
 pub struct PyFrontierResult {
     inner: FrontierResult,
+    /// Per-constraint factor from the absolute bound the solver used to the
+    /// user's threshold units: 1 for ``min``/``max``, 1/baseline for
+    /// ``min_pct``/``max_pct``.
+    report_scales: Vec<f64>,
 }
 
 #[pymethods]
 impl PyFrontierResult {
     /// Return the frontier as a Polars DataFrame with columns:
-    /// threshold_*, total_objective, total_*, lambda_*, iterations, converged
+    /// threshold_* (user units), bound_* (absolute), total_objective,
+    /// total_*, lambda_*, iterations, converged, solver_path,
+    /// non_convergence_reason, sv_*.
     #[getter]
     fn points(&self, py: Python) -> PyResult<Py<PyAny>> {
         let n_constraints = self.inner.constraint_names.len();
 
         let mut columns: Vec<Column> = Vec::new();
 
-        // Threshold columns
+        // Threshold columns, in the units of the user's threshold_ranges.
+        for (k, name) in self.inner.constraint_names.iter().enumerate() {
+            let scale = self.report_scales[k];
+            let vals: Vec<f64> = self
+                .inner
+                .points
+                .iter()
+                .map(|p| p.thresholds[k] * scale)
+                .collect();
+            columns.push(Column::new(format!("threshold_{name}").into(), &vals));
+        }
+
+        // Absolute bound each point was solved against.
         for (k, name) in self.inner.constraint_names.iter().enumerate() {
             let vals: Vec<f64> = self.inner.points.iter().map(|p| p.thresholds[k]).collect();
-            columns.push(Column::new(format!("threshold_{name}").into(), &vals));
+            columns.push(Column::new(format!("bound_{name}").into(), &vals));
         }
 
         // Total objective
@@ -297,7 +315,12 @@ pub fn sweep_frontier_py(
         // ``max``) constraints already match user units and need no
         // rescaling.
         let baseline = baseline_totals[constraint_idx];
-        let scale = if pct && baseline != 0.0 {
+        let scale = if pct {
+            if baseline == 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "min_pct/max_pct on '{name}' is undefined: baseline total is 0"
+                )));
+            }
             1.0 / baseline
         } else {
             1.0
@@ -319,11 +342,13 @@ pub fn sweep_frontier_py(
     };
 
     // Convert initial_lambdas dict to Vec<f64> in specs_template order
-    let initial_lambda_vec: Option<Vec<f64>> =
-        initial_lambdas.map(|lam_dict| order_lambdas(&lam_dict, &ordered_names));
+    let initial_lambda_vec: Option<Vec<f64>> = initial_lambdas
+        .map(|lam_dict| order_lambdas(&lam_dict, &ordered_names))
+        .transpose()
+        .map_err(PyValueError::new_err)?;
 
     let grid_arc = Arc::clone(&grid.inner);
-    let mut result = py
+    let result = py
         .detach(|| {
             sweep_frontier(
                 &grid_arc,
@@ -335,18 +360,8 @@ pub fn sweep_frontier_py(
         })
         .map_err(|e| PyValueError::new_err(format!("Frontier error: {e}")))?;
 
-    // Rescale recorded thresholds for ``_pct`` constraints back to the
-    // user-supplied fraction units. The inner solver operates on
-    // absolute thresholds; the reported column must match the units of
-    // ``threshold_ranges`` verbatim, so divide by baseline for any
-    // ``min_pct`` / ``max_pct`` axis (numeric or ``None``).
-    if report_scales.iter().any(|&s| s != 1.0) {
-        for point in result.points.iter_mut() {
-            for (k, t) in point.thresholds.iter_mut().enumerate() {
-                *t *= report_scales[k];
-            }
-        }
-    }
-
-    Ok(PyFrontierResult { inner: result })
+    Ok(PyFrontierResult {
+        inner: result,
+        report_scales,
+    })
 }

@@ -4,6 +4,7 @@ pub mod convergence;
 mod grouped;
 mod lambda;
 mod online;
+mod ratebook_eval;
 
 pub use apply::apply_lambdas;
 pub(crate) use apply::{apply_lambdas_no_baselines, ApplyPass};
@@ -13,3 +14,4 @@ pub use grouped::solve_grouped;
 pub use lambda::update_lambdas_subgradient;
 pub use online::solve_online;
 pub(crate) use online::solve_online_with_precomputed;
+pub use ratebook_eval::{evaluate_ratebook, RatebookEvaluation};
