@@ -19,16 +19,23 @@ except PackageNotFoundError:
 from price_contour.apply import ApplyOptimiser, apply_from_grid
 from price_contour.builder import QuoteGrid, QuoteGridBuilder
 from price_contour.frontier import FrontierResult, FrontierResultLike, frontier_summary
+from price_contour._frontier_helpers import frontier_points_schema
 from price_contour.ratebook import (
+    FACTOR_SEPARATOR,
+    PerFactorRecord,
+    RatebookFrontierResult,
     RatebookOptimiser,
     RatebookResult,
+    ResultUnavailableError,
     build_ratebook_factor_contexts_from_parquet_chunked,
+    quote_results_schema,
 )
 from price_contour.solver import OnlineOptimiser
 from price_contour._price_contour import (
     ApplyResult,
     ChunkedApplyResult,
     GroupedSolveResult,
+    RatebookEvaluation,
     RatebookFactorContexts,
     SolveResult,
     apply_lambdas_to_parquet_chunked_py as _apply_lambdas_to_parquet_chunked_inner,
@@ -286,6 +293,13 @@ def apply_lambdas_to_parquet_chunked(
 
 __all__ = [
     "__version__",
+    "FACTOR_SEPARATOR",
+    "PerFactorRecord",
+    "RatebookEvaluation",
+    "RatebookFrontierResult",
+    "ResultUnavailableError",
+    "frontier_points_schema",
+    "quote_results_schema",
     "ApplyOptimiser",
     "apply_from_grid",
     "apply_lambdas_to_parquet_chunked",

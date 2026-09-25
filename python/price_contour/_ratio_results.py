@@ -44,8 +44,10 @@ def _safe_ratio_from_columns(
     output, surfacing the divide-by-zero loud rather than silently
     reporting zero.
     """
-    num_total = float(df[numerator_col].sum())
-    denom_total = float(df[denominator_col].sum())
+    # Float64 accumulation of the (Float32) values, like every other total,
+    # so a reported ratio agrees with the ratio bound derived from it.
+    num_total = float(df[numerator_col].cast(pl.Float64).sum())
+    denom_total = float(df[denominator_col].cast(pl.Float64).sum())
     if denom_total == 0.0:
         return float("nan")
     return num_total / denom_total

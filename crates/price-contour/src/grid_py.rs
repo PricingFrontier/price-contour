@@ -19,6 +19,19 @@ impl PyQuoteGrid {
     }
 }
 
+/// The baseline step of a list of scenario values (the single baseline rule,
+/// `price_contour_core::baseline_step`), for Python-side code that works on
+/// a DataFrame rather than a built grid.
+#[pyfunction]
+pub fn _baseline_step_index(scenario_values: Vec<f32>) -> PyResult<usize> {
+    if scenario_values.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "scenario_values must not be empty",
+        ));
+    }
+    Ok(price_contour_core::baseline_step(&scenario_values))
+}
+
 #[pymethods]
 impl PyQuoteGrid {
     #[getter]
@@ -34,6 +47,19 @@ impl PyQuoteGrid {
     #[getter]
     fn scenario_values(&self) -> Vec<f32> {
         self.inner.scenario_values.clone()
+    }
+
+    /// Index of the baseline step: the scenario value nearest 1.0 (f32),
+    /// lowest index on a tie. See `price_contour_core::baseline_step`.
+    #[getter]
+    fn baseline_step(&self) -> usize {
+        self.inner.baseline_step()
+    }
+
+    /// Scenario value of the baseline step.
+    #[getter]
+    fn baseline_scenario_value(&self) -> f32 {
+        self.inner.scenario_values[self.inner.baseline_step()]
     }
 
     #[getter]

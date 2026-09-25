@@ -7,14 +7,16 @@ use pyo3_polars::PyDataFrame;
 
 use rayon::prelude::*;
 
+use polars::prelude::{BooleanChunked, Float32Chunked, IntoColumn, NewChunkedArray};
 use price_contour_core::{
-    solve_grouped, GroupMapping, GroupedSolveResult, QuoteGrid, SolverConfig,
+    evaluate_ratebook, solve_grouped, GroupMapping, GroupedSolveResult, QuoteGrid,
+    RatebookEvaluation, SolverConfig,
 };
 
 use crate::grid_py::PyQuoteGrid;
 use crate::ratebook_helpers_py::PyFactorContext;
-use crate::solver_py::{build_result_dataframe, parse_constraints};
-use crate::utils::{order_lambdas, zip_to_dict};
+use crate::solver_py::{build_result_dataframe, parse_constraints, spec_bounds};
+use crate::utils::{order_lambdas, zip_to_dict, OrderedDict};
 
 /// Python-visible grouped solve result.
 #[pyclass(name = "GroupedSolveResult")]
@@ -53,7 +55,7 @@ impl PyGroupedSolveResult {
     }
 
     #[getter]
-    fn lambdas(&self) -> HashMap<String, f64> {
+    fn lambdas(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.inner.lambdas)
     }
 
@@ -73,7 +75,7 @@ impl PyGroupedSolveResult {
     }
 
     #[getter]
-    fn total_constraints(&self) -> HashMap<String, f64> {
+    fn total_constraints(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.inner.total_constraints)
     }
 
@@ -83,7 +85,7 @@ impl PyGroupedSolveResult {
     }
 
     #[getter]
-    fn baseline_constraints(&self) -> HashMap<String, f64> {
+    fn baseline_constraints(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.inner.baseline_constraints)
     }
 
@@ -218,8 +220,10 @@ pub fn solve_grouped_py(
 
     let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
-    let initial_lambdas: Option<Vec<f64>> =
-        lambdas.map(|lam_dict| order_lambdas(&lam_dict, &constraint_names));
+    let initial_lambdas: Option<Vec<f64>> = lambdas
+        .map(|lam_dict| order_lambdas(&lam_dict, &constraint_names))
+        .transpose()
+        .map_err(PyValueError::new_err)?;
 
     let result_group_labels = group_mapping_arc.group_labels.clone();
 
@@ -247,34 +251,160 @@ pub fn solve_grouped_py(
     })
 }
 
-/// Result of a full ratebook CD pass run inside Rust. Carries the per-
-/// factor optimal factor values plus the aggregate metrics the Python
-/// orchestrator needs to assemble a `RatebookResult`. Also retains the
-/// last grouped solve's `optimal_steps_per_quote` so the orchestrator
-/// can build the per-quote results DataFrame for ratio reporting.
+/// A ratebook solution evaluated per quote by the canonical kernel
+/// (`price_contour_core::evaluate_ratebook`). Returned by
+/// `evaluate_ratebook_py` and carried by every `RatebookCDResult`, so solve
+/// totals, frontier rows and per-quote results all come from one place.
+#[pyclass(name = "RatebookEvaluation")]
+pub struct PyRatebookEvaluation {
+    inner: RatebookEvaluation,
+    grid: Arc<QuoteGrid>,
+    baseline_objective: f64,
+    baseline_constraints: Vec<f64>,
+    quote_results: Option<Py<PyAny>>,
+}
+
+impl PyRatebookEvaluation {
+    fn evaluate(
+        py: Python<'_>,
+        grid: Arc<QuoteGrid>,
+        mappings: &[Arc<GroupMapping>],
+        factor_values: &[Vec<f32>],
+    ) -> PyResult<Self> {
+        let (inner, (baseline_objective, baseline_constraints)) = py
+            .detach(|| {
+                let mapping_refs: Vec<&GroupMapping> =
+                    mappings.iter().map(|m| m.as_ref()).collect();
+                let value_refs: Vec<&[f32]> = factor_values.iter().map(|v| v.as_slice()).collect();
+                evaluate_ratebook(&grid, &mapping_refs, &value_refs)
+                    .map(|evaluation| (evaluation, grid.baseline_totals()))
+            })
+            .map_err(|e| PyValueError::new_err(format!("Ratebook evaluation error: {e}")))?;
+        Ok(Self {
+            inner,
+            grid,
+            baseline_objective,
+            baseline_constraints,
+            quote_results: None,
+        })
+    }
+}
+
+#[pymethods]
+impl PyRatebookEvaluation {
+    #[getter]
+    fn total_objective(&self) -> f64 {
+        self.inner.total_objective
+    }
+
+    #[getter]
+    fn total_constraints(&self) -> OrderedDict {
+        zip_to_dict(&self.grid.constraint_names, &self.inner.total_constraints)
+    }
+
+    #[getter]
+    fn baseline_objective(&self) -> f64 {
+        self.baseline_objective
+    }
+
+    #[getter]
+    fn baseline_constraints(&self) -> OrderedDict {
+        zip_to_dict(&self.grid.constraint_names, &self.baseline_constraints)
+    }
+
+    #[getter]
+    fn n_quotes(&self) -> usize {
+        self.grid.n_quotes
+    }
+
+    #[getter]
+    fn n_quotes_clamped_low(&self) -> u64 {
+        self.inner.n_clamped_low
+    }
+
+    #[getter]
+    fn n_quotes_clamped_high(&self) -> u64 {
+        self.inner.n_clamped_high
+    }
+
+    #[getter]
+    fn scenario_values(&self) -> Vec<f32> {
+        self.grid.scenario_values.clone()
+    }
+
+    #[getter]
+    fn baseline_scenario_value(&self) -> f32 {
+        self.grid.scenario_values[self.grid.baseline_step()]
+    }
+
+    /// Per-quote results in grid quote order: the online result columns
+    /// (`quote_id`, `optimal_step`, `optimal_scenario_value`,
+    /// `optimal_objective`, `optimal_<c>`) followed by `factor_product`,
+    /// `clamped_low` and `clamped_high`. Built on first access and cached.
+    #[getter]
+    fn quote_results(&mut self, py: Python) -> PyResult<Py<PyAny>> {
+        if let Some(ref cached) = self.quote_results {
+            return Ok(cached.clone_ref(py));
+        }
+        let mut df = build_result_dataframe(&self.inner.optimal_steps, &self.grid)?;
+        let extra = [
+            Float32Chunked::from_slice("factor_product".into(), &self.inner.factor_product)
+                .into_column(),
+            BooleanChunked::from_slice("clamped_low".into(), &self.inner.clamped_low).into_column(),
+            BooleanChunked::from_slice("clamped_high".into(), &self.inner.clamped_high)
+                .into_column(),
+        ];
+        df.hstack_mut(&extra)
+            .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))?;
+        let py_df: Py<PyAny> = PyDataFrame(df).into_pyobject(py)?.into();
+        self.quote_results = Some(py_df.clone_ref(py));
+        Ok(py_df)
+    }
+}
+
+/// Evaluate ratebook factor tables per quote (the canonical kernel).
+///
+/// `factor_values[f][g]` is the rate of level `g` of `contexts[f]`, in that
+/// context's `group_labels` order.
+#[pyfunction]
+pub fn evaluate_ratebook_py(
+    py: Python<'_>,
+    grid: &PyQuoteGrid,
+    contexts: Vec<PyRef<'_, PyFactorContext>>,
+    factor_values: Vec<Vec<f32>>,
+) -> PyResult<PyRatebookEvaluation> {
+    let mappings: Vec<Arc<GroupMapping>> =
+        contexts.iter().map(|c| Arc::clone(c.mapping())).collect();
+    PyRatebookEvaluation::evaluate(py, Arc::clone(&grid.inner), &mappings, &factor_values)
+}
+
+/// One inner grouped solve of the CD pass.
+struct CdCall {
+    cd_iteration: usize,
+    factor_index: usize,
+    total_objective: f64,
+    total_constraints: Vec<f64>,
+    lambdas: Vec<f64>,
+    clamp_rate: f32,
+    iterations: usize,
+    converged: bool,
+}
+
+/// Result of a full ratebook CD pass run inside Rust. Carries the per-factor
+/// optimal factor values, the final λ, one record per inner grouped solve,
+/// and the canonical evaluation of the final factor tables (which supplies
+/// every reported total).
 #[pyclass(name = "RatebookCDResult")]
 pub struct PyRatebookCDResult {
     factor_values: Vec<Vec<f32>>,
     lambdas: Vec<f64>,
     constraint_names: Vec<String>,
-    total_objective: f64,
-    total_constraints: Vec<f64>,
-    baseline_objective: f64,
-    baseline_constraints: Vec<f64>,
+    constraint_bounds: Vec<f64>,
     cd_iterations: usize,
     converged: bool,
     avg_clamp_rate: f32,
-    grid: Arc<QuoteGrid>,
-    optimal_steps_per_quote: Vec<u32>,
-    result_df: Option<Py<PyAny>>,
-    /// Per-(cd_iter × factor) `total_objective` values, one per inner
-    /// `solve_grouped` call. Preserved so the orchestrator can rebuild
-    /// lightweight `per_factor_results` records for backwards-
-    /// compatibility with code that inspects per-call convergence.
-    per_call_total_objectives: Vec<f64>,
-    /// Per-(cd_iter × factor) λ vectors, ordered by constraint index
-    /// (same order as `constraint_names`).
-    per_call_lambdas: Vec<Vec<f64>>,
+    calls: Vec<CdCall>,
+    evaluation: Py<PyRatebookEvaluation>,
 }
 
 #[pymethods]
@@ -288,29 +418,16 @@ impl PyRatebookCDResult {
         self.factor_values.clone()
     }
 
+    /// λ from the last inner grouped solve.
     #[getter]
-    fn lambdas(&self) -> HashMap<String, f64> {
+    fn lambdas(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.lambdas)
     }
 
+    /// Absolute bound each constraint was solved against.
     #[getter]
-    fn total_objective(&self) -> f64 {
-        self.total_objective
-    }
-
-    #[getter]
-    fn total_constraints(&self) -> HashMap<String, f64> {
-        zip_to_dict(&self.constraint_names, &self.total_constraints)
-    }
-
-    #[getter]
-    fn baseline_objective(&self) -> f64 {
-        self.baseline_objective
-    }
-
-    #[getter]
-    fn baseline_constraints(&self) -> HashMap<String, f64> {
-        zip_to_dict(&self.constraint_names, &self.baseline_constraints)
+    fn constraint_bounds(&self) -> OrderedDict {
+        zip_to_dict(&self.constraint_names, &self.constraint_bounds)
     }
 
     #[getter]
@@ -318,56 +435,51 @@ impl PyRatebookCDResult {
         self.cd_iterations
     }
 
+    /// Coordinate-descent convergence: the largest factor-value change over
+    /// the last full pass fell below `cd_tolerance`. Not a feasibility check.
     #[getter]
     fn converged(&self) -> bool {
         self.converged
     }
 
+    /// Unweighted mean of the inner solves' clamp rates (a search-space
+    /// diagnostic; see `docs/DESIGN_DECISIONS.md` §13.11).
     #[getter]
     fn clamp_rate(&self) -> f32 {
         self.avg_clamp_rate
     }
 
+    /// The canonical evaluation of the final factor tables.
     #[getter]
-    fn optimal_steps_per_quote(&self) -> Vec<u32> {
-        self.optimal_steps_per_quote.clone()
+    fn evaluation(&self, py: Python) -> Py<PyRatebookEvaluation> {
+        self.evaluation.clone_ref(py)
     }
 
-    /// Per-call total_objective in solve order (`(cd_iter, factor)`
-    /// loop). Length = `cd_iterations × n_factors` (or earlier if CD
-    /// terminated). Used by the orchestrator to populate
-    /// `RatebookResult.per_factor_results` with lightweight
-    /// monotonicity-checking objects.
+    /// One dict per inner grouped solve, in (CD pass, factor) order, with
+    /// explicit `cd_iteration` (1-based) and `factor_index` fields.
     #[getter]
-    fn per_call_total_objectives(&self) -> Vec<f64> {
-        self.per_call_total_objectives.clone()
-    }
-
-    /// Per-call λ vectors in solve order. Each inner `Vec<f64>` is
-    /// ordered to match `lambdas`'s constraint-name order. Length =
-    /// number of grouped solves run during the CD pass.
-    #[getter]
-    fn per_call_lambdas(&self) -> Vec<HashMap<String, f64>> {
-        self.per_call_lambdas
+    fn per_call_records(&self, py: Python) -> PyResult<Vec<Py<PyAny>>> {
+        self.calls
             .iter()
-            .map(|lam| zip_to_dict(&self.constraint_names, lam))
+            .map(|call| {
+                let record = pyo3::types::PyDict::new(py);
+                record.set_item("cd_iteration", call.cd_iteration)?;
+                record.set_item("factor_index", call.factor_index)?;
+                record.set_item("total_objective", call.total_objective)?;
+                record.set_item(
+                    "total_constraints",
+                    zip_to_dict(&self.constraint_names, &call.total_constraints),
+                )?;
+                record.set_item(
+                    "lambdas",
+                    zip_to_dict(&self.constraint_names, &call.lambdas),
+                )?;
+                record.set_item("clamp_rate", call.clamp_rate)?;
+                record.set_item("inner_iterations", call.iterations)?;
+                record.set_item("inner_converged", call.converged)?;
+                Ok(record.into_any().unbind())
+            })
             .collect()
-    }
-
-    /// Per-quote results DataFrame for the last grouped solve in the
-    /// CD pass — needed by the ratebook orchestrator's ratio-reporting
-    /// path (`_stitch_optimal_ratio_columns`). Built lazily on first
-    /// access and cached.
-    #[getter]
-    fn dataframe(&mut self, py: Python) -> PyResult<Py<PyAny>> {
-        if let Some(ref cached) = self.result_df {
-            return Ok(cached.clone_ref(py));
-        }
-        let df = build_result_dataframe(&self.optimal_steps_per_quote, &self.grid)?;
-        let py_df: Py<PyAny> = PyDataFrame(df).into_pyobject(py)?.into();
-        let cloned = py_df.clone_ref(py);
-        self.result_df = Some(py_df);
-        Ok(cloned)
     }
 }
 
@@ -376,22 +488,23 @@ impl PyRatebookCDResult {
 /// `ratebook_helpers_py::PAR_THRESHOLD`; small portfolios stay scalar.
 const CD_PAR_THRESHOLD: usize = 100_000;
 
-/// Run a full ratebook CD pass entirely in Rust.
+/// Run a full ratebook CD pass entirely in Rust, then evaluate the final
+/// factor tables with the canonical kernel.
 ///
-/// Replaces the Python `for cd_iter: for f_idx: compute_residuals_py +
-/// solve_grouped_py + update_multipliers_py + bookkeeping` loop with a
-/// single PyO3 entry. Within the loop:
+/// Within the loop:
 ///
 /// * residuals are computed in-place from `overall_mult` and the
 ///   current per-factor `factor_values` (group-indexed) — no Python
 ///   round-trip.
 /// * `solve_grouped` runs against the existing affine-cache kernel.
-/// * `overall_mult` is updated in-place using the new factor values.
+/// * `overall_mult` is updated in-place using the new factor values. It is
+///   the search's working multiplier only; reported totals come from the
+///   final `evaluate_ratebook` call.
 /// * `last_lambdas` is threaded as a `Vec<f64>` between calls (no dict
 ///   round-trip).
 ///
-/// The entire body runs inside `py.detach`, so 100k-element float
-/// buffers stay Rust-side across CD iterations.
+/// The loop runs inside `py.detach`, so the float buffers stay Rust-side
+/// across CD iterations.
 #[pyfunction]
 #[pyo3(signature = (
     grid,
@@ -422,6 +535,14 @@ pub fn run_cd_pass_py(
     if n_factors == 0 {
         return Err(PyValueError::new_err("contexts must not be empty"));
     }
+    if max_cd_iterations == 0 {
+        return Err(PyValueError::new_err("max_cd_iterations must be >= 1"));
+    }
+    if let Some(bad) = candidates.iter().find(|c| !c.is_finite() || **c <= 0.0) {
+        return Err(PyValueError::new_err(format!(
+            "candidate factor values must be finite and > 0; got {bad}"
+        )));
+    }
 
     let n_quotes = grid.inner.n_quotes;
     let group_mappings: Vec<Arc<GroupMapping>> =
@@ -439,8 +560,10 @@ pub fn run_cd_pass_py(
     let specs = parse_constraints(constraints, &grid.inner)?;
     let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
-    let initial_lambdas: Option<Vec<f64>> =
-        lambdas.map(|lam_dict| order_lambdas(&lam_dict, &constraint_names));
+    let initial_lambdas: Option<Vec<f64>> = lambdas
+        .map(|lam_dict| order_lambdas(&lam_dict, &constraint_names))
+        .transpose()
+        .map_err(PyValueError::new_err)?;
 
     let config = SolverConfig {
         max_iter,
@@ -450,10 +573,8 @@ pub fn run_cd_pass_py(
 
     let grid_arc = Arc::clone(&grid.inner);
 
-    // Persistent buffers for the whole CD pass. `overall_mult` and
-    // `factor_values` mirror the Python orchestrator's mutable state;
-    // `residuals_buf` is the per-factor scratch passed into
-    // `solve_grouped`.
+    // Persistent buffers for the whole CD pass. Factor values start at 1.0
+    // and candidates are validated > 0, so no factor value is ever 0.
     let mut overall_mult = vec![1.0f32; n_quotes];
     let mut factor_values: Vec<Vec<f32>> = group_mappings
         .iter()
@@ -464,11 +585,7 @@ pub fn run_cd_pass_py(
     let mut last_lambdas: Option<Vec<f64>> = initial_lambdas;
     let mut cd_iter = 0usize;
     let mut cd_converged = false;
-    let mut last_result: Option<GroupedSolveResult> = None;
-    let mut clamp_sum = 0.0f64;
-    let mut clamp_count = 0u64;
-    let mut per_call_total_objectives: Vec<f64> = Vec::new();
-    let mut per_call_lambdas: Vec<Vec<f64>> = Vec::new();
+    let mut calls: Vec<CdCall> = Vec::with_capacity(max_cd_iterations * n_factors);
 
     let cd_tolerance_f32 = cd_tolerance as f32;
 
@@ -479,26 +596,20 @@ pub fn run_cd_pass_py(
 
             for (f_idx, gm) in group_mappings.iter().enumerate() {
                 let group_of = gm.group_of.as_slice();
-                let n_groups_f = gm.n_groups;
 
                 // residuals = overall_mult / factor_values[f_idx][group_of[i]]
                 {
                     let old_values = factor_values[f_idx].as_slice();
                     let om = overall_mult.as_slice();
+                    let residual = |i: usize| om[i] / old_values[group_of[i] as usize];
                     if n_quotes > CD_PAR_THRESHOLD {
                         residuals_buf
                             .par_iter_mut()
                             .enumerate()
-                            .for_each(|(i, slot)| {
-                                let g = group_of[i] as usize;
-                                let fv = old_values[g];
-                                *slot = if fv != 0.0 { om[i] / fv } else { 1.0 };
-                            });
+                            .for_each(|(i, slot)| *slot = residual(i));
                     } else {
                         for (i, slot) in residuals_buf.iter_mut().enumerate() {
-                            let g = group_of[i] as usize;
-                            let fv = old_values[g];
-                            *slot = if fv != 0.0 { om[i] / fv } else { 1.0 };
+                            *slot = residual(i);
                         }
                     }
                 }
@@ -513,70 +624,44 @@ pub fn run_cd_pass_py(
                     &config,
                     last_lambdas.as_deref(),
                 )?;
+                let new_values = result.optimal_factor_values.clone();
 
-                // New factor values per group. Mirror the Python rule:
-                // a 0.0 from solve_grouped means "no active candidate
-                // for this group" and we keep the prior value.
-                let new_values: Vec<f32> = (0..n_groups_f)
-                    .map(|g| {
-                        let nv = result.optimal_factor_values[g];
-                        if nv != 0.0 {
-                            nv
-                        } else {
-                            factor_values[f_idx][g]
-                        }
-                    })
-                    .collect();
-
-                // Track max_change across all groups in this factor.
-                for (g, &nv) in new_values.iter().enumerate() {
-                    let change = (nv - factor_values[f_idx][g]).abs();
-                    if change > max_change {
-                        max_change = change;
-                    }
+                for (&nv, &ov) in new_values.iter().zip(factor_values[f_idx].iter()) {
+                    max_change = max_change.max((nv - ov).abs());
                 }
 
-                // Update overall_mult in place: new_mult[i] =
-                // overall_mult[i] / old_fv * new_fv (or new_fv when
-                // old_fv == 0).
+                // overall_mult[i] = overall_mult[i] / old_fv * new_fv
                 {
                     let old_values = factor_values[f_idx].as_slice();
                     let new_slice = new_values.as_slice();
+                    let update = |i: usize, slot: &mut f32| {
+                        let g = group_of[i] as usize;
+                        *slot = *slot / old_values[g] * new_slice[g];
+                    };
                     if n_quotes > CD_PAR_THRESHOLD {
                         overall_mult
                             .par_iter_mut()
                             .enumerate()
-                            .for_each(|(i, slot)| {
-                                let g = group_of[i] as usize;
-                                let fv_old = old_values[g];
-                                let fv_new = new_slice[g];
-                                *slot = if fv_old != 0.0 {
-                                    *slot / fv_old * fv_new
-                                } else {
-                                    fv_new
-                                };
-                            });
+                            .for_each(|(i, slot)| update(i, slot));
                     } else {
                         for (i, slot) in overall_mult.iter_mut().enumerate() {
-                            let g = group_of[i] as usize;
-                            let fv_old = old_values[g];
-                            let fv_new = new_slice[g];
-                            *slot = if fv_old != 0.0 {
-                                *slot / fv_old * fv_new
-                            } else {
-                                fv_new
-                            };
+                            update(i, slot);
                         }
                     }
                 }
 
                 factor_values[f_idx] = new_values;
-                per_call_total_objectives.push(result.total_objective);
-                per_call_lambdas.push(result.lambdas.clone());
                 last_lambdas = Some(result.lambdas.clone());
-                clamp_sum += result.clamp_rate as f64;
-                clamp_count += 1;
-                last_result = Some(result);
+                calls.push(CdCall {
+                    cd_iteration: iter_idx,
+                    factor_index: f_idx,
+                    total_objective: result.total_objective,
+                    total_constraints: result.total_constraints,
+                    lambdas: result.lambdas,
+                    clamp_rate: result.clamp_rate,
+                    iterations: result.iterations,
+                    converged: result.converged,
+                });
             }
 
             if max_change < cd_tolerance_f32 {
@@ -589,30 +674,23 @@ pub fn run_cd_pass_py(
 
     solver_outcome.map_err(|e| PyValueError::new_err(format!("Grouped solver error: {e}")))?;
 
-    let last = last_result
+    let final_lambdas = last_lambdas
         .ok_or_else(|| PyValueError::new_err("CD loop produced no grouped solve results"))?;
+    let avg_clamp_rate =
+        (calls.iter().map(|c| c.clamp_rate as f64).sum::<f64>() / calls.len() as f64) as f32;
 
-    let avg_clamp_rate = if clamp_count > 0 {
-        (clamp_sum / clamp_count as f64) as f32
-    } else {
-        0.0
-    };
+    let evaluation =
+        PyRatebookEvaluation::evaluate(py, Arc::clone(&grid_arc), &group_mappings, &factor_values)?;
 
     Ok(PyRatebookCDResult {
         factor_values,
-        lambdas: last.lambdas,
+        lambdas: final_lambdas,
+        constraint_bounds: spec_bounds(&specs),
         constraint_names,
-        total_objective: last.total_objective,
-        total_constraints: last.total_constraints,
-        baseline_objective: last.baseline_objective,
-        baseline_constraints: last.baseline_constraints,
         cd_iterations: cd_iter,
         converged: cd_converged,
         avg_clamp_rate,
-        grid: grid_arc,
-        optimal_steps_per_quote: last.optimal_steps_per_quote,
-        result_df: None,
-        per_call_total_objectives,
-        per_call_lambdas,
+        calls,
+        evaluation: Py::new(py, evaluation)?,
     })
 }

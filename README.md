@@ -124,12 +124,21 @@ print(result.factor_tables)
 #  'region': {'London': 1.08, 'South East': 1.01, 'North': 0.93},
 #  'vehicle_power': {'Low': 0.97, 'Medium': 1.0, 'High': 1.06}}
 
+# Per-quote evaluation of the solution: step, scenario value, objective,
+# constraints, factor product and clamp flags for every quote.
+result.quote_results
+
+# Re-evaluate any factor tables exactly (e.g. a loaded result or a frontier point)
+evaluation = optimiser.evaluate(df, factor_df, result.factor_tables)
+
 # Save to disk
 result.save("parameters/")
 
 # Convert to rating-step DataFrames
 tables = result.to_rating_entries()
 ```
+
+Every reported ratebook total is the **canonical evaluation** of the final factor tables: each quote is priced at the grid step nearest the f32 product of its factor values (products outside the grid clamp to the end steps; an exact midpoint goes to the lower step). `evaluate()` runs the same kernel, so it reproduces a result's totals and `quote_results` exactly.
 
 ### Live scoring with stored lambdas
 
@@ -167,7 +176,8 @@ frontier = optimiser.frontier(
     n_points_per_dim=20,
 )
 
-# DataFrame with one row per frontier point
+# DataFrame with one row per frontier point (columns abridged; every
+# constraint also has an absolute `bound_<name>` column)
 print(frontier.points)
 # ┌──────────────────┬─────────────────┬──────────────┬───────────────┬────────────┬───────────┬─────────┬─────────────────┐
 # │ threshold_volume │ total_objective │ total_volume │ lambda_volume │ iterations │ converged │ sv_mean │ sv_pct_increase │
@@ -179,6 +189,10 @@ print(frontier.points)
 ```
 
 Adjacent points are warm-started from each other (nearest-neighbour traversal of the threshold grid), so the full frontier solves much faster than running each point independently. Each point also includes scenario value distribution statistics (`sv_mean`, `sv_std`, percentiles, `sv_pct_increase`/`sv_pct_decrease`).
+
+`threshold_<name>` is in the units of `threshold_ranges` (a fraction of baseline for `min_pct`/`max_pct`); `bound_<name>` is the absolute bound the point was solved against, for every constraint, swept or not. `frontier_points_schema(mode, constraint_names)` returns the exact column schema.
+
+A ratebook frontier keeps each point's factor tables (`frontier.point_factor_tables(i)`); `optimiser.evaluate(grid, factors, frontier.point_factor_tables(i))` reproduces row `i` exactly. Re-solving with a row's λ is not guaranteed to land on the same tables.
 
 **Sweeping a ratio target** — declare the constraint with `None` so the constructor doesn't fix it, then supply the range to `frontier()`:
 
@@ -224,7 +238,7 @@ Constraints with numeric thresholds may be omitted from `threshold_ranges` — t
 
 Constraints are specified as a dictionary. There are two shapes:
 
-**Sum constraints** apply to a single column. The dict key is the column name in your DataFrame, the value specifies direction and threshold. Use ``min`` / ``max`` for absolute thresholds and ``min_pct`` / ``max_pct`` for thresholds expressed as a fraction of baseline (the portfolio totals at scenario_value = 1.0):
+**Sum constraints** apply to a single column. The dict key is the column name in your DataFrame, the value specifies direction and threshold. Use ``min`` / ``max`` for absolute thresholds and ``min_pct`` / ``max_pct`` for thresholds expressed as a fraction of baseline (the portfolio totals at the baseline step: the scenario value nearest 1.0, compared in f32, lowest on a tie):
 
 ```python
 constraints = {
@@ -414,7 +428,9 @@ The Rust core uses:
 
 ### Ratebook mode
 
-For ratebook optimisation, coordinate descent iterates over rating factors. For each factor, a grouped Lagrangian solve finds the best discrete factor value per group (e.g. per age band), with the individual quote scenario value computed as the product of all factor values times a per-quote residual. The inner grouped solve uses the same Lagrangian machinery with remapping to the nearest grid point.
+For ratebook optimisation, coordinate descent iterates over rating factors. For each factor, a grouped Lagrangian solve finds the best discrete factor value per group (e.g. per age band), with the individual quote scenario value computed as the product of all factor values times a per-quote residual. The inner grouped solve uses the same Lagrangian machinery with remapping to the nearest grid point. After the last pass, the final factor tables are evaluated once by the canonical kernel, which supplies every reported number.
+
+`converged` on a ratebook result means only that the factor values stopped moving (max change below `cd_tolerance`); it does not check that the constraints are met. Compare `total_constraints` with `constraint_bounds` for that.
 
 ---
 
@@ -505,7 +521,8 @@ maturin develop
 | Method | Description |
 |---|---|
 | `solve(df_or_grid, factors, *, factor_columns=None, lambdas=None)` | Run ratebook optimisation via coordinate descent. Returns `RatebookResult`. |
-| `frontier(df_or_grid, factors, *, threshold_ranges, n_points_per_dim=5, factor_columns=None, initial_lambdas=None)` | Sweep the efficient frontier via coordinate descent at each threshold. Returns `FrontierResult`. |
+| `evaluate(df_or_grid, factors, factor_tables)` | Evaluate factor tables per quote with the canonical kernel. Returns `RatebookEvaluation`. Tables must cover exactly the factors and levels in `factors`; rates must be finite and > 0. Ratio constraints raise. |
+| `frontier(df_or_grid, factors, *, threshold_ranges, n_points_per_dim=5, factor_columns=None, initial_lambdas=None)` | Sweep the efficient frontier via coordinate descent at each threshold. Returns `RatebookFrontierResult` (points plus each point's factor tables). `parallel=True` raises. |
 | `summary(result)` | Package result into MLflow-ready dicts. |
 
 ### ApplyOptimiser
@@ -531,11 +548,13 @@ maturin develop
 |---|---|---|
 | `converged` | `bool` | Whether the solver converged. |
 | `iterations` | `int` | Number of iterations taken. |
-| `lambdas` | `dict[str, float]` | Final Lagrange multipliers (shadow prices) per constraint. |
+| `lambdas` | `dict[str, float]` | Final Lagrange multipliers per constraint, in constraint order. |
 | `total_objective` | `float` | Portfolio-level objective at optimal solution. |
 | `total_constraints` | `dict[str, float]` | Portfolio-level constraint totals. |
-| `baseline_objective` | `float` | Objective at scenario_value = 1.0. |
-| `baseline_constraints` | `dict[str, float]` | Constraints at scenario_value = 1.0. |
+| `baseline_objective` | `float` | Objective at the baseline step (the scenario value nearest 1.0). |
+| `baseline_constraints` | `dict[str, float]` | Constraints at the baseline step. |
+| `constraint_bounds` | `dict[str, float]` | Absolute bound of each constraint (`baseline × fraction` for `min_pct`/`max_pct`; the ratio bound for ratio constraints). |
+| `baseline_scenario_value` | `float` | Scenario value of the baseline step. |
 | `dataframe` | `pl.DataFrame` | Per-quote results with optimal scenario values. |
 | `history` | `list[dict] \| None` | Per-iteration convergence records (if `record_history=True`). |
 | `n_quotes` | `int` | Number of quotes in the grid. |
@@ -549,8 +568,8 @@ maturin develop
 |---|---|---|
 | `total_objective` | `float` | Portfolio-level objective. |
 | `total_constraints` | `dict[str, float]` | Portfolio-level constraint totals. |
-| `baseline_objective` | `float` | Objective at scenario_value = 1.0. |
-| `baseline_constraints` | `dict[str, float]` | Constraints at scenario_value = 1.0. |
+| `baseline_objective` | `float` | Objective at the baseline step (the scenario value nearest 1.0). |
+| `baseline_constraints` | `dict[str, float]` | Constraints at the baseline step. |
 | `lambdas` | `dict[str, float]` | Applied Lagrange multipliers. |
 | `dataframe` | `pl.DataFrame` | Per-quote results with optimal scenario values. |
 
@@ -562,8 +581,8 @@ Returned by `apply_lambdas_to_parquet_chunked`. Carries the same aggregate total
 |---|---|---|
 | `total_objective` | `float` | Portfolio-level objective at the optimum (summed across chunks in f64). |
 | `total_constraints` | `dict[str, float]` | Portfolio-level constraint totals. |
-| `baseline_objective` | `float` | Objective at scenario_value = 1.0. |
-| `baseline_constraints` | `dict[str, float]` | Constraints at scenario_value = 1.0. |
+| `baseline_objective` | `float` | Objective at the baseline step (the scenario value nearest 1.0). |
+| `baseline_constraints` | `dict[str, float]` | Constraints at the baseline step. |
 | `lambdas` | `dict[str, float]` | Applied Lagrange multipliers. |
 | `output_path` | `str` | Path to the streamed-output parquet. Read back via `pl.read_parquet` or `pl.scan_parquet`. |
 
@@ -571,24 +590,31 @@ Returned by `apply_lambdas_to_parquet_chunked`. Carries the same aggregate total
 
 | Property | Type | Description |
 |---|---|---|
-| `points` | `pl.DataFrame` | One row per frontier point with `threshold_*`, `total_objective`, `total_*`, `lambda_*`, `iterations`, `converged`, and scenario value statistics (`sv_mean`, `sv_std`, `sv_min`, `sv_p5`–`sv_p95`, `sv_max`, `sv_pct_increase`, `sv_pct_decrease`). |
+| `points` | `pl.DataFrame` | One row per frontier point: `threshold_*`, `bound_*`, `total_objective`, `total_*`, `lambda_*`, `iterations`, `converged`, `solver_path`, `non_convergence_reason`, and scenario value statistics (`sv_mean`, `sv_std`, `sv_min`, `sv_p5`–`sv_p95`, `sv_max`, `sv_pct_increase`, `sv_pct_decrease`). Exact schema: `frontier_points_schema("online", constraint_names)`. |
 | `n_points` | `int` | Number of frontier points. |
 
 ### RatebookResult
 
 | Property | Type | Description |
 |---|---|---|
-| `factor_tables` | `dict[str, dict[str, float]]` | Factor name to level-value mapping. |
-| `lambdas` | `dict[str, float]` | Final Lagrange multipliers. |
-| `total_objective` | `float` | Portfolio-level objective at optimal solution. |
-| `total_constraints` | `dict[str, float]` | Portfolio-level constraint totals. |
-| `baseline_objective` | `float` | Objective at scenario_value = 1.0. |
-| `baseline_constraints` | `dict[str, float]` | Constraints at scenario_value = 1.0. |
-| `converged` | `bool` | Whether coordinate descent converged. |
-| `cd_iterations` | `int` | Coordinate descent iterations. |
-| `clamp_rate` | `float` | Fraction of remappings that hit a grid boundary. |
-| `per_factor_results` | `list[GroupedSolveResult]` | Per-factor inner solve results. |
-| `save(path)` | | Save factor tables to a directory (one JSON per factor). |
+| `factor_tables` | `dict[str, dict[str, float]]` | Factor name to level-rate mapping, in factor-spec order. Composite levels join their parts with `FACTOR_SEPARATOR` (`"\x1f"`). |
+| `lambdas` | `dict[str, float]` | Lagrange multipliers from the last inner solve, in constraint order. |
+| `total_objective` | `float` | Objective of the canonical evaluation of `factor_tables`. |
+| `total_constraints` | `dict[str, float]` | Constraint totals of the canonical evaluation. |
+| `constraint_bounds` | `dict[str, float]` | Absolute bound of each constraint. |
+| `baseline_objective` | `float` | Objective at the baseline step (the scenario value nearest 1.0, f32, lowest on a tie). |
+| `baseline_constraints` | `dict[str, float]` | Constraints at the baseline step. |
+| `baseline_scenario_value` | `float` | Scenario value of the baseline step. |
+| `scenario_values` | `tuple[float, ...]` | The grid's scenario values, ascending. |
+| `converged` | `bool` | Coordinate descent converged (factor values stopped moving). Not a feasibility check. |
+| `cd_iterations` | `int` | Coordinate descent passes. |
+| `clamp_rate` | `float` | Search-space diagnostic: the mean, over every grouped solve, of the fraction of (quote, candidate) targets that fell strictly outside the scenario range. It does not count quotes at a grid edge. |
+| `n_quotes` | `int` | Quotes evaluated. |
+| `n_quotes_clamped_low` / `n_quotes_clamped_high` | `int` | Quotes whose factor product lies strictly below / above the scenario range. |
+| `quote_results` | `pl.DataFrame` | Per-quote evaluation: `quote_id`, `optimal_step`, `optimal_scenario_value`, `optimal_objective`, `optimal_<c>`, `factor_product`, `clamped_low`, `clamped_high` (`quote_results_schema(constraint_names)`). Not persisted: raises `ResultUnavailableError` on a loaded result; use `evaluate()`. |
+| `per_factor_results` | `tuple[PerFactorRecord, ...]` | One record per inner grouped solve, with explicit `cd_iteration`, `factor`, `factor_index`, totals, λ, `clamp_rate`, `inner_iterations`, `inner_converged`. |
+| `save(path)` | | Save to a directory (format 2: config.json plus one JSON per factor). Factor names that map to the same file name raise. |
+| `RatebookResult.load(path)` | | Load format 1 or 2. Rejects unknown keys and missing factor files; fields a format-1 save lacks raise `ResultUnavailableError`. |
 | `to_rating_entries()` | `dict[str, pl.DataFrame]` | Convert to rating-step DataFrames. |
 
 ### Utility functions

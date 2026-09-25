@@ -24,7 +24,12 @@ use crate::solver::lambda::update_lambdas_subgradient;
 
 /// Find the step index whose scenario_value is nearest to `target`.
 /// Returns (step_index, was_clamped).
-fn nearest_step(scenario_values: &[f32], target: f32) -> (usize, bool) {
+///
+/// `target <= sv[0]` maps to 0 and `target >= sv[n-1]` to n-1; `was_clamped`
+/// is strict (a target exactly on an end value is not clamped). An exact
+/// midpoint between two steps maps to the lower step. This is the one step
+/// rule for the grouped solver and for `evaluate_ratebook`.
+pub(crate) fn nearest_step(scenario_values: &[f32], target: f32) -> (usize, bool) {
     let n = scenario_values.len();
     if target <= scenario_values[0] {
         return (0, target < scenario_values[0]);

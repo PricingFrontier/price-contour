@@ -28,9 +28,7 @@ from typing import Any
 import polars as pl
 
 
-# Column ordering used by the Python sweep so the resulting DataFrame
-# mirrors the Rust frontier emitter (threshold_*, total_objective,
-# total_*, lambda_*, iterations, converged, sv_*).
+# Scenario-value distribution columns of the online frontier.
 _SV_COLUMNS: tuple[str, ...] = (
     "sv_mean",
     "sv_std",
@@ -77,7 +75,7 @@ def _percentile(sorted_vals: list[float], p: float) -> float:
     """Linear-interpolation percentile (mirrors the Rust helper)."""
     n = len(sorted_vals)
     if n == 0:
-        return 0.0
+        raise ValueError("percentile of an empty list is undefined")
     if n == 1:
         return sorted_vals[0]
     pos = p * (n - 1)
@@ -94,13 +92,13 @@ def _compute_sv_stats_from_dataframe(out_df: pl.DataFrame) -> dict[str, float]:
     output DataFrame and returns the ``sv_*`` summary metrics emitted
     by the Rust frontier (``sv_mean``, ``sv_std``, ``sv_min``,
     ``sv_p5`` / ``p25`` / ``median`` / ``p75`` / ``p95``, ``sv_max``,
-    ``sv_pct_increase``, ``sv_pct_decrease``). Empty results return
-    zeros, matching the Rust behaviour.
+    ``sv_pct_increase``, ``sv_pct_decrease``). A result with no quotes
+    has no distribution and raises.
     """
     sv_series = out_df["optimal_scenario_value"]
     n = sv_series.len()
     if n == 0:
-        return {col: 0.0 for col in _SV_COLUMNS}
+        raise ValueError("scenario-value statistics need at least one quote")
     vals: list[float] = [float(v) for v in sv_series.to_list()]
     sum_v = sum(vals)
     mean = sum_v / n
@@ -134,11 +132,14 @@ class _PythonFrontierResult:
     for parity even where the test contract doesn't pin them.
     """
 
-    __slots__ = ("_points", "_n_points")
+    __slots__ = ("_points", "_n_points", "_constraint_names")
 
-    def __init__(self, *, points_df: pl.DataFrame, n_points: int) -> None:
+    def __init__(
+        self, *, points_df: pl.DataFrame, n_points: int, constraint_names: list[str]
+    ) -> None:
         self._points = points_df
         self._n_points = int(n_points)
+        self._constraint_names = list(constraint_names)
 
     @property
     def points(self) -> pl.DataFrame:
@@ -150,72 +151,62 @@ class _PythonFrontierResult:
 
     @property
     def n_converged(self) -> int:
-        if "converged" not in self._points.columns:
-            return 0
         return int(self._points["converged"].sum())
 
     @property
     def constraint_names(self) -> list[str]:
-        return [
-            c.removeprefix("threshold_")
-            for c in self._points.columns
-            if c.startswith("threshold_")
-        ]
+        return list(self._constraint_names)
+
+
+def frontier_points_schema(
+    mode: str, constraint_names: list[str]
+) -> dict[str, pl.DataType]:
+    """Exact ``{column: dtype}`` of a frontier's ``points`` (DESIGN_DECISIONS
+    §13.12), in column order.
+
+    ``mode`` is ``"online"`` (the Rust sweep and the Python-orchestrated
+    sweep emit the same schema) or ``"ratebook"``.
+    """
+    if mode not in ("online", "ratebook"):
+        raise ValueError(f"mode must be 'online' or 'ratebook', got {mode!r}")
+    schema: dict[str, pl.DataType] = {}
+    for prefix in ("threshold", "bound"):
+        for name in constraint_names:
+            schema[f"{prefix}_{name}"] = pl.Float64()
+    schema["total_objective"] = pl.Float64()
+    for prefix in ("total", "lambda"):
+        for name in constraint_names:
+            schema[f"{prefix}_{name}"] = pl.Float64()
+    schema["iterations"] = pl.Int64()
+    schema["converged"] = pl.Boolean()
+    if mode == "online":
+        schema["solver_path"] = pl.String()
+        schema["non_convergence_reason"] = pl.String()
+        for col in _SV_COLUMNS:
+            schema[col] = pl.Float64()
+    else:
+        schema["clamp_rate"] = pl.Float64()
+        schema["n_quotes_clamped_low"] = pl.Int64()
+        schema["n_quotes_clamped_high"] = pl.Int64()
+    return schema
 
 
 def _build_points_dataframe(
     rows: list[dict[str, Any]], constraint_names: list[str]
 ) -> pl.DataFrame:
-    """Assemble the frontier ``points`` DataFrame in the canonical column
-    order so downstream consumers (``frontier_summary``, plotting code)
-    see the same shape as the Rust frontier emitter.
-
-    Order: ``threshold_<name>`` per constraint, ``total_objective``,
-    ``total_<name>`` per constraint, ``lambda_<name>`` per constraint,
-    ``iterations``, ``converged``, ``sv_*``.
-    """
-    if not rows:
-        return _empty_points_df(constraint_names)
-    ordered_cols: list[str] = []
-    for name in constraint_names:
-        ordered_cols.append(f"threshold_{name}")
-    ordered_cols.append("total_objective")
-    for name in constraint_names:
-        ordered_cols.append(f"total_{name}")
-    for name in constraint_names:
-        ordered_cols.append(f"lambda_{name}")
-    ordered_cols.append("iterations")
-    ordered_cols.append("converged")
-    ordered_cols.extend(_SV_COLUMNS)
-
-    df = pl.DataFrame(rows)
-    # Reorder to canonical layout. Any unexpected extra columns sort to
-    # the end so we don't accidentally drop data.
-    extras = [c for c in df.columns if c not in ordered_cols]
-    return df.select(ordered_cols + extras)
-
-
-def _empty_points_df(constraint_names: list[str] | None = None) -> pl.DataFrame:
-    """Empty DataFrame with the canonical frontier-points schema.
-
-    Used when the cartesian product yields zero combinations or no
-    constraints are configured.
-    """
-    schema: dict[str, Any] = {}
-    if constraint_names:
-        for name in constraint_names:
-            schema[f"threshold_{name}"] = pl.Float64
-    schema["total_objective"] = pl.Float64
-    if constraint_names:
-        for name in constraint_names:
-            schema[f"total_{name}"] = pl.Float64
-        for name in constraint_names:
-            schema[f"lambda_{name}"] = pl.Float64
-    schema["iterations"] = pl.Int64
-    schema["converged"] = pl.Boolean
-    for col in _SV_COLUMNS:
-        schema[col] = pl.Float64
-    return pl.DataFrame(schema=schema)
+    """Assemble an online frontier's ``points`` in the canonical schema
+    (:func:`frontier_points_schema`). Every row must carry exactly the
+    schema's columns."""
+    schema = frontier_points_schema("online", constraint_names)
+    for row in rows:
+        if set(row) != set(schema):
+            missing = sorted(set(schema) - set(row))
+            extra = sorted(set(row) - set(schema))
+            raise ValueError(
+                f"frontier row does not match the points schema: "
+                f"missing {missing}, unexpected {extra}"
+            )
+    return pl.DataFrame(rows, schema=schema)
 
 
 def _python_frontier_orchestrator(
@@ -278,4 +269,6 @@ def _python_frontier_orchestrator(
                 row[key] = float(unswept_thresholds[name])
 
     points_df = _build_points_dataframe(rows, constraint_names)
-    return _PythonFrontierResult(points_df=points_df, n_points=len(rows))
+    return _PythonFrontierResult(
+        points_df=points_df, n_points=len(rows), constraint_names=constraint_names
+    )

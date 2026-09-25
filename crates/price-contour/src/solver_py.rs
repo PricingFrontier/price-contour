@@ -5,6 +5,7 @@ use polars::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
+use rayon::prelude::*;
 
 use price_contour_core::{
     fingerprint_quote_ids, solve_online, ConstraintDirection, ConstraintSpec, QuoteGrid,
@@ -14,7 +15,7 @@ use price_contour_core::{
 use crate::constraint_parsing::validate_constraints_dict;
 use crate::grid_py::PyQuoteGrid;
 use crate::quote_id::quote_id_str_iter;
-use crate::utils::{order_lambdas, zip_to_dict};
+use crate::utils::{order_lambdas, zip_to_dict, OrderedDict};
 
 /// Check if a DataFrame is already sorted by (col1, col2) where col1 is a
 /// quote_id-shaped column (Utf8 or Categorical) and col2 is Int32. Returns
@@ -248,47 +249,47 @@ pub(crate) fn ingest_dataframe(
 
 /// Build result DataFrame from optimal_steps + QuoteGrid.
 ///
-/// Shared by both `PySolveResult.dataframe` and `PyApplyResult.dataframe`.
+/// Shared by `PySolveResult.dataframe`, `PyApplyResult.dataframe` and the
+/// ratebook `quote_results`. Columns are gathered in parallel (order is
+/// preserved) into owned vectors that move into Polars without a second copy.
 pub(crate) fn build_result_dataframe(
     optimal_steps: &[u32],
     grid: &QuoteGrid,
 ) -> PyResult<DataFrame> {
     let n = grid.n_quotes;
     let m = grid.n_steps;
-
-    let mut opt_scenario_values = Vec::with_capacity(n);
-    let mut opt_objectives = Vec::with_capacity(n);
-    let mut opt_constraint_vals: Vec<Vec<f32>> =
-        vec![Vec::with_capacity(n); grid.constraint_names.len()];
-
-    for (q, &opt_step) in optimal_steps.iter().enumerate().take(n) {
-        let step = opt_step as usize;
-        let idx = q * m + step;
-        opt_scenario_values.push(grid.scenario_values[step]);
-        opt_objectives.push(grid.objective[idx]);
-        for (k, con) in grid.constraints.iter().enumerate() {
-            opt_constraint_vals[k].push(con[idx]);
-        }
+    if optimal_steps.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "optimal_steps length {} != n_quotes {n}",
+            optimal_steps.len()
+        )));
     }
+
+    let gather = |values: &[f32]| -> Vec<f32> {
+        optimal_steps
+            .par_iter()
+            .enumerate()
+            .map(|(q, &step)| values[q * m + step as usize])
+            .collect()
+    };
+    let opt_scenario_values: Vec<f32> = optimal_steps
+        .par_iter()
+        .map(|&step| grid.scenario_values[step as usize])
+        .collect();
+    let opt_steps: Vec<i32> = optimal_steps.par_iter().map(|&s| s as i32).collect();
 
     let mut columns: Vec<Column> = vec![
         Column::new("quote_id".into(), &grid.quote_ids),
-        Column::new(
-            "optimal_step".into(),
-            optimal_steps
-                .iter()
-                .map(|&s| s as i32)
-                .collect::<Vec<i32>>(),
-        ),
-        Column::new("optimal_scenario_value".into(), &opt_scenario_values),
-        Column::new("optimal_objective".into(), &opt_objectives),
+        Int32Chunked::from_vec("optimal_step".into(), opt_steps).into_column(),
+        Float32Chunked::from_vec("optimal_scenario_value".into(), opt_scenario_values)
+            .into_column(),
+        Float32Chunked::from_vec("optimal_objective".into(), gather(&grid.objective)).into_column(),
     ];
-
-    for (k, name) in grid.constraint_names.iter().enumerate() {
-        columns.push(Column::new(
-            format!("optimal_{name}").into(),
-            &opt_constraint_vals[k],
-        ));
+    for (name, values) in grid.constraint_names.iter().zip(grid.constraints.iter()) {
+        columns.push(
+            Float32Chunked::from_vec(format!("optimal_{name}").into(), gather(values))
+                .into_column(),
+        );
     }
 
     DataFrame::new(columns)
@@ -301,13 +302,15 @@ pub struct PySolveResult {
     inner: SolveResult,
     grid: Arc<QuoteGrid>,
     constraint_names: Vec<String>,
+    /// Absolute bound of each constraint, in `constraint_names` order.
+    constraint_bounds: Vec<f64>,
     result_df: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PySolveResult {
     #[getter]
-    fn lambdas(&self) -> HashMap<String, f64> {
+    fn lambdas(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.inner.lambdas)
     }
 
@@ -327,7 +330,7 @@ impl PySolveResult {
     }
 
     #[getter]
-    fn total_constraints(&self) -> HashMap<String, f64> {
+    fn total_constraints(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.inner.total_constraints)
     }
 
@@ -348,8 +351,21 @@ impl PySolveResult {
     }
 
     #[getter]
-    fn baseline_constraints(&self) -> HashMap<String, f64> {
+    fn baseline_constraints(&self) -> OrderedDict {
         zip_to_dict(&self.constraint_names, &self.inner.baseline_constraints)
+    }
+
+    /// Absolute bound each constraint was solved against: the threshold for
+    /// `min`/`max`, `baseline × fraction` for `min_pct`/`max_pct`.
+    #[getter]
+    fn constraint_bounds(&self) -> OrderedDict {
+        zip_to_dict(&self.constraint_names, &self.constraint_bounds)
+    }
+
+    /// Scenario value of the baseline step (nearest 1.0).
+    #[getter]
+    fn baseline_scenario_value(&self) -> f32 {
+        self.grid.scenario_values[self.grid.baseline_step()]
     }
 
     #[getter]
@@ -496,7 +512,13 @@ pub(crate) fn parse_constraints(
         };
 
         let threshold = if is_pct {
-            baseline_totals[constraint_idx] * *value
+            let baseline = baseline_totals[constraint_idx];
+            if baseline == 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "min_pct/max_pct on '{name}' is undefined: baseline total is 0"
+                )));
+            }
+            baseline * *value
         } else {
             *value
         };
@@ -508,6 +530,11 @@ pub(crate) fn parse_constraints(
         });
     }
     Ok(specs)
+}
+
+/// Absolute bound of each parsed constraint, in spec order.
+pub(crate) fn spec_bounds(specs: &[ConstraintSpec]) -> Vec<f64> {
+    specs.iter().map(|spec| spec.threshold).collect()
 }
 
 #[pyfunction]
@@ -563,8 +590,10 @@ pub fn solve_online_py(
     let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
     // Build initial_lambdas from the dict, ordered to match specs
-    let initial_lambdas: Option<Vec<f64>> =
-        lambdas.map(|lam_dict| order_lambdas(&lam_dict, &constraint_names));
+    let initial_lambdas: Option<Vec<f64>> = lambdas
+        .map(|lam_dict| order_lambdas(&lam_dict, &constraint_names))
+        .transpose()
+        .map_err(PyValueError::new_err)?;
 
     let result = py
         .detach(|| solve_online(&grid, &specs, &config, initial_lambdas.as_deref()))
@@ -574,6 +603,7 @@ pub fn solve_online_py(
         inner: result,
         grid,
         constraint_names,
+        constraint_bounds: spec_bounds(&specs),
         result_df: None,
     })
 }
@@ -611,8 +641,10 @@ pub fn solve_from_grid_py(
 
     let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
-    let initial_lambdas: Option<Vec<f64>> =
-        lambdas.map(|lam_dict| order_lambdas(&lam_dict, &constraint_names));
+    let initial_lambdas: Option<Vec<f64>> = lambdas
+        .map(|lam_dict| order_lambdas(&lam_dict, &constraint_names))
+        .transpose()
+        .map_err(PyValueError::new_err)?;
 
     let grid_arc = Arc::clone(&grid.inner);
     let result = py
@@ -623,6 +655,7 @@ pub fn solve_from_grid_py(
         inner: result,
         grid: Arc::clone(&grid.inner),
         constraint_names,
+        constraint_bounds: spec_bounds(&specs),
         result_df: None,
     })
 }

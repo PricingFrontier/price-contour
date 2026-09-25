@@ -279,13 +279,15 @@ class TestRunCdPass:
         assert len(result.factor_values[0]) == ctx_a.n_groups
         assert len(result.factor_values[1]) == ctx_b.n_groups
 
-        # Volume constraint must be satisfied within slack.
-        baseline_vol = result.baseline_constraints["volume"]
-        threshold = baseline_vol * 0.90
-        assert result.total_constraints["volume"] >= threshold * (
+        # Volume constraint must be satisfied within slack, judged on the
+        # canonical evaluation of the final factor values.
+        evaluation = result.evaluation
+        threshold = result.constraint_bounds["volume"]
+        assert threshold == evaluation.baseline_constraints["volume"] * 0.90
+        assert evaluation.total_constraints["volume"] >= threshold * (
             1 - CONSTRAINT_RTOL
         ), (
-            f"CD-pass volume {result.total_constraints['volume']} < "
+            f"CD-pass volume {evaluation.total_constraints['volume']} < "
             f"threshold {threshold}"
         )
 
@@ -294,11 +296,10 @@ class TestRunCdPass:
         # the last solve of each sweep should be ≥ the last of the
         # previous sweep, modulo small numerical noise.)
         n_factors = 2
-        per_call = result.per_call_total_objectives
+        records = result.per_call_records
+        assert [r["factor_index"] for r in records] == [0, 1] * result.cd_iterations
         sweep_finals = [
-            per_call[i + n_factors - 1]
-            for i in range(0, len(per_call), n_factors)
-            if i + n_factors - 1 < len(per_call)
+            r["total_objective"] for r in records if r["factor_index"] == n_factors - 1
         ]
         for i in range(len(sweep_finals) - 1):
             assert sweep_finals[i] <= sweep_finals[i + 1] + 1e-3, (
@@ -323,6 +324,17 @@ class TestRunCdPass:
                 candidates,
                 constraints={"volume": {"min_pct": 0.90}},
             )
+
+    @pytest.mark.parametrize("bad", [0.0, -0.5, float("nan"), float("inf")])
+    def test_rejects_non_positive_candidates(self, bad):
+        """A zero, negative or non-finite candidate rate would zero or flip
+        a quote's price; the kernel refuses it instead of the old rule
+        that silently kept the prior factor value."""
+        df = make_small_df(n_quotes=10, n_steps=5)
+        grid = _build_grid(df, constraint_cols=["volume"])
+        ctx = FactorContext.from_labels(["A"] * 10)
+        with pytest.raises(ValueError, match="finite and > 0"):
+            run_cd_pass_py(grid, [ctx], [0.9, bad, 1.1])
 
     def test_rejects_context_n_quotes_mismatch(self):
         """A FactorContext built from a label vector of the wrong
@@ -367,18 +379,18 @@ class TestRunCdPass:
             cd_tolerance=1e-3,
         )
 
-        # Sanity: factor values populated, constraint near-satisfied,
-        # last grouped solve's optimal_steps span the right range.
+        # Sanity: factor values populated, and the evaluation's per-quote
+        # steps span the right range.
         assert len(result.factor_values[0]) == ctx.n_groups
         assert all(0.0 < v for v in result.factor_values[0])
-        steps = result.optimal_steps_per_quote
+        steps = result.evaluation.quote_results["optimal_step"].to_list()
         assert len(steps) == n
         assert all(0 <= s < 5 for s in steps)
 
-    def test_dataframe_getter_lazy_and_idempotent(self):
-        """The `dataframe` getter is built lazily from
-        `optimal_steps_per_quote` and the grid; calling it twice should
-        return the same per-quote rows without re-running the solver.
+    def test_quote_results_getter_lazy_and_idempotent(self):
+        """The evaluation's `quote_results` is built lazily and cached:
+        calling it twice returns the same per-quote rows without
+        re-running the solver.
         """
         n = 50
         df = make_small_df(n_quotes=n, n_steps=5)
@@ -395,10 +407,10 @@ class TestRunCdPass:
             max_cd_iterations=2,
         )
 
-        df_first = result.dataframe
-        df_second = result.dataframe
+        df_first = result.evaluation.quote_results
+        df_second = result.evaluation.quote_results
         # Both calls return DataFrames with the same row count and the
         # same `optimal_step` column values (cached round-trip).
         assert df_first.shape[0] == n
         assert df_second.shape[0] == n
-        assert df_first["optimal_step"].to_list() == df_second["optimal_step"].to_list()
+        assert df_first.equals(df_second)

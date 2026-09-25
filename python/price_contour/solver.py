@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any
+from typing import Any, NamedTuple
 
 import polars as pl
 
@@ -15,6 +15,7 @@ from price_contour._frontier_helpers import (
 )
 from price_contour._grid_utils import build_grid
 from price_contour._price_contour import (
+    _baseline_step_index,
     ApplyResult,
     FrontierResult,
     QuoteGrid,
@@ -154,18 +155,18 @@ class OnlineOptimiser:
         # existing fast path is preserved bit-for-bit.
         ratio_names = _ratio_constraint_names(self.constraints)
         if ratio_names:
-            (
-                modified_df,
-                sum_constraints,
-                _grid_cols,
-                ratio_columns,
-                threshold_shift,
-            ) = _linearise_ratio_constraints(
+            linearised = _linearise_ratio_constraints(
                 df_or_grid,
                 self.constraints,
                 scenario_value_col=self.scenario_value,
+                scenario_index_col=self.scenario_index,
                 quote_id_col=self.quote_id,
             )
+            modified_df = linearised.df
+            sum_constraints = linearised.sum_constraints
+            ratio_columns = linearised.ratio_columns
+            threshold_shift = linearised.threshold_shift
+            ratio_bounds = linearised.ratio_bounds
             inner_result = solve_online_py(
                 modified_df,
                 quote_id=self.quote_id,
@@ -189,6 +190,7 @@ class OnlineOptimiser:
                 scenario_value=self.scenario_value,
                 objective=self.objective,
                 threshold_shift=threshold_shift,
+                ratio_bounds=ratio_bounds,
             )
 
         return solve_online_py(
@@ -247,6 +249,13 @@ class OnlineOptimiser:
         ratio_names = _ratio_constraint_names(self.constraints)
         has_unswept = any(name not in threshold_ranges for name in self.constraints)
         if ratio_names or has_unswept:
+            if parallel:
+                raise ValueError(
+                    "parallel=True is not supported when the frontier is "
+                    "orchestrated in Python (ratio constraints, or constraints "
+                    "without a threshold_ranges entry); points are solved "
+                    "sequentially with warm starts"
+                )
             if ratio_names and not isinstance(df_or_grid, pl.DataFrame):
                 # The ratio linearisation needs raw numerator / denominator
                 # columns at solve time; a pre-built grid has already
@@ -386,6 +395,8 @@ class OnlineOptimiser:
             _check_zero_baseline_denominator_for_pct_ratios(
                 df,
                 self.constraints,
+                quote_id_col=self.quote_id,
+                scenario_index_col=self.scenario_index,
                 scenario_value_col=self.scenario_value,
             )
 
@@ -419,20 +430,29 @@ class OnlineOptimiser:
         def compose_row(
             result: Any, combo: list[float], swept: list[str]
         ) -> dict[str, Any]:
+            converged = bool(result.converged)
             row: dict[str, Any] = {
                 "total_objective": float(result.total_objective),
                 "iterations": int(result.iterations),
-                "converged": bool(result.converged),
+                "converged": converged,
+                # Each point is one subgradient solve(); a non-converged
+                # point ran out of its max_iter budget.
+                "solver_path": "subgradient",
+                "non_convergence_reason": (
+                    None if converged else "iteration_budget_exhausted"
+                ),
             }
             totals = result.total_constraints
             lambdas = result.lambdas
+            bounds = result.constraint_bounds
             swept_idx_map = {name: i for i, name in enumerate(swept)}
             for name in constraint_names:
                 if name in swept_idx_map:
                     threshold_val = float(combo[swept_idx_map[name]])
                     row[f"threshold_{name}"] = threshold_val
-                row[f"total_{name}"] = float(totals.get(name, float("nan")))
-                row[f"lambda_{name}"] = float(lambdas.get(name, 0.0))
+                row[f"bound_{name}"] = float(bounds[name])
+                row[f"total_{name}"] = float(totals[name])
+                row[f"lambda_{name}"] = float(lambdas[name])
 
             # sv_* distribution stats from the per-quote optimal
             # scenario values. Mirrors the Rust frontier emitter so
@@ -527,7 +547,7 @@ class OnlineOptimiser:
             metrics[f"constraint_{name}_baseline"] = baseline
             if baseline != 0:
                 metrics[f"constraint_{name}_ratio"] = (
-                    result.total_constraints.get(name, 0.0) / baseline
+                    result.total_constraints[name] / baseline
                 )
         for name, lam in result.lambdas.items():
             metrics[f"lambda_{name}"] = lam
@@ -565,12 +585,13 @@ class OnlineOptimiser:
         if baseline_obj != 0:
             summary_dict["uplift_pct"] = metrics["uplift_pct"]
         for name, total in result.total_constraints.items():
-            baseline = result.baseline_constraints.get(name, 0.0)
+            baseline = result.baseline_constraints[name]
             entry: dict[str, Any] = {
                 "total": total,
                 "baseline": baseline,
-                "lambda": result.lambdas.get(name, 0.0),
-                "spec": config["constraints"].get(name, {}),
+                "lambda": result.lambdas[name],
+                "bound": result.constraint_bounds[name],
+                "spec": config["constraints"][name],
             }
             if baseline != 0:
                 entry["ratio_to_baseline"] = total / baseline
@@ -747,6 +768,69 @@ def _validate_ratio_spec(name: str, spec: dict) -> None:
         )
 
 
+# Constraint names that would collide with a result column
+# (``total_objective``, ``optimal_step``, ``optimal_scenario_value``,
+# ``optimal_objective``).
+_RESERVED_CONSTRAINT_NAMES = frozenset({"objective", "step", "scenario_value"})
+
+
+def _baseline_rows(
+    df: pl.DataFrame,
+    *,
+    quote_id_col: str,
+    scenario_index_col: str,
+    scenario_value_col: str,
+) -> pl.DataFrame:
+    """Rows of ``df`` at the baseline step (DESIGN_DECISIONS §13.6).
+
+    The baseline is one grid-wide step: the scenario value nearest 1.0 in
+    f32, lowest ``scenario_index`` on a tie — the same rule the Rust grid
+    uses for sum totals and pct bounds (``_baseline_step_index`` calls it).
+    Raises if any quote has no row at that step.
+    """
+    if df.height == 0:
+        raise ValueError("cannot take a baseline of an empty DataFrame")
+    # Every quote carries the same scenario values (the grid builder enforces
+    # it), so the first quote's rows define the steps.
+    steps = (
+        df.filter(pl.col(quote_id_col) == df[quote_id_col][0])
+        .select(scenario_index_col, scenario_value_col)
+        .sort(scenario_index_col)
+    )
+    position = _baseline_step_index(
+        steps[scenario_value_col].cast(pl.Float32).to_list()
+    )
+    baseline_index = steps[scenario_index_col][position]
+    rows = df.filter(pl.col(scenario_index_col) == baseline_index)
+    # One row per (quote, step): the frame is complete iff every quote has
+    # its baseline row, i.e. rows × steps == all rows.
+    if rows.height * steps.height != df.height:
+        n_quotes = df[quote_id_col].n_unique()
+        raise ValueError(
+            f"{n_quotes - rows.height} of {n_quotes} quotes have no row at the "
+            f"baseline step ({scenario_index_col}={baseline_index}, "
+            f"{scenario_value_col}={steps[scenario_value_col][position]})"
+        )
+    return rows
+
+
+class _RatioLinearisation(NamedTuple):
+    """Output of :func:`_linearise_ratio_constraints`."""
+
+    df: pl.DataFrame
+    """Working DataFrame with one synthetic linearised column per ratio label."""
+    sum_constraints: dict[str, dict[str, float | None]]
+    """``constraints`` with each ratio spec rewritten to ``{direction: 0.0}``."""
+    grid_cols: list[str]
+    """Columns the grid should carry (sum columns + linearised columns)."""
+    ratio_columns: list[tuple[str, str, str]]
+    """``(label, numerator, denominator)`` per ratio constraint."""
+    threshold_shift: dict[str, float]
+    """Per-ratio reporting offset (currently always 0.0)."""
+    ratio_bounds: dict[str, float]
+    """Per-ratio absolute bound ``L`` in ratio units (§13.5)."""
+
+
 def _validate_constraint_dict(
     constraints: dict[str, dict[str, float]],
 ) -> None:
@@ -763,6 +847,14 @@ def _validate_constraint_dict(
     column name.
     """
     for name, spec in constraints.items():
+        if name in _RESERVED_CONSTRAINT_NAMES:
+            raise ValueError(
+                f"Constraint name '{name}' is reserved: it collides with the "
+                f"result columns (total_objective, optimal_step, "
+                f"optimal_scenario_value, optimal_objective). Rename the "
+                f"column or ratio label. Reserved names: "
+                f"{sorted(_RESERVED_CONSTRAINT_NAMES)}"
+            )
         if not isinstance(spec, dict):
             raise ValueError(
                 f"Constraint '{name}' value must be a dict, got {type(spec).__name__}"
@@ -929,14 +1021,9 @@ def _linearise_ratio_constraints(
     constraints: dict[str, dict[str, float | None]],
     *,
     scenario_value_col: str,
+    scenario_index_col: str,
     quote_id_col: str,
-) -> tuple[
-    pl.DataFrame,
-    dict[str, dict[str, float | None]],
-    list[str],
-    list[tuple[str, str, str]],
-    dict[str, float],
-]:
+) -> _RatioLinearisation:
     """Linearise ratio constraints into synthetic sum constraints.
 
     Each ratio constraint ``Sigma num_i / Sigma denom_i ⟂ L`` is rewritten
@@ -1000,6 +1087,7 @@ def _linearise_ratio_constraints(
     seen: set[str] = set()
     ratio_columns: list[tuple[str, str, str]] = []
     threshold_shift: dict[str, float] = {}
+    ratio_bounds: dict[str, float] = {}
 
     def _track(col: str) -> None:
         if col not in seen:
@@ -1041,20 +1129,16 @@ def _linearise_ratio_constraints(
                 if col not in baseline_seen:
                     baseline_seen.add(col)
                     baseline_cols.append(col)
-        baseline_df = df.filter(pl.col(scenario_value_col) == 1.0)
-        if baseline_cols:
-            agg = baseline_df.select(
-                [pl.col(c).cast(pl.Float64).sum().alias(c) for c in baseline_cols]
-            )
-            if agg.height > 0:
-                row = agg.row(0)
-                for col, val in zip(baseline_cols, row):
-                    baseline_totals[col] = float(val) if val is not None else 0.0
-            else:
-                # Empty baseline: every aggregated total is treated as
-                # zero so the ``_pct`` zero-denom check fires uniformly.
-                for col in baseline_cols:
-                    baseline_totals[col] = 0.0
+        baseline_df = _baseline_rows(
+            df,
+            quote_id_col=quote_id_col,
+            scenario_index_col=scenario_index_col,
+            scenario_value_col=scenario_value_col,
+        )
+        row = baseline_df.select(
+            [pl.col(c).cast(pl.Float64).sum().alias(c) for c in baseline_cols]
+        ).row(0)
+        baseline_totals = dict(zip(baseline_cols, (float(v) for v in row)))
 
     # Second pass: walk constraints in iteration order and build the
     # synthetic column expressions.
@@ -1090,12 +1174,17 @@ def _linearise_ratio_constraints(
         # need ``baseline_LR = Sigma_baseline num / Sigma_baseline denom``,
         # which is undefined when ``Sigma_baseline denom == 0``.
         is_pct = direction_key in ("min_pct", "max_pct")
-        denom_baseline_total = baseline_totals.get(denominator_col, 0.0)
+        denom_baseline_total = baseline_totals[denominator_col]
         if is_pct:
             if denom_baseline_total == 0.0:
                 raise ValueError(_zero_denom_message(name, denominator_col))
-            num_total = baseline_totals.get(numerator_col, 0.0)
+            num_total = baseline_totals[numerator_col]
             baseline_lr = num_total / denom_baseline_total
+            if baseline_lr == 0.0:
+                raise ValueError(
+                    f"min_pct/max_pct on '{name}' is undefined: baseline ratio is 0 "
+                    f"(the baseline total of '{numerator_col}' is 0)"
+                )
             L = float(threshold_value) * baseline_lr
         else:
             L = float(threshold_value)
@@ -1107,6 +1196,7 @@ def _linearise_ratio_constraints(
         sum_direction = _spec_direction(spec)
         sum_constraints[name] = {sum_direction: 0.0}
         threshold_shift[name] = 0.0
+        ratio_bounds[name] = L
 
         # Materialise the synthetic column ``c_i = num_i - L * denom_i``.
         # Cast to Float32 to match the existing constraint-column dtype
@@ -1124,7 +1214,14 @@ def _linearise_ratio_constraints(
     if new_columns:
         df = df.with_columns(new_columns)
 
-    return df, sum_constraints, grid_cols, ratio_columns, threshold_shift
+    return _RatioLinearisation(
+        df=df,
+        sum_constraints=sum_constraints,
+        grid_cols=grid_cols,
+        ratio_columns=ratio_columns,
+        threshold_shift=threshold_shift,
+        ratio_bounds=ratio_bounds,
+    )
 
 
 class _RatioSolveResultWrapper:
@@ -1154,7 +1251,7 @@ class _RatioSolveResultWrapper:
     * ``baseline_constraints[<ratio_label>]`` (C3): replaces the inner's
       linearised baseline with the actual baseline ratio
       ``Sigma_baseline num / Sigma_baseline denom``, computed from the
-      ``scenario_value == 1.0`` slice of the original DataFrame. Sum
+      baseline-step slice (§13.6) of the original DataFrame. Sum
       constraints pass through.
     * ``history`` (C3): for each iteration record, replays the
       Lagrangian argmax in pure Python using the record's lambdas to
@@ -1209,6 +1306,7 @@ class _RatioSolveResultWrapper:
         "_scenario_value",
         "_objective",
         "_threshold_shift",
+        "_ratio_bounds",
         "_dataframe_cache",
         "_total_constraints_cache",
         "_baseline_constraints_cache",
@@ -1228,8 +1326,10 @@ class _RatioSolveResultWrapper:
         scenario_value: str,
         objective: str,
         threshold_shift: dict[str, float],
+        ratio_bounds: dict[str, float],
     ) -> None:
         self._inner = inner
+        self._ratio_bounds = ratio_bounds
         self._original_df = original_df
         self._modified_df = modified_df
         self._ratio_columns = ratio_columns
@@ -1275,16 +1375,27 @@ class _RatioSolveResultWrapper:
         return out
 
     @property
+    def constraint_bounds(self) -> dict[str, float]:
+        """Absolute bounds (§13.5): ratio labels report the ratio bound ``L``
+        in ratio units rather than the linearised sum's 0."""
+        out = dict(self._inner.constraint_bounds)
+        out.update(self._ratio_bounds)
+        return out
+
+    @property
     def baseline_constraints(self) -> dict[str, float]:
         if self._baseline_constraints_cache is not None:
             return self._baseline_constraints_cache
         # C3 contract: each ratio label reports the actual baseline ratio
         # ``Sigma_baseline num / Sigma_baseline denom`` from rows where
-        # ``scenario_value == 1.0``. Sum constraints pass through.
+        # the baseline step (§13.6). Sum constraints pass through.
         out = dict(self._inner.baseline_constraints)
         if self._ratio_columns:
-            baseline_slice = self._original_df.filter(
-                pl.col(self._scenario_value) == 1.0
+            baseline_slice = _baseline_rows(
+                self._original_df,
+                quote_id_col=self._quote_id,
+                scenario_index_col=self._scenario_index,
+                scenario_value_col=self._scenario_value,
             )
             for label, num_col, denom_col in self._ratio_columns:
                 out[label] = _safe_ratio_from_columns(
@@ -1456,7 +1567,7 @@ class _RatioApplyResultWrapper:
       ``optimal_*`` columns. Sum constraints pass through.
     * ``baseline_constraints[<ratio_label>]``: the actual baseline ratio
       ``Sigma_baseline num / Sigma_baseline denom`` over rows where
-      ``scenario_value == 1.0`` on the apply-time DataFrame. Sum
+      the baseline step (§13.6) of the apply-time DataFrame. Sum
       constraints pass through.
 
     No ``history`` attribute — :class:`ApplyResult` does not carry one
@@ -1530,8 +1641,11 @@ class _RatioApplyResultWrapper:
             return self._baseline_constraints_cache
         out = dict(self._inner.baseline_constraints)
         if self._ratio_columns:
-            baseline_slice = self._original_df.filter(
-                pl.col(self._scenario_value) == 1.0
+            baseline_slice = _baseline_rows(
+                self._original_df,
+                quote_id_col=self._quote_id,
+                scenario_index_col=self._scenario_index,
+                scenario_value_col=self._scenario_value,
             )
             for label, num_col, denom_col in self._ratio_columns:
                 out[label] = _safe_ratio_from_columns(
@@ -1781,6 +1895,8 @@ def _check_zero_baseline_denominator_for_pct_ratios(
     df: pl.DataFrame,
     constraints: dict[str, dict[str, float | None]],
     *,
+    quote_id_col: str,
+    scenario_index_col: str,
     scenario_value_col: str,
 ) -> None:
     """Pre-flight check for ``min_pct`` / ``max_pct`` ratio constraints.
@@ -1801,13 +1917,13 @@ def _check_zero_baseline_denominator_for_pct_ratios(
                 break
     if not pct_ratios:
         return
-    baseline = df.filter(pl.col(scenario_value_col) == 1.0)
+    baseline = _baseline_rows(
+        df,
+        quote_id_col=quote_id_col,
+        scenario_index_col=scenario_index_col,
+        scenario_value_col=scenario_value_col,
+    )
     for name, denom_col in pct_ratios:
-        # Defensive: if the baseline slice is empty, treat as zero
-        # (the linearisation helper does the same).
-        if baseline.height == 0:
-            denom_total = 0.0
-        else:
-            denom_total = float(baseline[denom_col].cast(pl.Float64).sum())
+        denom_total = float(baseline[denom_col].cast(pl.Float64).sum())
         if denom_total == 0.0:
             raise ValueError(_zero_denom_message(name, denom_col))

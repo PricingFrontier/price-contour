@@ -136,18 +136,16 @@ class ApplyOptimiser:
         # the existing fast path is preserved bit-for-bit.
         ratio_names = _ratio_constraint_names(self.constraints)
         if ratio_names:
-            (
-                modified_df,
-                sum_constraints,
-                _grid_cols,
-                ratio_columns,
-                _threshold_shift,
-            ) = _linearise_ratio_constraints(
+            linearised = _linearise_ratio_constraints(
                 df,
                 self.constraints,
                 scenario_value_col=self.scenario_value,
+                scenario_index_col=self.scenario_index,
                 quote_id_col=self.quote_id,
             )
+            modified_df = linearised.df
+            sum_constraints = linearised.sum_constraints
+            ratio_columns = linearised.ratio_columns
             inner_result = apply_lambdas_py(
                 modified_df,
                 lambdas=self.lambdas,
@@ -258,14 +256,13 @@ class ApplyOptimiser:
         # phantom column they didn't supply.
         ratio_names: set[str] = set(_ratio_constraint_names(self.constraints))
         if ratio_names:
-            modified_df, _sum_specs, _grid_cols, _ratio_columns, _shift = (
-                _linearise_ratio_constraints(
-                    df,
-                    self.constraints,
-                    scenario_value_col=self.scenario_value,
-                    quote_id_col=self.quote_id,
-                )
-            )
+            modified_df = _linearise_ratio_constraints(
+                df,
+                self.constraints,
+                scenario_value_col=self.scenario_value,
+                scenario_index_col=self.scenario_index,
+                quote_id_col=self.quote_id,
+            ).df
         else:
             modified_df = df
 

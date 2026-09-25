@@ -245,9 +245,11 @@ class TestRatebookSave:
 
             interaction = json.loads((out / "region_age.json").read_text())
             assert interaction["columns"] == ["region", "age"]
-            # Keys should be compound "val1:val2"
+            # Composite keys are written verbatim, joined by the factor
+            # separator (JSON escapes it as \u001f).
+            assert set(interaction["table"]) == set(result.factor_tables["region:age"])
             for key in interaction["table"]:
-                assert ":" in key
+                assert key.split(pc.FACTOR_SEPARATOR)[0] in {"N", "S"}
 
 
 class TestApplySerialisationErrors:

@@ -7,6 +7,7 @@ generated inputs, catching edge cases that hand-crafted fixtures miss.
 from __future__ import annotations
 
 
+import numpy as np
 import polars as pl
 from hypothesis import given, settings, assume
 import hypothesis.strategies as st
@@ -30,7 +31,9 @@ def quote_grid_strategy(draw: st.DrawFn) -> tuple[pl.DataFrame, int, int]:
     n_quotes = draw(st.integers(2, 30))
     n_steps = draw(st.integers(2, 8))
 
-    # Draw n_steps distinct, sorted scenario values in [0.5, 2.0]
+    # Draw n_steps distinct, sorted scenario values in [0.5, 2.0]. They
+    # must stay distinct after the Float32 cast: grids require strictly
+    # increasing scenario values.
     scenario_values = draw(
         st.lists(
             st.floats(0.5, 2.0, allow_nan=False, allow_infinity=False),
@@ -39,8 +42,8 @@ def quote_grid_strategy(draw: st.DrawFn) -> tuple[pl.DataFrame, int, int]:
             unique=True,
         )
     )
-    assume(len(set(scenario_values)) == n_steps)
-    scenario_values = sorted(scenario_values)
+    scenario_values = sorted({float(np.float32(v)) for v in scenario_values})
+    assume(len(scenario_values) == n_steps)
 
     rows: list[dict] = []
     for q in range(n_quotes):
