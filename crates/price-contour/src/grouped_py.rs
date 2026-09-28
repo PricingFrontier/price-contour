@@ -9,13 +9,16 @@ use rayon::prelude::*;
 
 use polars::prelude::{BooleanChunked, Float32Chunked, IntoColumn, NewChunkedArray};
 use price_contour_core::{
-    evaluate_ratebook, solve_grouped, GroupMapping, GroupedSolveResult, QuoteGrid,
-    RatebookEvaluation, SolverConfig,
+    check_cancelled, evaluate_ratebook, evaluate_ratebook_cancellable, solve_grouped, CancelFlag,
+    GroupMapping, GroupedSolveResult, QuoteGrid, RatebookEvaluation, SolverConfig,
 };
 
+use crate::cancel_py::{core_error, flag_of, PyCancelToken};
 use crate::grid_py::PyQuoteGrid;
 use crate::ratebook_helpers_py::PyFactorContext;
-use crate::solver_py::{build_result_dataframe, parse_constraints, spec_bounds};
+use crate::solver_py::{
+    build_result_dataframe, build_result_dataframe_polling, parse_constraints, spec_bounds,
+};
 use crate::utils::{order_lambdas, zip_to_dict, OrderedDict};
 
 /// Python-visible grouped solve result.
@@ -262,6 +265,9 @@ pub struct PyRatebookEvaluation {
     baseline_objective: f64,
     baseline_constraints: Vec<f64>,
     quote_results: Option<Py<PyAny>>,
+    /// The token of the call that produced this evaluation; a first access
+    /// to the lazily built `quote_results` honours it.
+    cancel: Option<CancelFlag>,
 }
 
 impl PyRatebookEvaluation {
@@ -270,22 +276,32 @@ impl PyRatebookEvaluation {
         grid: Arc<QuoteGrid>,
         mappings: &[Arc<GroupMapping>],
         factor_values: &[Vec<f32>],
+        cancel: Option<CancelFlag>,
     ) -> PyResult<Self> {
         let (inner, (baseline_objective, baseline_constraints)) = py
             .detach(|| {
                 let mapping_refs: Vec<&GroupMapping> =
                     mappings.iter().map(|m| m.as_ref()).collect();
                 let value_refs: Vec<&[f32]> = factor_values.iter().map(|v| v.as_slice()).collect();
-                evaluate_ratebook(&grid, &mapping_refs, &value_refs)
-                    .map(|evaluation| (evaluation, grid.baseline_totals()))
+                match cancel.as_ref() {
+                    None => evaluate_ratebook(&grid, &mapping_refs, &value_refs)
+                        .map(|evaluation| (evaluation, grid.baseline_totals())),
+                    Some(flag) => {
+                        evaluate_ratebook_cancellable(&grid, &mapping_refs, &value_refs, flag)
+                            .and_then(|evaluation| {
+                                Ok((evaluation, grid.baseline_totals_cancellable(flag)?))
+                            })
+                    }
+                }
             })
-            .map_err(|e| PyValueError::new_err(format!("Ratebook evaluation error: {e}")))?;
+            .map_err(|e| core_error("Ratebook evaluation error", e))?;
         Ok(Self {
             inner,
             grid,
             baseline_objective,
             baseline_constraints,
             quote_results: None,
+            cancel,
         })
     }
 }
@@ -346,16 +362,30 @@ impl PyRatebookEvaluation {
         if let Some(ref cached) = self.quote_results {
             return Ok(cached.clone_ref(py));
         }
-        let mut df = build_result_dataframe(&self.inner.optimal_steps, &self.grid)?;
-        let extra = [
-            Float32Chunked::from_slice("factor_product".into(), &self.inner.factor_product)
-                .into_column(),
-            BooleanChunked::from_slice("clamped_low".into(), &self.inner.clamped_low).into_column(),
-            BooleanChunked::from_slice("clamped_high".into(), &self.inner.clamped_high)
-                .into_column(),
-        ];
-        df.hstack_mut(&extra)
+        let (inner, grid, cancel) = (&self.inner, &self.grid, self.cancel.as_ref());
+        let df = py.detach(|| -> PyResult<_> {
+            let mut df = build_result_dataframe_polling(&inner.optimal_steps, grid, cancel)?;
+            // The three extra columns are plain copies of retained vectors,
+            // each one O(n_quotes) memcpy; the token is checked between them.
+            let check =
+                || check_cancelled(cancel).map_err(|e| core_error("DataFrame build failed", e));
+            check()?;
+            let factor_product =
+                Float32Chunked::from_slice("factor_product".into(), &inner.factor_product);
+            check()?;
+            let clamped_low = BooleanChunked::from_slice("clamped_low".into(), &inner.clamped_low);
+            check()?;
+            let clamped_high =
+                BooleanChunked::from_slice("clamped_high".into(), &inner.clamped_high);
+            check()?;
+            df.hstack_mut(&[
+                factor_product.into_column(),
+                clamped_low.into_column(),
+                clamped_high.into_column(),
+            ])
             .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))?;
+            Ok(df)
+        })?;
         let py_df: Py<PyAny> = PyDataFrame(df).into_pyobject(py)?.into();
         self.quote_results = Some(py_df.clone_ref(py));
         Ok(py_df)
@@ -367,15 +397,23 @@ impl PyRatebookEvaluation {
 /// `factor_values[f][g]` is the rate of level `g` of `contexts[f]`, in that
 /// context's `group_labels` order.
 #[pyfunction]
+#[pyo3(signature = (grid, contexts, factor_values, *, cancel = None))]
 pub fn evaluate_ratebook_py(
     py: Python<'_>,
     grid: &PyQuoteGrid,
     contexts: Vec<PyRef<'_, PyFactorContext>>,
     factor_values: Vec<Vec<f32>>,
+    cancel: Option<&Bound<'_, PyCancelToken>>,
 ) -> PyResult<PyRatebookEvaluation> {
     let mappings: Vec<Arc<GroupMapping>> =
         contexts.iter().map(|c| Arc::clone(c.mapping())).collect();
-    PyRatebookEvaluation::evaluate(py, Arc::clone(&grid.inner), &mappings, &factor_values)
+    PyRatebookEvaluation::evaluate(
+        py,
+        Arc::clone(&grid.inner),
+        &mappings,
+        &factor_values,
+        flag_of(cancel),
+    )
 }
 
 /// One inner grouped solve of the CD pass.
@@ -679,8 +717,13 @@ pub fn run_cd_pass_py(
     let avg_clamp_rate =
         (calls.iter().map(|c| c.clamp_rate as f64).sum::<f64>() / calls.len() as f64) as f32;
 
-    let evaluation =
-        PyRatebookEvaluation::evaluate(py, Arc::clone(&grid_arc), &group_mappings, &factor_values)?;
+    let evaluation = PyRatebookEvaluation::evaluate(
+        py,
+        Arc::clone(&grid_arc),
+        &group_mappings,
+        &factor_values,
+        None,
+    )?;
 
     Ok(PyRatebookCDResult {
         factor_values,

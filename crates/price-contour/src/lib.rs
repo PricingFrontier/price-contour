@@ -1,5 +1,6 @@
 mod apply_py;
 mod builder_py;
+pub(crate) mod cancel_py;
 pub(crate) mod constraint_parsing;
 mod factor_context_py;
 mod frontier_py;
@@ -15,6 +16,8 @@ use pyo3::prelude::*;
 
 #[pymodule]
 fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<cancel_py::PyCancelToken>()?;
+    m.add("Cancelled", m.py().get_type::<cancel_py::Cancelled>())?;
     m.add_class::<solver_py::PySolveResult>()?;
     m.add_function(wrap_pyfunction!(solver_py::solve_online_py, m)?)?;
     m.add_function(wrap_pyfunction!(solver_py::solve_from_grid_py, m)?)?;

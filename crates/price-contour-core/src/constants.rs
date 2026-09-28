@@ -52,3 +52,8 @@ pub const RATIO_LINEARISED_TOLERANCE_MULTIPLIER: f64 = 1000.0;
 /// recompute path instead of materialising the cache. Sized to fit
 /// comfortably alongside a typical `QuoteGrid` on commodity hardware.
 pub const MAX_REMAP_TABLE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Quotes between cancellation polls in the sequential scans (baseline totals,
+/// the per-quote frame's string column). Large enough that the check costs
+/// nothing measurable, small enough that a cancel lands within milliseconds.
+pub const CANCEL_POLL_QUOTES: usize = 65_536;

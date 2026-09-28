@@ -377,6 +377,33 @@ The **whole-portfolio** `optimal_steps` array is never materialised — only one
 
 ---
 
+## Cancelling a long call
+
+`apply_from_grid` and `RatebookOptimiser.evaluate` take an optional
+keyword-only `cancel=CancelToken()`. Another thread calls `token.cancel()` to
+stop the call, which raises `Cancelled` (a `RuntimeError`, never a
+`ValueError`). Both calls run with the GIL released and poll the token once
+per block of quotes in every phase, including the lazily built per-quote
+frame, so a cancel lands within milliseconds even on large books.
+
+```python
+import threading
+from price_contour import Cancelled, CancelToken, apply_from_grid
+
+token = CancelToken()
+threading.Timer(0.5, token.cancel).start()   # e.g. the user moved on
+try:
+    frame = apply_from_grid(grid, lambdas, constraints, cancel=token).dataframe
+except Cancelled:
+    frame = None
+```
+
+A result keeps its call's token: cancelling after the call returned still
+stops a first access to `dataframe` / `quote_results`, and nothing is cached.
+Input errors are reported as `ValueError` even when the token is already
+cancelled. Without a token, both calls behave exactly as before. See
+`docs/DESIGN_DECISIONS.md` §14 and `scripts/bench_cancel.py`.
+
 ## MLflow integration
 
 Both `OnlineOptimiser` and `RatebookOptimiser` produce MLflow-ready summaries:
@@ -521,7 +548,7 @@ maturin develop
 | Method | Description |
 |---|---|
 | `solve(df_or_grid, factors, *, factor_columns=None, lambdas=None)` | Run ratebook optimisation via coordinate descent. Returns `RatebookResult`. |
-| `evaluate(df_or_grid, factors, factor_tables)` | Evaluate factor tables per quote with the canonical kernel. Returns `RatebookEvaluation`. Tables must cover exactly the factors and levels in `factors`; rates must be finite and > 0. Ratio constraints raise. |
+| `evaluate(df_or_grid, factors, factor_tables, *, cancel=None)` | Evaluate factor tables per quote with the canonical kernel. Returns `RatebookEvaluation`. Tables must cover exactly the factors and levels in `factors`; rates must be finite and > 0. Ratio constraints raise. `cancel` takes a `CancelToken`; pass a `QuoteGrid` to make the whole call cancellable (building a grid from a DataFrame is not). |
 | `frontier(df_or_grid, factors, *, threshold_ranges, n_points_per_dim=5, factor_columns=None, initial_lambdas=None)` | Sweep the efficient frontier via coordinate descent at each threshold. Returns `RatebookFrontierResult` (points plus each point's factor tables). `parallel=True` raises. |
 | `summary(result)` | Package result into MLflow-ready dicts. |
 
@@ -624,7 +651,7 @@ Returned by `apply_lambdas_to_parquet_chunked`. Carries the same aggregate total
 | `build_grid_from_parquet(path, constraint_columns, *, ...)` | Build a `QuoteGrid` directly from a Parquet file. Loads the projected columns whole; column projection prunes everything outside `constraint_columns` + the four schema columns. Sum constraints only — ratio constraints require a DataFrame. |
 | `build_grid_from_parquet_chunked(path, constraint_columns, chunk_size, *, n_steps=None, ...)` | Stream a Parquet file in fixed-size row slices via Polars' `with_slice` pushdown. Memory peak for the parquet decode buffer is bounded by `chunk_size`; the final `QuoteGrid` is still O(total_rows). `chunk_size` is rounded down to a multiple of `n_steps` so every slice ends on a quote boundary. Use when the parquet itself doesn't fit in RAM. |
 | `apply_lambdas_to_parquet_chunked(parquet_in, parquet_out, lambdas, constraints, chunk_size, *, n_steps=None, ...)` | Stream a parquet through `apply` and write per-quote results to `parquet_out` one row group per chunk. Returns `ChunkedApplyResult` with aggregate totals; per-quote rows live in the output parquet. The input/output paths are checked for equality (refuses to overwrite the input), and any error best-effort-deletes the partial output. |
-| `apply_from_grid(grid, lambdas, constraints)` | Single-pass Lagrangian apply on an existing `QuoteGrid`. Returns `ApplyResult`. Sum constraints only; ratio constraints raise `ValueError` (use `ApplyOptimiser.apply(df)` on a DataFrame instead — the grid path can't carry numerator/denominator columns for linearisation). |
+| `apply_from_grid(grid, lambdas, constraints, *, cancel=None)` | Single-pass Lagrangian apply on an existing `QuoteGrid`. Returns `ApplyResult`. Sum constraints only; ratio constraints raise `ValueError` (use `ApplyOptimiser.apply(df)` on a DataFrame instead — the grid path can't carry numerator/denominator columns for linearisation). `cancel` takes a `CancelToken` (see [Cancelling a long call](#cancelling-a-long-call)). |
 | `frontier_summary(frontier_result, selected_index)` | Package a frontier result into MLflow-ready `params`, `metrics`, `artifacts` dicts. |
 
 ---

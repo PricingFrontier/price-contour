@@ -397,6 +397,12 @@ pub fn apply(
 
 This is microseconds — one pass over M values. The cost is dominated by whatever upstream model scoring produces the input values.
 
+Applying stored lambdas to a whole grid (`apply_from_grid`) and the canonical
+ratebook evaluation are cancellable: the core kernels take an optional
+`CancelFlag` (`crates/price-contour-core/src/cancel.rs`) and poll it once per
+parallel grain or `CANCEL_POLL_QUOTES` block, and the bindings expose it as
+`CancelToken` / `Cancelled`. See `DESIGN_DECISIONS.md` §14.
+
 ---
 
 ## Efficient Frontier

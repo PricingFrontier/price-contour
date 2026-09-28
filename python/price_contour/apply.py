@@ -9,6 +9,7 @@ import polars as pl
 
 from price_contour._price_contour import (
     ApplyResult,
+    CancelToken,
     apply_from_grid_py,
     apply_lambdas_py,
 )
@@ -480,6 +481,8 @@ def apply_from_grid(
     grid: QuoteGrid,
     lambdas: dict[str, float],
     constraints: dict[str, dict[str, float]],
+    *,
+    cancel: CancelToken | None = None,
 ) -> ApplyResult:
     """Single-pass Lagrangian apply on an existing QuoteGrid.
 
@@ -497,6 +500,12 @@ def apply_from_grid(
         Fixed Lagrange multipliers keyed by constraint name.
     constraints : dict[str, dict[str, float]]
         Constraint specifications (same format as ``OnlineOptimiser``).
+
+    cancel : CancelToken, optional
+        Cooperative cancellation (DESIGN_DECISIONS §14). Once another thread
+        calls ``cancel.cancel()``, the call raises :class:`Cancelled`; so does
+        a first access to the result's ``dataframe``. Without a token the call
+        behaves exactly as before.
 
     Returns
     -------
@@ -528,4 +537,4 @@ def apply_from_grid(
     # ``NotImplementedError`` — the feature is available, just not via
     # this entry point) and point the user at the DataFrame-shape apply.
     _reject_ratio_for_grid(constraints, mode="apply")
-    return apply_from_grid_py(grid, lambdas, constraints)
+    return apply_from_grid_py(grid, lambdas, constraints, cancel=cancel)

@@ -7,11 +7,13 @@ use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 use rayon::prelude::*;
 
+use price_contour_core::constants::{CANCEL_POLL_QUOTES, RECONSTRUCT_PAR_GRAIN};
 use price_contour_core::{
-    fingerprint_quote_ids, solve_online, ConstraintDirection, ConstraintSpec, QuoteGrid,
-    SolveResult, SolverConfig,
+    check_cancelled, fingerprint_quote_ids, solve_online, CancelFlag, ConstraintDirection,
+    ConstraintSpec, QuoteGrid, SolveResult, SolverConfig,
 };
 
+use crate::cancel_py::core_error;
 use crate::constraint_parsing::validate_constraints_dict;
 use crate::grid_py::PyQuoteGrid;
 use crate::quote_id::quote_id_str_iter;
@@ -256,6 +258,17 @@ pub(crate) fn build_result_dataframe(
     optimal_steps: &[u32],
     grid: &QuoteGrid,
 ) -> PyResult<DataFrame> {
+    build_result_dataframe_polling(optimal_steps, grid, None)
+}
+
+/// [`build_result_dataframe`], polling `cancel` once per block of rows in
+/// every column (never once per column), raising `Cancelled` once it is set.
+/// Holds no Python state, so callers run it with the GIL released.
+pub(crate) fn build_result_dataframe_polling(
+    optimal_steps: &[u32],
+    grid: &QuoteGrid,
+    cancel: Option<&CancelFlag>,
+) -> PyResult<DataFrame> {
     let n = grid.n_quotes;
     let m = grid.n_steps;
     if optimal_steps.len() != n {
@@ -264,30 +277,51 @@ pub(crate) fn build_result_dataframe(
             optimal_steps.len()
         )));
     }
+    let check = || check_cancelled(cancel).map_err(|e| core_error("DataFrame build failed", e));
 
-    let gather = |values: &[f32]| -> Vec<f32> {
-        optimal_steps
-            .par_iter()
+    // Each column is filled in parallel blocks; a block skips its work once
+    // the flag is set, and `check` turns that into `Cancelled`.
+    let fill = |f: &(dyn Fn(usize) -> f32 + Sync)| -> PyResult<Vec<f32>> {
+        let mut out = vec![0.0f32; n];
+        out.par_chunks_mut(RECONSTRUCT_PAR_GRAIN)
             .enumerate()
-            .map(|(q, &step)| values[q * m + step as usize])
-            .collect()
+            .for_each(|(block, slice)| {
+                if check_cancelled(cancel).is_err() {
+                    return;
+                }
+                let start = block * RECONSTRUCT_PAR_GRAIN;
+                for (i, v) in slice.iter_mut().enumerate() {
+                    *v = f(start + i);
+                }
+            });
+        check()?;
+        Ok(out)
     };
-    let opt_scenario_values: Vec<f32> = optimal_steps
-        .par_iter()
-        .map(|&step| grid.scenario_values[step as usize])
-        .collect();
+    let gather = |values: &[f32]| fill(&|q| values[q * m + optimal_steps[q] as usize]);
+
+    check()?;
+    let mut quote_ids = StringChunkedBuilder::new("quote_id".into(), n);
+    for block in grid.quote_ids.chunks(CANCEL_POLL_QUOTES) {
+        check()?;
+        for id in block {
+            quote_ids.append_value(id);
+        }
+    }
     let opt_steps: Vec<i32> = optimal_steps.par_iter().map(|&s| s as i32).collect();
+    check()?;
+    let opt_scenario_values = fill(&|q| grid.scenario_values[optimal_steps[q] as usize])?;
 
     let mut columns: Vec<Column> = vec![
-        Column::new("quote_id".into(), &grid.quote_ids),
+        quote_ids.finish().into_column(),
         Int32Chunked::from_vec("optimal_step".into(), opt_steps).into_column(),
         Float32Chunked::from_vec("optimal_scenario_value".into(), opt_scenario_values)
             .into_column(),
-        Float32Chunked::from_vec("optimal_objective".into(), gather(&grid.objective)).into_column(),
+        Float32Chunked::from_vec("optimal_objective".into(), gather(&grid.objective)?)
+            .into_column(),
     ];
     for (name, values) in grid.constraint_names.iter().zip(grid.constraints.iter()) {
         columns.push(
-            Float32Chunked::from_vec(format!("optimal_{name}").into(), gather(values))
+            Float32Chunked::from_vec(format!("optimal_{name}").into(), gather(values)?)
                 .into_column(),
         );
     }
@@ -467,21 +501,23 @@ pub(crate) fn parse_constraints(
     constraints: HashMap<String, HashMap<String, Option<f64>>>,
     grid: &QuoteGrid,
 ) -> PyResult<Vec<ConstraintSpec>> {
-    let (_, baseline_totals) = grid.baseline_totals();
+    parse_constraints_polling(constraints, grid, None)
+}
 
+/// [`parse_constraints`] whose baseline scan (needed only for `min_pct` /
+/// `max_pct`) polls `cancel`. Holds no Python state, so callers run it with
+/// the GIL released.
+pub(crate) fn parse_constraints_polling(
+    constraints: HashMap<String, HashMap<String, Option<f64>>>,
+    grid: &QuoteGrid,
+    cancel: Option<&CancelFlag>,
+) -> PyResult<Vec<ConstraintSpec>> {
     validate_constraints_dict(&constraints, grid)?;
 
-    // Walk grid order so spec[k] aligns with grid.constraints[k].
-    // Extension point: ratio constraints (C1) detect via `numerator` /
-    // `denominator` keys before the direction-key match below.
-    //
-    // ``None`` values are frontier-only markers (B1); the from-grid solve
-    // path lands here, and solve() cannot pick a threshold from thin air,
-    // so we raise a ``ValueError`` that names the constraint and points
-    // the user at ``frontier()``. The Python ``OnlineOptimiser.solve()``
-    // shim catches this earlier for the DataFrame path; this is the
-    // belt-and-braces backstop for callers that bypass it.
-    let mut specs = Vec::with_capacity(constraints.len());
+    // First pass: every input error, before any O(n_quotes) work, so a
+    // malformed call reports its error rather than `Cancelled`.
+    let mut parsed: Vec<(usize, &String, ConstraintDirection, f64, bool)> =
+        Vec::with_capacity(constraints.len());
     for (constraint_idx, name) in grid.constraint_names.iter().enumerate() {
         let Some(spec_dict) = constraints.get(name) else {
             continue;
@@ -510,7 +546,25 @@ pub(crate) fn parse_constraints(
                 name
             )));
         };
+        parsed.push((constraint_idx, name, direction, *value, is_pct));
+    }
 
+    // The baseline scan is O(n_quotes); only a pct bound needs it.
+    let baseline_totals = if parsed.iter().any(|&(.., is_pct)| is_pct) {
+        match cancel {
+            None => grid.baseline_totals().1,
+            Some(flag) => {
+                grid.baseline_totals_cancellable(flag)
+                    .map_err(|e| core_error("Constraint parsing error", e))?
+                    .1
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut specs = Vec::with_capacity(parsed.len());
+    for (constraint_idx, name, direction, value, is_pct) in parsed {
         let threshold = if is_pct {
             let baseline = baseline_totals[constraint_idx];
             if baseline == 0.0 {
@@ -518,9 +572,9 @@ pub(crate) fn parse_constraints(
                     "min_pct/max_pct on '{name}' is undefined: baseline total is 0"
                 )));
             }
-            baseline * *value
+            baseline * value
         } else {
-            *value
+            value
         };
 
         specs.push(ConstraintSpec {
@@ -530,6 +584,20 @@ pub(crate) fn parse_constraints(
         });
     }
     Ok(specs)
+}
+
+/// The names of the constraints `constraints` specifies, in grid order —
+/// the order of the specs [`parse_constraints`] returns. Needs no baseline
+/// scan, so callers can check lambda keys against it first.
+pub(crate) fn spec_names(
+    constraints: &HashMap<String, HashMap<String, Option<f64>>>,
+    grid: &QuoteGrid,
+) -> Vec<String> {
+    grid.constraint_names
+        .iter()
+        .filter(|name| constraints.contains_key(*name))
+        .cloned()
+        .collect()
 }
 
 /// Absolute bound of each parsed constraint, in spec order.

@@ -1,7 +1,10 @@
+use crate::cancel::CancelFlag;
 use crate::data::{ApplyResult, ConstraintSpec, QuoteGrid};
 use crate::error::{PriceContourError, Result};
 
-use super::argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
+use super::argmax::{
+    compute_lambda_signs_f32, lagrangian_argmax_pass, lagrangian_argmax_pass_cancellable,
+};
 
 /// Result of one Lagrangian argmax pass at fixed lambdas, without baselines.
 ///
@@ -27,6 +30,15 @@ pub fn apply_lambdas_no_baselines(
     specs: &[ConstraintSpec],
     lambdas: &[f64],
 ) -> Result<ApplyPass> {
+    apply_pass(grid, specs, lambdas, None)
+}
+
+fn apply_pass(
+    grid: &QuoteGrid,
+    specs: &[ConstraintSpec],
+    lambdas: &[f64],
+    cancel: Option<&CancelFlag>,
+) -> Result<ApplyPass> {
     if lambdas.len() != specs.len() {
         return Err(PriceContourError::DimensionMismatch(format!(
             "lambdas length {} != specs count {}",
@@ -45,8 +57,12 @@ pub fn apply_lambdas_no_baselines(
     let n_quotes = grid.n_quotes;
     let lambda_signs_f32 = compute_lambda_signs_f32(specs, lambdas);
 
-    let (optimal_steps, total_objective, total_constraints) =
-        lagrangian_argmax_pass(grid, &lambda_signs_f32, 0, n_quotes);
+    let (optimal_steps, total_objective, total_constraints) = match cancel {
+        None => lagrangian_argmax_pass(grid, &lambda_signs_f32, 0, n_quotes),
+        Some(flag) => {
+            lagrangian_argmax_pass_cancellable(grid, &lambda_signs_f32, 0, n_quotes, flag)?
+        }
+    };
 
     Ok(ApplyPass {
         optimal_steps,
@@ -65,9 +81,33 @@ pub fn apply_lambdas(
     specs: &[ConstraintSpec],
     lambdas: &[f64],
 ) -> Result<ApplyResult> {
+    apply_lambdas_polling(grid, specs, lambdas, None)
+}
+
+/// [`apply_lambdas`] that stops with `Err(Cancelled)` once `cancel` is set.
+/// Both the argmax and the baseline totals poll the flag; an uncancelled
+/// result is bit-identical to [`apply_lambdas`].
+pub fn apply_lambdas_cancellable(
+    grid: &QuoteGrid,
+    specs: &[ConstraintSpec],
+    lambdas: &[f64],
+    cancel: &CancelFlag,
+) -> Result<ApplyResult> {
+    apply_lambdas_polling(grid, specs, lambdas, Some(cancel))
+}
+
+fn apply_lambdas_polling(
+    grid: &QuoteGrid,
+    specs: &[ConstraintSpec],
+    lambdas: &[f64],
+    cancel: Option<&CancelFlag>,
+) -> Result<ApplyResult> {
     grid.validate()?;
-    let pass = apply_lambdas_no_baselines(grid, specs, lambdas)?;
-    let (baseline_objective, baseline_constraints) = grid.baseline_totals();
+    let pass = apply_pass(grid, specs, lambdas, cancel)?;
+    let (baseline_objective, baseline_constraints) = match cancel {
+        None => grid.baseline_totals(),
+        Some(flag) => grid.baseline_totals_cancellable(flag)?,
+    };
 
     Ok(ApplyResult {
         optimal_steps: pass.optimal_steps,
@@ -192,6 +232,101 @@ mod tests {
         assert!(
             msg.contains("lambdas") || msg.contains("length") || msg.contains("specs"),
             "error should mention lambdas/specs mismatch: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancellation (DESIGN_DECISIONS §14)
+    // -----------------------------------------------------------------------
+
+    fn large_grid(n: usize) -> (QuoteGrid, Vec<ConstraintSpec>) {
+        let m = 7;
+        let mut obj = vec![0.0f32; n * m];
+        let mut vol = vec![0.0f32; n * m];
+        for q in 0..n {
+            for j in 0..m {
+                let mult = 0.85 + 0.05 * j as f32;
+                let conversion = 1.0 / (1.0 + ((q % 13) as f32 * 0.3 * (mult - 1.0)).exp());
+                obj[q * m + j] = (50.0 + (q % 101) as f32) * mult * conversion;
+                vol[q * m + j] = conversion;
+            }
+        }
+        let grid = QuoteGrid {
+            n_quotes: n,
+            n_steps: m,
+            scenario_values: (0..m).map(|j| 0.85 + 0.05 * j as f32).collect(),
+            objective: obj,
+            constraints: vec![vol],
+            constraint_names: vec!["volume".to_string()],
+            quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
+        };
+        let specs = vec![ConstraintSpec {
+            name: "volume".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold: 0.0,
+        }];
+        (grid, specs)
+    }
+
+    #[test]
+    fn cancellable_apply_is_bit_identical_when_not_cancelled() {
+        // Several argmax grains and several baseline poll blocks.
+        let (grid, specs) = large_grid(crate::constants::CANCEL_POLL_QUOTES * 2 + 4099);
+        let lambdas = [0.7];
+        let single_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let (plain, tokened) = single_thread.install(|| {
+            (
+                apply_lambdas(&grid, &specs, &lambdas).unwrap(),
+                apply_lambdas_cancellable(&grid, &specs, &lambdas, &CancelFlag::new()).unwrap(),
+            )
+        });
+        assert_eq!(plain.optimal_steps, tokened.optimal_steps);
+        assert_eq!(
+            plain.total_objective.to_bits(),
+            tokened.total_objective.to_bits()
+        );
+        assert_eq!(
+            plain.total_constraints[0].to_bits(),
+            tokened.total_constraints[0].to_bits()
+        );
+        assert_eq!(
+            plain.baseline_objective.to_bits(),
+            tokened.baseline_objective.to_bits()
+        );
+        assert_eq!(
+            plain.baseline_constraints[0].to_bits(),
+            tokened.baseline_constraints[0].to_bits()
+        );
+
+        // Multi-threaded, the per-quote choices are identical.
+        let tokened_parallel =
+            apply_lambdas_cancellable(&grid, &specs, &lambdas, &CancelFlag::new()).unwrap();
+        assert_eq!(plain.optimal_steps, tokened_parallel.optimal_steps);
+    }
+
+    #[test]
+    fn pre_cancelled_apply_returns_cancelled() {
+        let (grid, specs) = make_test_grid();
+        let flag = CancelFlag::new();
+        flag.cancel();
+        let err = apply_lambdas_cancellable(&grid, &specs, &[0.0], &flag).unwrap_err();
+        assert!(matches!(err, PriceContourError::Cancelled), "{err}");
+    }
+
+    #[test]
+    fn apply_input_errors_win_over_cancellation() {
+        // A malformed call reports the input error, not Cancelled.
+        let (grid, specs) = make_test_grid();
+        let flag = CancelFlag::new();
+        flag.cancel();
+        let err = apply_lambdas_cancellable(&grid, &specs, &[0.0, 0.0], &flag).unwrap_err();
+        assert!(
+            matches!(err, PriceContourError::DimensionMismatch(_)),
+            "{err}"
         );
     }
 }
