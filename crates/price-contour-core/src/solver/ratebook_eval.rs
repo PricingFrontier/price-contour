@@ -10,6 +10,7 @@
 
 use rayon::prelude::*;
 
+use crate::cancel::{check_cancelled, is_cancelled, CancelFlag};
 use crate::constants::RECONSTRUCT_PAR_GRAIN;
 use crate::data::{GroupMapping, QuoteGrid};
 use crate::error::{PriceContourError, Result};
@@ -61,8 +62,30 @@ pub fn evaluate_ratebook(
     mappings: &[&GroupMapping],
     factor_values: &[&[f32]],
 ) -> Result<RatebookEvaluation> {
+    evaluate_ratebook_polling(grid, mappings, factor_values, None)
+}
+
+/// [`evaluate_ratebook`], polling `cancel` once per
+/// [`RECONSTRUCT_PAR_GRAIN`] quotes and returning `Err(Cancelled)` once it is
+/// set. An uncancelled result is bit-identical.
+pub fn evaluate_ratebook_cancellable(
+    grid: &QuoteGrid,
+    mappings: &[&GroupMapping],
+    factor_values: &[&[f32]],
+    cancel: &CancelFlag,
+) -> Result<RatebookEvaluation> {
+    evaluate_ratebook_polling(grid, mappings, factor_values, Some(cancel))
+}
+
+fn evaluate_ratebook_polling(
+    grid: &QuoteGrid,
+    mappings: &[&GroupMapping],
+    factor_values: &[&[f32]],
+    cancel: Option<&CancelFlag>,
+) -> Result<RatebookEvaluation> {
     grid.validate()?;
     validate_inputs(grid, mappings, factor_values)?;
+    check_cancelled(cancel)?;
 
     let n_quotes = grid.n_quotes;
     let n_steps = grid.n_steps;
@@ -92,6 +115,11 @@ pub fn evaluate_ratebook(
                 n_clamped_low: 0,
                 n_clamped_high: 0,
             };
+            // A cancelled evaluation skips its remaining chunks; the partial
+            // result is discarded below.
+            if is_cancelled(cancel) {
+                return totals;
+            }
             for local_i in 0..products.len() {
                 let i = start + local_i;
                 let mut product = 1.0f32;
@@ -118,6 +146,7 @@ pub fn evaluate_ratebook(
             totals
         })
         .collect();
+    check_cancelled(cancel)?;
 
     let mut total_objective = 0.0f64;
     let mut total_constraints = vec![0.0f64; n_constraints];
@@ -381,5 +410,65 @@ mod tests {
             many.total_constraints[0].to_bits()
         );
         assert_eq!(single.optimal_steps, many.optimal_steps);
+    }
+
+    #[test]
+    fn cancellable_evaluation_is_bit_identical_when_not_cancelled() {
+        let n_quotes = RECONSTRUCT_PAR_GRAIN * 5 + 17;
+        let mut grid = indexed_grid(vec![0.8f32, 0.9, 1.0, 1.1, 1.2], n_quotes);
+        for (i, v) in grid.objective.iter_mut().enumerate() {
+            *v = 1.0 / (1.0 + i as f32 * 0.37);
+        }
+        let level_labels: Vec<String> = (0..n_quotes).map(|i| format!("L{}", i % 7)).collect();
+        let f = build_group_mapping(&level_labels);
+        let values: Vec<f32> = (0..7).map(|g| 0.85 + 0.05 * g as f32).collect();
+
+        let plain = evaluate_ratebook(&grid, &[&f], &[&values]).unwrap();
+        let tokened =
+            evaluate_ratebook_cancellable(&grid, &[&f], &[&values], &CancelFlag::new()).unwrap();
+        assert_eq!(plain.optimal_steps, tokened.optimal_steps);
+        assert_eq!(plain.factor_product, tokened.factor_product);
+        assert_eq!(plain.clamped_low, tokened.clamped_low);
+        assert_eq!(plain.clamped_high, tokened.clamped_high);
+        assert_eq!(
+            plain.total_objective.to_bits(),
+            tokened.total_objective.to_bits()
+        );
+        assert_eq!(
+            plain.total_constraints[0].to_bits(),
+            tokened.total_constraints[0].to_bits()
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_evaluation_returns_cancelled() {
+        let grid = indexed_grid(vec![0.8, 1.0, 1.2], 3);
+        let f = build_group_mapping(&labels(&["a", "b", "a"]));
+        let flag = CancelFlag::new();
+        flag.cancel();
+        let err = evaluate_ratebook_cancellable(&grid, &[&f], &[&[1.0, 1.0]], &flag).unwrap_err();
+        assert!(matches!(err, PriceContourError::Cancelled), "{err}");
+    }
+
+    #[test]
+    fn a_flag_set_mid_evaluation_stops_it() {
+        // One entry poll, then one per chunk: tripping on the third poll lands
+        // after the first chunk has run.
+        let n_quotes = RECONSTRUCT_PAR_GRAIN * 6;
+        let grid = indexed_grid(vec![0.8f32, 1.0, 1.2], n_quotes);
+        let level_labels: Vec<String> = (0..n_quotes).map(|i| format!("L{}", i % 3)).collect();
+        let f = build_group_mapping(&level_labels);
+        let values = [0.9f32, 1.0, 1.1];
+        let flag = CancelFlag::new();
+        flag.cancel_after_polls(3);
+        let result = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| evaluate_ratebook_cancellable(&grid, &[&f], &[&values], &flag));
+        assert!(matches!(result, Err(PriceContourError::Cancelled)));
+        // Every chunk still polls once (a skipped chunk is one flag read), but
+        // no more than that: entry, six chunks and the final check.
+        assert_eq!(flag.polls(), 8);
     }
 }

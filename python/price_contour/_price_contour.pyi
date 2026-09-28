@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import final
+
 import polars as pl
 
 # ---------------------------------------------------------------------------
@@ -91,6 +93,26 @@ class SolveResult:
     def scenario_values(self) -> list[float]: ...
     @property
     def grid(self) -> QuoteGrid: ...
+
+# ---------------------------------------------------------------------------
+# Cancellation (DESIGN_DECISIONS §14)
+# ---------------------------------------------------------------------------
+
+class Cancelled(RuntimeError):
+    """Raised by a call whose CancelToken was cancelled while it ran."""
+
+@final
+class CancelToken:
+    """A thread-safe, one-way cancellation flag."""
+
+    def __init__(self) -> None: ...
+    def cancel(self) -> None: ...
+    @property
+    def cancelled(self) -> bool: ...
+    # Test hooks (DESIGN_DECISIONS §14.5), not API.
+    def _cancel_after_polls(self, n: int) -> None: ...
+    @property
+    def _polls(self) -> int: ...
 
 # ---------------------------------------------------------------------------
 # ApplyResult
@@ -264,6 +286,8 @@ def apply_from_grid_py(
     grid: QuoteGrid,
     lambdas: dict[str, float],
     constraints: dict[str, dict[str, float]],
+    *,
+    cancel: CancelToken | None = None,
 ) -> ApplyResult: ...
 def apply_lambdas_to_parquet_chunked_py(
     parquet_in: str,
@@ -315,6 +339,8 @@ def evaluate_ratebook_py(
     grid: QuoteGrid,
     contexts: list[FactorContext],
     factor_values: list[list[float]],
+    *,
+    cancel: CancelToken | None = None,
 ) -> RatebookEvaluation: ...
 def _baseline_step_index(scenario_values: list[float]) -> int: ...
 def build_grid_from_parquet_py(

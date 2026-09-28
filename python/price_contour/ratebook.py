@@ -18,6 +18,7 @@ from price_contour._frontier_helpers import (
 )
 from price_contour._grid_utils import build_grid
 from price_contour._price_contour import (
+    CancelToken,
     FactorContext,
     QuoteGrid,
     RatebookEvaluation,
@@ -843,6 +844,8 @@ class RatebookOptimiser:
         df_or_grid: pl.DataFrame | QuoteGrid,
         factors: pl.DataFrame | RatebookFactorContexts,
         factor_tables: Mapping[str, Mapping[str, float]],
+        *,
+        cancel: CancelToken | None = None,
     ) -> RatebookEvaluation:
         """Evaluate ratebook factor tables per quote (DESIGN_DECISIONS §13.3).
 
@@ -863,6 +866,14 @@ class RatebookOptimiser:
             One table per factor spec (``":".join(columns)``), covering
             exactly the levels present in ``factors``. Rates must be finite
             and > 0.
+        cancel : CancelToken, optional
+            Cooperative cancellation (DESIGN_DECISIONS §14). Once another
+            thread calls ``cancel.cancel()``, the evaluation raises
+            :class:`Cancelled`; so does a first access to its
+            ``quote_results``. Building a grid or factor contexts from a
+            DataFrame is not cancellable, so pass a ``QuoteGrid`` and
+            ``RatebookFactorContexts`` to make the whole call cancellable.
+            Without a token the call behaves exactly as before.
 
         Returns
         -------
@@ -909,6 +920,7 @@ class RatebookOptimiser:
             grid,
             solver_contexts,
             _factor_values_for_contexts(factor_specs, solver_contexts, factor_tables),
+            cancel=cancel,
         )
 
     def _discover_structure(

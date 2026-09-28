@@ -1,7 +1,9 @@
 use rayon::prelude::*;
 
+use crate::cancel::{is_cancelled, CancelFlag};
 use crate::constants::ARGMAX_PAR_GRAIN;
 use crate::data::{ConstraintDirection, ConstraintSpec, QuoteGrid};
+use crate::error::Result;
 
 /// Pre-compute signed lambdas in f32.
 ///
@@ -36,6 +38,33 @@ pub fn lagrangian_argmax_pass(
     quote_start: usize,
     quote_end: usize,
 ) -> (Vec<u32>, f64, Vec<f64>) {
+    argmax_pass_polling(grid, lambda_signs_f32, quote_start, quote_end, None)
+}
+
+/// [`lagrangian_argmax_pass`], polling `cancel` once per
+/// [`ARGMAX_PAR_GRAIN`] quotes. Once the flag is set the remaining grains are
+/// skipped and the call returns `Err(Cancelled)`; otherwise the result is
+/// bit-identical (same grains, same fold and reduce).
+pub fn lagrangian_argmax_pass_cancellable(
+    grid: &QuoteGrid,
+    lambda_signs_f32: &[f32],
+    quote_start: usize,
+    quote_end: usize,
+    cancel: &CancelFlag,
+) -> Result<(Vec<u32>, f64, Vec<f64>)> {
+    cancel.check()?;
+    let pass = argmax_pass_polling(grid, lambda_signs_f32, quote_start, quote_end, Some(cancel));
+    cancel.check()?;
+    Ok(pass)
+}
+
+fn argmax_pass_polling(
+    grid: &QuoteGrid,
+    lambda_signs_f32: &[f32],
+    quote_start: usize,
+    quote_end: usize,
+    cancel: Option<&CancelFlag>,
+) -> (Vec<u32>, f64, Vec<f64>) {
     let chunk_size = quote_end - quote_start;
     let n_steps = grid.n_steps;
     let n_constraints = grid.constraints.len();
@@ -50,6 +79,11 @@ pub fn lagrangian_argmax_pass(
         .fold(
             || (0.0f64, vec![0.0f64; n_constraints]),
             |(mut partial_obj, mut partial_cons), (chunk_idx, step_slice)| {
+                // A cancelled pass skips its remaining grains; the caller
+                // discards the partial result.
+                if is_cancelled(cancel) {
+                    return (partial_obj, partial_cons);
+                }
                 let sub_start = quote_start + chunk_idx * ARGMAX_PAR_GRAIN;
                 let sub_len = step_slice.len();
                 // Reusable buffer for per-quote Lagrangian values (n_steps × 4 bytes).
@@ -182,5 +216,75 @@ mod tests {
         let lambdas = vec![2.0, 3.0];
         let signs = compute_lambda_signs_f32(&specs, &lambdas);
         assert_eq!(signs, vec![2.0f32, -3.0f32]);
+    }
+
+    #[test]
+    fn a_set_flag_skips_every_grain() {
+        // Polling happens before each grain, so a flag set before the pass
+        // leaves every step unwritten and every total zero; the public
+        // cancellable pass turns that into Err(Cancelled).
+        let n = ARGMAX_PAR_GRAIN * 3 + 5;
+        let grid = QuoteGrid {
+            n_quotes: n,
+            n_steps: 2,
+            scenario_values: vec![1.0, 1.1],
+            objective: (0..n).flat_map(|_| [0.0f32, 1.0]).collect(),
+            constraints: vec![],
+            constraint_names: vec![],
+            quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
+        };
+        let flag = CancelFlag::new();
+        let (steps, obj, _) = argmax_pass_polling(&grid, &[], 0, n, Some(&flag));
+        assert!(steps.iter().all(|&s| s == 1));
+        assert_abs_diff_eq!(obj, n as f64, epsilon = 1e-9);
+
+        flag.cancel();
+        let (steps, obj, _) = argmax_pass_polling(&grid, &[], 0, n, Some(&flag));
+        assert!(steps.iter().all(|&s| s == 0));
+        assert_eq!(obj, 0.0);
+        assert!(matches!(
+            lagrangian_argmax_pass_cancellable(&grid, &[], 0, n, &flag),
+            Err(crate::error::PriceContourError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn a_flag_set_mid_pass_skips_every_later_grain() {
+        // One thread runs the grains in order, polling once before each: a
+        // flag that trips on the third poll lets grains 0 and 1 run and
+        // skips all the rest.
+        let n = ARGMAX_PAR_GRAIN * 8;
+        let grid = QuoteGrid {
+            n_quotes: n,
+            n_steps: 2,
+            scenario_values: vec![1.0, 1.1],
+            objective: (0..n).flat_map(|_| [0.0f32, 1.0]).collect(),
+            constraints: vec![],
+            constraint_names: vec![],
+            quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
+        };
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+
+        let flag = CancelFlag::new();
+        flag.cancel_after_polls(3);
+        let (steps, obj, _) =
+            one_thread.install(|| argmax_pass_polling(&grid, &[], 0, n, Some(&flag)));
+        assert!(steps[..2 * ARGMAX_PAR_GRAIN].iter().all(|&s| s == 1));
+        assert!(steps[2 * ARGMAX_PAR_GRAIN..].iter().all(|&s| s == 0));
+        assert_abs_diff_eq!(obj, (2 * ARGMAX_PAR_GRAIN) as f64, epsilon = 1e-9);
+
+        let flag = CancelFlag::new();
+        flag.cancel_after_polls(3);
+        let result =
+            one_thread.install(|| lagrangian_argmax_pass_cancellable(&grid, &[], 0, n, &flag));
+        assert!(matches!(
+            result,
+            Err(crate::error::PriceContourError::Cancelled)
+        ));
     }
 }

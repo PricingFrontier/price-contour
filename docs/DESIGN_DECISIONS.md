@@ -1350,3 +1350,88 @@ edge; `n_quotes_clamped_low` / `n_quotes_clamped_high` and `quote_results` do.
 - The canonical evaluation is one O(n_quotes × n_factors) pass after the CD
   loop; its retained state is about 50 MB at 5M quotes, and the frame is
   built only on access.
+
+---
+
+## 14. Cancellation (0.6.0)
+
+### Context
+
+haute materialises a frontier point on demand: `apply_from_grid` for an
+online point, `RatebookOptimiser.evaluate` for a ratebook point. When a user
+steps through frontier points quickly, the point they stepped away from keeps
+running to completion because neither call can be stopped (haute
+`specs/roadmap/optimiser-validation.md`, OPT-PC02). 0.6.0 adds cooperative
+cancellation to those two calls. It is additive (a new keyword argument, a new
+class and a new exception), so it is a minor version bump.
+
+### 14.1 `CancelToken` and `Cancelled`
+
+- `CancelToken()` is a thread-safe flag: `cancel()` sets it, `cancelled`
+  reads it. Both are safe from any thread at any time, including while a call
+  holding the token runs with the GIL released. Cancelling is idempotent and
+  cannot be undone; one token serves one piece of work.
+- `Cancelled` is raised by a call that observed its token set. It subclasses
+  `RuntimeError`, never `ValueError`, so a caller can tell "you asked me to
+  stop" from "your input is wrong".
+- In Rust the flag is `price_contour_core::CancelFlag` (an
+  `Arc<AtomicBool>`), and the error is `PriceContourError::Cancelled`.
+
+### 14.2 Which calls take a token
+
+`apply_from_grid(grid, lambdas, constraints, *, cancel=None)` and
+`RatebookOptimiser.evaluate(df_or_grid, factors, factor_tables, *,
+cancel=None)`. With no token, both behave exactly as in 0.5.0.
+
+A token already cancelled on entry raises `Cancelled` before any work,
+except that input errors come first: every error that needs no scan of the
+book (constraint dict, lambda keys, a grid constraint with no spec, factor
+tables) is a `ValueError` even on a cancelled token. The one input error that
+only the book can reveal, a zero baseline under a `min_pct` / `max_pct` bound,
+is found by the cancellable baseline scan, so a cancel during that scan wins.
+
+Only the native work is cancellable. `evaluate` given a DataFrame first builds
+a grid, and given factor DataFrames first builds factor contexts; neither step
+polls the token. Pass a `QuoteGrid` and `RatebookFactorContexts` to make the
+whole call cancellable.
+
+### 14.3 Every phase that scales with the book polls the token
+
+- online: the baseline scan that resolves constraint thresholds, the
+  Lagrangian argmax, and the baseline totals reported on the result;
+- ratebook: the canonical evaluation kernel and its baseline totals;
+- both: the lazily built per-quote frame (`ApplyResult.dataframe`,
+  `RatebookEvaluation.quote_results`).
+
+Each phase checks the flag once per block of quotes
+(`CANCEL_POLL_QUOTES`, or the kernel's existing parallel grain), and the frame
+build does so in every column, never once per column, so one long column
+cannot stall a cancel. All of them run with the
+GIL released, so another Python thread can call `cancel()` while they run.
+
+A result keeps its call's token. Cancelling after the call has returned still
+stops a first access to the lazily built frame, which raises `Cancelled` and
+caches nothing; a frame that was already built is returned as before.
+
+### 14.4 Determinism
+
+Polling adds a flag check between blocks and changes no arithmetic, block
+boundaries or reduction order. An uncancelled call with a token therefore
+returns what a call without one returns: the same per-quote choices and
+frame, the same baselines and ratebook totals bit for bit, and online totals
+bit for bit under the same thread scheduling (the online argmax reduces with
+rayon's fold, whose grouping depends on work stealing with or without a
+token). The Rust tests pin the bit-identity single-threaded; the Python tests
+pin frames, baselines and ratebook totals exactly.
+
+### 14.5 Latency
+
+The tests prove polling happens inside each phase, not only at its edges:
+`CancelToken._cancel_after_polls(n)` (a test hook, not API) trips the token on
+the n-th poll, and tripping anywhere inside a phase must raise `Cancelled`.
+
+`scripts/bench_cancel.py` measures the time from `cancel()` to the raise on a
+synthetic grid of 1,000,000 quotes × 41 steps × 3 constraints, online and
+ratebook, cancelling at random points in every phase. The p99 must stay under
+50 ms. The one step that does not poll is handing the finished frame to
+Python, which is zero-copy.

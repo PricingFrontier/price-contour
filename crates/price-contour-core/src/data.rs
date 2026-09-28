@@ -1,3 +1,4 @@
+use crate::cancel::{check_cancelled, CancelFlag};
 use crate::constants::*;
 use crate::error::{PriceContourError, Result};
 
@@ -102,20 +103,36 @@ impl QuoteGrid {
     /// Baseline totals: every quote at the [`baseline_step`].
     /// Returns (baseline_objective_total, baseline_constraint_totals) as f64.
     pub fn baseline_totals(&self) -> (f64, Vec<f64>) {
+        self.baseline_totals_polling(None)
+            .expect("baseline totals without a cancel flag cannot be cancelled")
+    }
+
+    /// [`Self::baseline_totals`], polling `cancel` every
+    /// [`CANCEL_POLL_QUOTES`] quotes. The summation order is the same, so an
+    /// uncancelled result is bit-identical.
+    pub fn baseline_totals_cancellable(&self, cancel: &CancelFlag) -> Result<(f64, Vec<f64>)> {
+        self.baseline_totals_polling(Some(cancel))
+    }
+
+    fn baseline_totals_polling(&self, cancel: Option<&CancelFlag>) -> Result<(f64, Vec<f64>)> {
         let baseline_step = self.baseline_step();
 
         let mut obj_total: f64 = 0.0;
         let mut con_totals = vec![0.0f64; self.constraints.len()];
 
-        for q in 0..self.n_quotes {
-            let idx = q * self.n_steps + baseline_step;
-            obj_total += self.objective[idx] as f64;
-            for (k, con) in self.constraints.iter().enumerate() {
-                con_totals[k] += con[idx] as f64;
+        for block_start in (0..self.n_quotes).step_by(CANCEL_POLL_QUOTES) {
+            check_cancelled(cancel)?;
+            let block_end = (block_start + CANCEL_POLL_QUOTES).min(self.n_quotes);
+            for q in block_start..block_end {
+                let idx = q * self.n_steps + baseline_step;
+                obj_total += self.objective[idx] as f64;
+                for (k, con) in self.constraints.iter().enumerate() {
+                    con_totals[k] += con[idx] as f64;
+                }
             }
         }
 
-        (obj_total, con_totals)
+        Ok((obj_total, con_totals))
     }
 
     /// Compute baseline totals and per-constraint scale factors for subgradient updates.
@@ -705,6 +722,43 @@ mod tests {
         let mut grid = make_grid(3, 3);
         grid.constraints[0] = vec![1.0; 5];
         assert!(grid.validate().is_err());
+    }
+
+    #[test]
+    fn test_baseline_totals_cancellable() {
+        let n = CANCEL_POLL_QUOTES + 3;
+        let grid = QuoteGrid {
+            n_quotes: n,
+            n_steps: 2,
+            scenario_values: vec![0.9, 1.0],
+            objective: (0..n)
+                .flat_map(|q| [0.0f32, 1.0 / (q as f32 + 1.0)])
+                .collect(),
+            constraints: vec![(0..n).flat_map(|q| [0.0f32, q as f32 * 0.5]).collect()],
+            constraint_names: vec!["c".into()],
+            quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
+        };
+        let flag = CancelFlag::new();
+        let (obj, cons) = grid.baseline_totals();
+        let (obj_c, cons_c) = grid.baseline_totals_cancellable(&flag).unwrap();
+        assert_eq!(obj.to_bits(), obj_c.to_bits());
+        assert_eq!(cons[0].to_bits(), cons_c[0].to_bits());
+        flag.cancel();
+        assert!(matches!(
+            grid.baseline_totals_cancellable(&flag),
+            Err(PriceContourError::Cancelled)
+        ));
+
+        // Polled once per block: a flag tripping on the second poll stops the
+        // scan after the first block.
+        let flag = CancelFlag::new();
+        flag.cancel_after_polls(2);
+        assert!(matches!(
+            grid.baseline_totals_cancellable(&flag),
+            Err(PriceContourError::Cancelled)
+        ));
+        assert_eq!(flag.polls(), 2);
     }
 
     #[test]

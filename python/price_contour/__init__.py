@@ -33,6 +33,8 @@ from price_contour.ratebook import (
 from price_contour.solver import OnlineOptimiser
 from price_contour._price_contour import (
     ApplyResult,
+    Cancelled,
+    CancelToken,
     ChunkedApplyResult,
     GroupedSolveResult,
     RatebookEvaluation,
@@ -304,6 +306,8 @@ __all__ = [
     "apply_from_grid",
     "apply_lambdas_to_parquet_chunked",
     "ApplyResult",
+    "Cancelled",
+    "CancelToken",
     "ChunkedApplyResult",
     "FrontierResult",
     "FrontierResultLike",

@@ -6,12 +6,14 @@ mod lambda;
 mod online;
 mod ratebook_eval;
 
-pub use apply::apply_lambdas;
+pub use apply::{apply_lambdas, apply_lambdas_cancellable, check_specs_cover_grid};
 pub(crate) use apply::{apply_lambdas_no_baselines, ApplyPass};
-pub use argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
+pub use argmax::{
+    compute_lambda_signs_f32, lagrangian_argmax_pass, lagrangian_argmax_pass_cancellable,
+};
 pub use convergence::{all_constraints_satisfied, select_final_lambdas};
 pub use grouped::solve_grouped;
 pub use lambda::update_lambdas_subgradient;
 pub use online::solve_online;
 pub(crate) use online::solve_online_with_precomputed;
-pub use ratebook_eval::{evaluate_ratebook, RatebookEvaluation};
+pub use ratebook_eval::{evaluate_ratebook, evaluate_ratebook_cancellable, RatebookEvaluation};

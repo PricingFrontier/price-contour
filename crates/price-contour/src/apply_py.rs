@@ -11,12 +11,20 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
-use price_contour_core::{apply_lambdas, ApplyResult, ConstraintSpec, QuoteGrid};
+use price_contour_core::{
+    apply_lambdas, apply_lambdas_cancellable, check_specs_cover_grid, ApplyResult, CancelFlag,
+    ConstraintSpec, QuoteGrid,
+};
 
 use crate::builder_py::PyQuoteGridBuilder;
+use crate::cancel_py::{core_error, flag_of, PyCancelToken};
+use crate::constraint_parsing::validate_constraints_dict;
 use crate::grid_py::PyQuoteGrid;
 use crate::parquet_grid_py::{read_parquet_in_aligned_chunks, validate_column_names};
-use crate::solver_py::{build_result_dataframe, ingest_dataframe, parse_constraints};
+use crate::solver_py::{
+    build_result_dataframe, build_result_dataframe_polling, ingest_dataframe, parse_constraints,
+    parse_constraints_polling, spec_names,
+};
 use crate::utils::{order_lambdas, zip_to_dict, OrderedDict};
 
 /// Python-visible apply result.
@@ -26,6 +34,9 @@ pub struct PyApplyResult {
     grid: Arc<QuoteGrid>,
     constraint_names: Vec<String>,
     result_df: Option<Py<PyAny>>,
+    /// The token of the call that produced this result; a first access to
+    /// the lazily built `dataframe` honours it.
+    cancel: Option<CancelFlag>,
 }
 
 #[pymethods]
@@ -60,7 +71,8 @@ impl PyApplyResult {
         if let Some(ref cached) = self.result_df {
             return Ok(cached.clone_ref(py));
         }
-        let df = build_result_dataframe(&self.inner.optimal_steps, &self.grid)?;
+        let (steps, grid, cancel) = (&self.inner.optimal_steps, &self.grid, &self.cancel);
+        let df = py.detach(|| build_result_dataframe_polling(steps, grid, cancel.as_ref()))?;
         let py_df = PyDataFrame(df).into_pyobject(py)?.into();
         self.result_df = Some(py_df);
         Ok(self.result_df.as_ref().unwrap().clone_ref(py))
@@ -116,6 +128,7 @@ pub fn apply_lambdas_py(
         grid,
         constraint_names,
         result_df: None,
+        cancel: None,
     })
 }
 
@@ -124,28 +137,43 @@ pub fn apply_lambdas_py(
 /// This avoids re-building the grid from a DataFrame — useful when the grid
 /// is already in memory (e.g. after a `solve()` or `frontier()` call).
 #[pyfunction]
-#[pyo3(signature = (grid, lambdas, constraints))]
+#[pyo3(signature = (grid, lambdas, constraints, *, cancel = None))]
 pub fn apply_from_grid_py(
     py: Python<'_>,
     grid: &PyQuoteGrid,
     lambdas: HashMap<String, f64>,
     constraints: HashMap<String, HashMap<String, Option<f64>>>,
+    cancel: Option<&Bound<'_, PyCancelToken>>,
 ) -> PyResult<PyApplyResult> {
-    let specs = parse_constraints(constraints, &grid.inner)?;
-    let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
-
-    let lambda_vec = order_lambdas(&lambdas, &constraint_names).map_err(PyValueError::new_err)?;
-
+    let cancel = flag_of(cancel);
     let grid_arc = Arc::clone(&grid.inner);
-    let result = py
-        .detach(|| apply_lambdas(&grid_arc, &specs, &lambda_vec))
-        .map_err(|e| PyValueError::new_err(format!("Apply error: {e}")))?;
+    // Constraint parsing (whose pct baseline scan is O(n_quotes)), the argmax
+    // and the baseline totals all run with the GIL released, so another
+    // thread can cancel any of them.
+    let (result, constraint_names) = py.detach(|| -> PyResult<_> {
+        // Input errors first: the constraint dict, then the lambda keys, then
+        // parsing's O(n_quotes) pct baseline scan, which can be cancelled.
+        validate_constraints_dict(&constraints, &grid_arc)?;
+        let constraint_names = spec_names(&constraints, &grid_arc);
+        check_specs_cover_grid(constraint_names.len(), &grid_arc)
+            .map_err(|e| core_error("Apply error", e))?;
+        let lambda_vec =
+            order_lambdas(&lambdas, &constraint_names).map_err(PyValueError::new_err)?;
+        let specs = parse_constraints_polling(constraints, &grid_arc, cancel.as_ref())?;
+        let result = match cancel.as_ref() {
+            None => apply_lambdas(&grid_arc, &specs, &lambda_vec),
+            Some(flag) => apply_lambdas_cancellable(&grid_arc, &specs, &lambda_vec, flag),
+        }
+        .map_err(|e| core_error("Apply error", e))?;
+        Ok((result, constraint_names))
+    })?;
 
     Ok(PyApplyResult {
         inner: result,
-        grid: Arc::clone(&grid.inner),
+        grid: grid_arc,
         constraint_names,
         result_df: None,
+        cancel,
     })
 }
 
