@@ -449,4 +449,26 @@ mod tests {
         let err = evaluate_ratebook_cancellable(&grid, &[&f], &[&[1.0, 1.0]], &flag).unwrap_err();
         assert!(matches!(err, PriceContourError::Cancelled), "{err}");
     }
+
+    #[test]
+    fn a_flag_set_mid_evaluation_stops_it() {
+        // One entry poll, then one per chunk: tripping on the third poll lands
+        // after the first chunk has run.
+        let n_quotes = RECONSTRUCT_PAR_GRAIN * 6;
+        let grid = indexed_grid(vec![0.8f32, 1.0, 1.2], n_quotes);
+        let level_labels: Vec<String> = (0..n_quotes).map(|i| format!("L{}", i % 3)).collect();
+        let f = build_group_mapping(&level_labels);
+        let values = [0.9f32, 1.0, 1.1];
+        let flag = CancelFlag::new();
+        flag.cancel_after_polls(3);
+        let result = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| evaluate_ratebook_cancellable(&grid, &[&f], &[&values], &flag));
+        assert!(matches!(result, Err(PriceContourError::Cancelled)));
+        // Every chunk still polls once (a skipped chunk is one flag read), but
+        // no more than that: entry, six chunks and the final check.
+        assert_eq!(flag.polls(), 8);
+    }
 }

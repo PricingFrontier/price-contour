@@ -281,8 +281,12 @@ pub(crate) fn build_result_dataframe_polling(
 
     // Each column is filled in parallel blocks; a block skips its work once
     // the flag is set, and `check` turns that into `Cancelled`.
-    let fill = |f: &(dyn Fn(usize) -> f32 + Sync)| -> PyResult<Vec<f32>> {
-        let mut out = vec![0.0f32; n];
+    fn fill<T: Copy + Default + Send>(
+        n: usize,
+        cancel: Option<&CancelFlag>,
+        f: &(dyn Fn(usize) -> T + Sync),
+    ) -> Vec<T> {
+        let mut out = vec![T::default(); n];
         out.par_chunks_mut(RECONSTRUCT_PAR_GRAIN)
             .enumerate()
             .for_each(|(block, slice)| {
@@ -294,10 +298,14 @@ pub(crate) fn build_result_dataframe_polling(
                     *v = f(start + i);
                 }
             });
+        out
+    }
+    let fill_f32 = |f: &(dyn Fn(usize) -> f32 + Sync)| -> PyResult<Vec<f32>> {
+        let out = fill(n, cancel, f);
         check()?;
         Ok(out)
     };
-    let gather = |values: &[f32]| fill(&|q| values[q * m + optimal_steps[q] as usize]);
+    let gather = |values: &[f32]| fill_f32(&|q| values[q * m + optimal_steps[q] as usize]);
 
     check()?;
     let mut quote_ids = StringChunkedBuilder::new("quote_id".into(), n);
@@ -307,9 +315,9 @@ pub(crate) fn build_result_dataframe_polling(
             quote_ids.append_value(id);
         }
     }
-    let opt_steps: Vec<i32> = optimal_steps.par_iter().map(|&s| s as i32).collect();
+    let opt_steps: Vec<i32> = fill(n, cancel, &|q| optimal_steps[q] as i32);
     check()?;
-    let opt_scenario_values = fill(&|q| grid.scenario_values[optimal_steps[q] as usize])?;
+    let opt_scenario_values = fill_f32(&|q| grid.scenario_values[optimal_steps[q] as usize])?;
 
     let mut columns: Vec<Column> = vec![
         quote_ids.finish().into_column(),

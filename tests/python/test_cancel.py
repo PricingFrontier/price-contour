@@ -76,6 +76,49 @@ def _cancelled() -> CancelToken:
     return token
 
 
+# One poll per argmax grain (4_096 quotes) or evaluation chunk (4_096), per
+# baseline block (65_536), and per frame block (4_096) in every column: a
+# phase over N_QUOTES polls at least this often, so a call that only checked
+# its token before or after the work fails these tests.
+MIN_CALL_POLLS = N_QUOTES // 4_096
+MIN_FRAME_POLLS = 4 * (N_QUOTES // 4_096)
+
+
+def _trip_points(polls: int) -> list[int]:
+    """Polls to trip on, spread over a phase that made *polls* polls."""
+    return sorted({1, 2, polls // 4, polls // 2, (3 * polls) // 4, polls - 1})
+
+
+def _assert_cancellable_mid_call(call) -> None:
+    counter = CancelToken()
+    call(counter)
+    polls = counter._polls
+    assert polls >= MIN_CALL_POLLS, polls
+    for trip in _trip_points(polls):
+        token = CancelToken()
+        token._cancel_after_polls(trip)
+        with pytest.raises(Cancelled):
+            call(token)
+
+
+def _assert_cancellable_mid_frame(call, attr: str) -> None:
+    counter = CancelToken()
+    result = call(counter)
+    before = counter._polls
+    getattr(result, attr)
+    polls = counter._polls - before
+    assert polls >= MIN_FRAME_POLLS, polls
+    for trip in _trip_points(polls):
+        token = CancelToken()
+        result = call(token)
+        token._cancel_after_polls(trip)
+        with pytest.raises(Cancelled):
+            getattr(result, attr)
+        # Nothing partial was cached.
+        with pytest.raises(Cancelled):
+            getattr(result, attr)
+
+
 class TestCancelToken:
     def test_is_a_one_way_flag(self):
         token = CancelToken()
@@ -132,6 +175,35 @@ class TestApplyFromGrid:
     def test_input_errors_win_over_cancellation(self, grid, lambdas, constraints):
         with pytest.raises(ValueError):
             apply_from_grid(grid, lambdas, constraints, cancel=_cancelled())
+
+    def test_a_cancel_inside_the_call_stops_it(self, grid):
+        _assert_cancellable_mid_call(
+            lambda token: apply_from_grid(grid, LAMBDAS, CONSTRAINTS, cancel=token)
+        )
+
+    def test_a_cancel_inside_the_cold_frame_build_stops_it(self, grid):
+        _assert_cancellable_mid_frame(
+            lambda token: apply_from_grid(grid, LAMBDAS, CONSTRAINTS, cancel=token),
+            "dataframe",
+        )
+
+    def test_a_missing_constraint_spec_is_a_value_error_even_when_cancelled(self):
+        # The grid has two constraints but only one is specified: a structural
+        # error found before the pct baseline scan, so it wins over the token.
+        df = _book(10).with_columns(pl.col("volume").alias("claims"))
+        two = build_grid(
+            df,
+            constraint_columns=["volume", "claims"],
+            quote_id="quote_id",
+            scenario_index="scenario_index",
+            scenario_value="scenario_value",
+            objective="expected_income",
+        )
+        for cancel in (None, _cancelled()):
+            with pytest.raises(
+                ValueError, match="specs count 1 != grid constraints count 2"
+            ):
+                apply_from_grid(two, LAMBDAS, CONSTRAINTS, cancel=cancel)
 
     def test_cancel_after_return_stops_the_cold_frame_on_another_thread(self, grid):
         token = CancelToken()
@@ -209,6 +281,19 @@ class TestRatebookEvaluate:
         bad = {"region": {**tables["region"], "North": -1.0}}
         with pytest.raises(ValueError):
             optimiser.evaluate(grid, contexts, bad, cancel=_cancelled())
+
+    def test_a_cancel_inside_the_call_stops_it(self, grid, ratebook):
+        optimiser, contexts, tables = ratebook
+        _assert_cancellable_mid_call(
+            lambda token: optimiser.evaluate(grid, contexts, tables, cancel=token)
+        )
+
+    def test_a_cancel_inside_the_cold_frame_build_stops_it(self, grid, ratebook):
+        optimiser, contexts, tables = ratebook
+        _assert_cancellable_mid_frame(
+            lambda token: optimiser.evaluate(grid, contexts, tables, cancel=token),
+            "quote_results",
+        )
 
     def test_cancel_after_return_stops_the_cold_frame(self, grid, ratebook):
         optimiser, contexts, tables = ratebook

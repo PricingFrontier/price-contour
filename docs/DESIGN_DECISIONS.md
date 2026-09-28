@@ -1383,7 +1383,17 @@ class and a new exception), so it is a minor version bump.
 `RatebookOptimiser.evaluate(df_or_grid, factors, factor_tables, *,
 cancel=None)`. With no token, both behave exactly as in 0.5.0.
 
-A token already cancelled on entry raises `Cancelled` before any work.
+A token already cancelled on entry raises `Cancelled` before any work,
+except that input errors come first: every error that needs no scan of the
+book (constraint dict, lambda keys, a grid constraint with no spec, factor
+tables) is a `ValueError` even on a cancelled token. The one input error that
+only the book can reveal, a zero baseline under a `min_pct` / `max_pct` bound,
+is found by the cancellable baseline scan, so a cancel during that scan wins.
+
+Only the native work is cancellable. `evaluate` given a DataFrame first builds
+a grid, and given factor DataFrames first builds factor contexts; neither step
+polls the token. Pass a `QuoteGrid` and `RatebookFactorContexts` to make the
+whole call cancellable.
 
 ### 14.3 Every phase that scales with the book polls the token
 
@@ -1394,8 +1404,9 @@ A token already cancelled on entry raises `Cancelled` before any work.
   `RatebookEvaluation.quote_results`).
 
 Each phase checks the flag once per block of quotes
-(`CANCEL_POLL_QUOTES`, or the kernel's existing parallel grain), never once
-per column, so one long column cannot stall a cancel. All of them run with the
+(`CANCEL_POLL_QUOTES`, or the kernel's existing parallel grain), and the frame
+build does so in every column, never once per column, so one long column
+cannot stall a cancel. All of them run with the
 GIL released, so another Python thread can call `cancel()` while they run.
 
 A result keeps its call's token. Cancelling after the call has returned still
@@ -1414,6 +1425,10 @@ token). The Rust tests pin the bit-identity single-threaded; the Python tests
 pin frames, baselines and ratebook totals exactly.
 
 ### 14.5 Latency
+
+The tests prove polling happens inside each phase, not only at its edges:
+`CancelToken._cancel_after_polls(n)` (a test hook, not API) trips the token on
+the n-th poll, and tripping anywhere inside a phase must raise `Cancelled`.
 
 `scripts/bench_cancel.py` measures the time from `cancel()` to the raise on a
 synthetic grid of 1,000,000 quotes × 41 steps × 3 constraints, online and

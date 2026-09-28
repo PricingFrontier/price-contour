@@ -33,6 +33,19 @@ pub fn apply_lambdas_no_baselines(
     apply_pass(grid, specs, lambdas, None)
 }
 
+/// Apply needs one spec per grid constraint. Cheap and structural, so
+/// callers run it before any O(n_quotes) work.
+pub fn check_specs_cover_grid(n_specs: usize, grid: &QuoteGrid) -> Result<()> {
+    if n_specs != grid.constraints.len() {
+        return Err(PriceContourError::DimensionMismatch(format!(
+            "specs count {} != grid constraints count {}",
+            n_specs,
+            grid.constraints.len()
+        )));
+    }
+    Ok(())
+}
+
 fn apply_pass(
     grid: &QuoteGrid,
     specs: &[ConstraintSpec],
@@ -46,13 +59,7 @@ fn apply_pass(
             specs.len()
         )));
     }
-    if specs.len() != grid.constraints.len() {
-        return Err(PriceContourError::DimensionMismatch(format!(
-            "specs count {} != grid constraints count {}",
-            specs.len(),
-            grid.constraints.len()
-        )));
-    }
+    check_specs_cover_grid(specs.len(), grid)?;
 
     let n_quotes = grid.n_quotes;
     let lambda_signs_f32 = compute_lambda_signs_f32(specs, lambdas);

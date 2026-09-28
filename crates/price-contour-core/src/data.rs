@@ -749,6 +749,16 @@ mod tests {
             grid.baseline_totals_cancellable(&flag),
             Err(PriceContourError::Cancelled)
         ));
+
+        // Polled once per block: a flag tripping on the second poll stops the
+        // scan after the first block.
+        let flag = CancelFlag::new();
+        flag.cancel_after_polls(2);
+        assert!(matches!(
+            grid.baseline_totals_cancellable(&flag),
+            Err(PriceContourError::Cancelled)
+        ));
+        assert_eq!(flag.polls(), 2);
     }
 
     #[test]

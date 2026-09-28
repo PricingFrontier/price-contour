@@ -401,7 +401,10 @@ except Cancelled:
 A result keeps its call's token: cancelling after the call returned still
 stops a first access to `dataframe` / `quote_results`, and nothing is cached.
 Input errors are reported as `ValueError` even when the token is already
-cancelled. Without a token, both calls behave exactly as before. See
+cancelled, except a zero baseline under a pct bound, which only the
+cancellable baseline scan can find. For `evaluate`, pass a `QuoteGrid` and
+`RatebookFactorContexts`: building either from a DataFrame is not cancellable.
+Without a token, both calls behave exactly as before. See
 `docs/DESIGN_DECISIONS.md` §14 and `scripts/bench_cancel.py`.
 
 ## MLflow integration
@@ -548,7 +551,7 @@ maturin develop
 | Method | Description |
 |---|---|
 | `solve(df_or_grid, factors, *, factor_columns=None, lambdas=None)` | Run ratebook optimisation via coordinate descent. Returns `RatebookResult`. |
-| `evaluate(df_or_grid, factors, factor_tables, *, cancel=None)` | Evaluate factor tables per quote with the canonical kernel. Returns `RatebookEvaluation`. Tables must cover exactly the factors and levels in `factors`; rates must be finite and > 0. Ratio constraints raise. `cancel` takes a `CancelToken`; pass a `QuoteGrid` to make the whole call cancellable (building a grid from a DataFrame is not). |
+| `evaluate(df_or_grid, factors, factor_tables, *, cancel=None)` | Evaluate factor tables per quote with the canonical kernel. Returns `RatebookEvaluation`. Tables must cover exactly the factors and levels in `factors`; rates must be finite and > 0. Ratio constraints raise. `cancel` takes a `CancelToken`; pass a `QuoteGrid` and `RatebookFactorContexts` to make the whole call cancellable (building either from a DataFrame is not). |
 | `frontier(df_or_grid, factors, *, threshold_ranges, n_points_per_dim=5, factor_columns=None, initial_lambdas=None)` | Sweep the efficient frontier via coordinate descent at each threshold. Returns `RatebookFrontierResult` (points plus each point's factor tables). `parallel=True` raises. |
 | `summary(result)` | Package result into MLflow-ready dicts. |
 

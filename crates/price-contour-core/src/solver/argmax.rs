@@ -248,4 +248,43 @@ mod tests {
             Err(crate::error::PriceContourError::Cancelled)
         ));
     }
+
+    #[test]
+    fn a_flag_set_mid_pass_skips_every_later_grain() {
+        // One thread runs the grains in order, polling once before each: a
+        // flag that trips on the third poll lets grains 0 and 1 run and
+        // skips all the rest.
+        let n = ARGMAX_PAR_GRAIN * 8;
+        let grid = QuoteGrid {
+            n_quotes: n,
+            n_steps: 2,
+            scenario_values: vec![1.0, 1.1],
+            objective: (0..n).flat_map(|_| [0.0f32, 1.0]).collect(),
+            constraints: vec![],
+            constraint_names: vec![],
+            quote_ids: (0..n).map(|i| format!("Q{i}")).collect(),
+            quote_id_fingerprint: 0,
+        };
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+
+        let flag = CancelFlag::new();
+        flag.cancel_after_polls(3);
+        let (steps, obj, _) =
+            one_thread.install(|| argmax_pass_polling(&grid, &[], 0, n, Some(&flag)));
+        assert!(steps[..2 * ARGMAX_PAR_GRAIN].iter().all(|&s| s == 1));
+        assert!(steps[2 * ARGMAX_PAR_GRAIN..].iter().all(|&s| s == 0));
+        assert_abs_diff_eq!(obj, (2 * ARGMAX_PAR_GRAIN) as f64, epsilon = 1e-9);
+
+        let flag = CancelFlag::new();
+        flag.cancel_after_polls(3);
+        let result =
+            one_thread.install(|| lagrangian_argmax_pass_cancellable(&grid, &[], 0, n, &flag));
+        assert!(matches!(
+            result,
+            Err(crate::error::PriceContourError::Cancelled)
+        ));
+    }
 }

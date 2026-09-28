@@ -12,7 +12,8 @@ use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
 use price_contour_core::{
-    apply_lambdas, apply_lambdas_cancellable, ApplyResult, CancelFlag, ConstraintSpec, QuoteGrid,
+    apply_lambdas, apply_lambdas_cancellable, check_specs_cover_grid, ApplyResult, CancelFlag,
+    ConstraintSpec, QuoteGrid,
 };
 
 use crate::builder_py::PyQuoteGridBuilder;
@@ -154,6 +155,8 @@ pub fn apply_from_grid_py(
         // parsing's O(n_quotes) pct baseline scan, which can be cancelled.
         validate_constraints_dict(&constraints, &grid_arc)?;
         let constraint_names = spec_names(&constraints, &grid_arc);
+        check_specs_cover_grid(constraint_names.len(), &grid_arc)
+            .map_err(|e| core_error("Apply error", e))?;
         let lambda_vec =
             order_lambdas(&lambdas, &constraint_names).map_err(PyValueError::new_err)?;
         let specs = parse_constraints_polling(constraints, &grid_arc, cancel.as_ref())?;

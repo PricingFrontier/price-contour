@@ -870,9 +870,10 @@ class RatebookOptimiser:
             Cooperative cancellation (DESIGN_DECISIONS §14). Once another
             thread calls ``cancel.cancel()``, the evaluation raises
             :class:`Cancelled`; so does a first access to its
-            ``quote_results``. Building a grid from a DataFrame is not
-            cancellable, so pass a ``QuoteGrid`` to make the whole call
-            cancellable. Without a token the call behaves exactly as before.
+            ``quote_results``. Building a grid or factor contexts from a
+            DataFrame is not cancellable, so pass a ``QuoteGrid`` and
+            ``RatebookFactorContexts`` to make the whole call cancellable.
+            Without a token the call behaves exactly as before.
 
         Returns
         -------

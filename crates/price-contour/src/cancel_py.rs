@@ -43,15 +43,23 @@ impl PyCancelToken {
 
     #[getter]
     fn cancelled(&self) -> bool {
-        self.flag.is_cancelled()
+        self.flag.peek()
+    }
+
+    /// Test hook: cancel on the `n`-th poll the library makes from now, to
+    /// stop a call at a precise point inside a phase. Not part of the API.
+    fn _cancel_after_polls(&self, n: u64) {
+        self.flag.cancel_after_polls(n);
+    }
+
+    /// Test hook: polls the library has made on this token so far.
+    #[getter]
+    fn _polls(&self) -> u64 {
+        self.flag.polls()
     }
 
     fn __repr__(&self) -> String {
-        let cancelled = if self.flag.is_cancelled() {
-            "True"
-        } else {
-            "False"
-        };
+        let cancelled = if self.flag.peek() { "True" } else { "False" };
         format!("CancelToken(cancelled={cancelled})")
     }
 }

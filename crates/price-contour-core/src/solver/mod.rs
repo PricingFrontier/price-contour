@@ -6,7 +6,7 @@ mod lambda;
 mod online;
 mod ratebook_eval;
 
-pub use apply::{apply_lambdas, apply_lambdas_cancellable};
+pub use apply::{apply_lambdas, apply_lambdas_cancellable, check_specs_cover_grid};
 pub(crate) use apply::{apply_lambdas_no_baselines, ApplyPass};
 pub use argmax::{
     compute_lambda_signs_f32, lagrangian_argmax_pass, lagrangian_argmax_pass_cancellable,

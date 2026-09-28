@@ -19,7 +19,7 @@ pub use frontier::{
     ScenarioValueStats, SolverPath,
 };
 pub use solver::{
-    apply_lambdas, apply_lambdas_cancellable, compute_lambda_signs_f32, evaluate_ratebook,
-    evaluate_ratebook_cancellable, lagrangian_argmax_pass, lagrangian_argmax_pass_cancellable,
-    solve_grouped, solve_online, RatebookEvaluation,
+    apply_lambdas, apply_lambdas_cancellable, check_specs_cover_grid, compute_lambda_signs_f32,
+    evaluate_ratebook, evaluate_ratebook_cancellable, lagrangian_argmax_pass,
+    lagrangian_argmax_pass_cancellable, solve_grouped, solve_online, RatebookEvaluation,
 };
