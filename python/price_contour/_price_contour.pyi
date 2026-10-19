@@ -36,8 +36,9 @@ class QuoteGrid:
         :class:`RatebookFactorContexts`."""
         ...
 
-class QuoteGridBuilder:
-    """Incrementally build a QuoteGrid from DataFrame chunks."""
+class _QuoteGridBuilder:
+    """Native builder behind ``price_contour.QuoteGridBuilder``, which
+    projects each chunk onto the columns this reads before ``append``."""
 
     def __init__(
         self,
@@ -343,6 +344,11 @@ def evaluate_ratebook_py(
     cancel: CancelToken | None = None,
 ) -> RatebookEvaluation: ...
 def _baseline_step_index(scenario_values: list[float]) -> int: ...
+def _received_columns(df: pl.DataFrame) -> list[tuple[str, str, int]]:
+    """Test hook: each column as the native module receives it, as
+    ``(name, dtype, n_chunks)``. Not part of the API."""
+    ...
+
 def build_grid_from_parquet_py(
     path: str,
     constraint_columns: list[str],

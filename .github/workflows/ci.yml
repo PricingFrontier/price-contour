@@ -5,9 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # publish.yml calls this workflow and publishes only if it passes.
+  workflow_call:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # github.workflow is the caller's name under workflow_call, so the copy
+  # publish.yml runs does not cancel (or get cancelled by) the push run.
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -84,11 +88,15 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install dependencies and build
+      # Everything comes from uv.lock, so the suite runs on the Polars the
+      # lock pins. --no-sync keeps later steps from re-resolving it.
+      - name: Install dependencies from the lock
+        run: uv sync --locked --python ${{ matrix.python-version }} --no-install-project --group test
+
+      - name: Build the extension
         run: |
-          uv venv --python ${{ matrix.python-version }}
-          uv pip install "maturin>=1.4" "pytest>=9.0" "hypothesis>=6.0" "polars>=0.20" "pyarrow>=23.0.1" "scipy>=1.10"
-          uv run maturin develop --release
+          uv run --no-sync python -c "import polars; print('polars', polars.__version__)"
+          uv run --no-sync maturin develop --release
 
       - name: Run tests
-        run: uv run pytest tests/python -v --tb=short
+        run: uv run --no-sync pytest tests/python -v --tb=short

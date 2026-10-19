@@ -95,10 +95,13 @@ def _stitch_optimal_ratio_columns(
     lookup = original_df.select([quote_id_col, scenario_index_col, *wanted]).rename(
         {scenario_index_col: "optimal_step"}
     )
+    # ``maintain_order="left"``: rows follow ``base_df`` (the grid's quote
+    # order), which Polars 2 no longer promises by default (§15.3).
     joined = base_df.join(
         lookup,
         on=[quote_id_col, "optimal_step"],
         how="inner",
+        maintain_order="left",
     )
     if joined.height != base_df.height:
         raise RuntimeError(

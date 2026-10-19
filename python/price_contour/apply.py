@@ -7,6 +7,7 @@ from pathlib import Path
 
 import polars as pl
 
+from price_contour._native_columns import select_native_columns
 from price_contour._price_contour import (
     ApplyResult,
     CancelToken,
@@ -148,7 +149,9 @@ class ApplyOptimiser:
             sum_constraints = linearised.sum_constraints
             ratio_columns = linearised.ratio_columns
             inner_result = apply_lambdas_py(
-                modified_df,
+                select_native_columns(
+                    modified_df, self._native_read_columns(sum_constraints)
+                ),
                 lambdas=self.lambdas,
                 quote_id=self.quote_id,
                 scenario_index=self.scenario_index,
@@ -165,7 +168,7 @@ class ApplyOptimiser:
                 scenario_value=self.scenario_value,
             )
         return apply_lambdas_py(
-            df,
+            select_native_columns(df, self._native_read_columns(self.constraints)),
             lambdas=self.lambdas,
             quote_id=self.quote_id,
             scenario_index=self.scenario_index,
@@ -173,6 +176,16 @@ class ApplyOptimiser:
             objective=self.objective,
             constraints=self.constraints,
         )
+
+    def _native_read_columns(self, constraints: dict[str, dict]) -> list[str]:
+        """Columns ``apply_lambdas_py`` reads (DESIGN_DECISIONS §15.2)."""
+        return [
+            self.quote_id,
+            self.scenario_index,
+            self.scenario_value,
+            self.objective,
+            *constraints,
+        ]
 
     def with_explainer_columns(self, df: pl.DataFrame) -> pl.DataFrame:
         """Append optimiser-consistent explainer columns to ``df``.
@@ -340,9 +353,10 @@ class ApplyOptimiser:
         # are grid-wide so this resolves to the same scenario_index for
         # every quote; the per-quote computation is what the spec asks
         # for and stays correct should that ever loosen.
+        # Eager, like its input: a lazy ``collect()`` would run on Polars 2's
+        # streaming engine (DESIGN_DECISIONS §15.3).
         baseline_lookup = (
-            modified_df.lazy()
-            .select(
+            modified_df.select(
                 [
                     pl.col(self.quote_id),
                     pl.col(self.scenario_index),
@@ -358,7 +372,6 @@ class ApplyOptimiser:
                 .first()
                 .alias(_EXPLAINER_BASELINE_SI)
             )
-            .collect()
         )
 
         # Compose the final DataFrame. Order:
@@ -378,7 +391,9 @@ class ApplyOptimiser:
         out = out.with_columns(decision_expr)
 
         out = (
-            out.join(selected_lookup, on=self.quote_id, how="left")
+            out.join(
+                selected_lookup, on=self.quote_id, how="left", maintain_order="left"
+            )
             .with_columns(
                 (pl.col(self.scenario_index) == pl.col(_EXPLAINER_OPT_STEP)).alias(
                     "selected"
@@ -388,7 +403,9 @@ class ApplyOptimiser:
         )
 
         out = (
-            out.join(baseline_lookup, on=self.quote_id, how="left")
+            out.join(
+                baseline_lookup, on=self.quote_id, how="left", maintain_order="left"
+            )
             .with_columns(
                 (pl.col(self.scenario_index) == pl.col(_EXPLAINER_BASELINE_SI)).alias(
                     "is_baseline"

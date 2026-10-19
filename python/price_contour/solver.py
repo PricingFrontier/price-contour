@@ -14,6 +14,7 @@ from price_contour._frontier_helpers import (
     _python_frontier_orchestrator,
 )
 from price_contour._grid_utils import build_grid
+from price_contour._native_columns import select_native_columns
 from price_contour._price_contour import (
     _baseline_step_index,
     ApplyResult,
@@ -77,6 +78,16 @@ class OnlineOptimiser:
         self.tolerance = tolerance
         self.record_history = record_history
         _validate_constraint_dict(self.constraints)
+
+    def _native_read_columns(self, constraints: dict[str, dict]) -> list[str]:
+        """Columns ``solve_online_py`` reads (DESIGN_DECISIONS §15.2)."""
+        return [
+            self.quote_id,
+            self.scenario_index,
+            self.scenario_value,
+            self.objective,
+            *constraints,
+        ]
 
     def solve(
         self,
@@ -168,7 +179,9 @@ class OnlineOptimiser:
             threshold_shift = linearised.threshold_shift
             ratio_bounds = linearised.ratio_bounds
             inner_result = solve_online_py(
-                modified_df,
+                select_native_columns(
+                    modified_df, self._native_read_columns(sum_constraints)
+                ),
                 quote_id=self.quote_id,
                 scenario_index=self.scenario_index,
                 scenario_value=self.scenario_value,
@@ -194,7 +207,9 @@ class OnlineOptimiser:
             )
 
         return solve_online_py(
-            df_or_grid,
+            select_native_columns(
+                df_or_grid, self._native_read_columns(self.constraints)
+            ),
             quote_id=self.quote_id,
             scenario_index=self.scenario_index,
             scenario_value=self.scenario_value,
@@ -1501,11 +1516,14 @@ class _RatioSolveResultWrapper:
         # Inner-join back onto the original DataFrame at (quote_id,
         # scenario_index == optimal_step) to pull num / denom values at
         # the chosen step for each quote.
+        # ``maintain_order="left"`` fixes the summation order, and so the
+        # last bits of the Float64 ratio totals (DESIGN_DECISIONS §15.3).
         chosen = self._original_df.join(
             opt_steps,
             left_on=[self._quote_id, self._scenario_index],
             right_on=[self._quote_id, "_optimal_step"],
             how="inner",
+            maintain_order="left",
         )
         out: dict[str, float] = {}
         for label, num_col, denom_col in self._ratio_columns:

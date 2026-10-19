@@ -152,7 +152,7 @@ impl PyFrontierResult {
         sv_col!("sv_pct_increase", pct_increase);
         sv_col!("sv_pct_decrease", pct_decrease);
 
-        let df = DataFrame::new(columns)
+        let df = DataFrame::new(self.inner.points.len(), columns)
             .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))?;
         let py_df: Py<PyAny> = PyDataFrame(df).into_pyobject(py)?.into();
         Ok(py_df)

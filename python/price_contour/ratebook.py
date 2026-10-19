@@ -17,6 +17,7 @@ from price_contour._frontier_helpers import (
     frontier_points_schema,
 )
 from price_contour._grid_utils import build_grid
+from price_contour._native_columns import select_native_columns
 from price_contour._price_contour import (
     CancelToken,
     FactorContext,
@@ -955,7 +956,7 @@ class RatebookOptimiser:
         # the screening loop only uses each per-factor `FactorContext`
         # to drive `solve_grouped_py`, routing through the public
         # builder keeps the dataframe-extraction path in one place.
-        contexts_wrapper = RatebookFactorContexts.from_dataframe(
+        contexts_wrapper = _factor_contexts_from_dataframe(
             factors,
             [[col] for col in factors.columns],
             quote_id=self.quote_id if self.quote_id in factors.columns else None,
@@ -1193,11 +1194,10 @@ class RatebookOptimiser:
             expected_quote_ids = _expected_quote_ids_for_frontier(
                 df_or_grid, grid, self.quote_id
             )
-            frontier_factor_contexts = RatebookFactorContexts.from_dataframe(
+            frontier_factor_contexts = _factor_contexts_from_dataframe(
                 factors,
                 resolved_factor_specs,
                 quote_id=(self.quote_id if self.quote_id in factors.columns else None),
-                separator="\x1f",
                 expected_quote_ids=expected_quote_ids,
             )
 
@@ -1704,12 +1704,33 @@ def _resolve_factor_contexts(
     # through so the chunked-builder path validates IDs explicitly;
     # otherwise fall back to positional-trust against
     # expected_quote_ids=grid.quote_ids.
-    return RatebookFactorContexts.from_dataframe(
+    return _factor_contexts_from_dataframe(
         factors,
         factor_specs,
         quote_id=quote_id_col if quote_id_col in factors.columns else None,
-        separator="\x1f",
         expected_quote_ids=grid.quote_ids,
+    )
+
+
+def _factor_contexts_from_dataframe(
+    factors: pl.DataFrame,
+    factor_specs: list[list[str]],
+    *,
+    quote_id: str | None,
+    expected_quote_ids: list[str],
+) -> RatebookFactorContexts:
+    """Build contexts from a factors frame, handing the native builder only
+    the ``quote_id`` column (when used) and the factor columns
+    (DESIGN_DECISIONS §15.2)."""
+    read = [] if quote_id is None else [quote_id]
+    for spec in factor_specs:
+        read.extend(spec)
+    return RatebookFactorContexts.from_dataframe(
+        select_native_columns(factors, read),
+        factor_specs,
+        quote_id=quote_id,
+        separator=FACTOR_SEPARATOR,
+        expected_quote_ids=expected_quote_ids,
     )
 
 
