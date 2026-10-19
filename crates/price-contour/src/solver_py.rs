@@ -334,7 +334,7 @@ pub(crate) fn build_result_dataframe_polling(
         );
     }
 
-    DataFrame::new(columns)
+    DataFrame::new(n, columns)
         .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))
 }
 

@@ -36,7 +36,7 @@ const SCENARIO_VALUE_TOL: f32 = 1e-6;
 /// formed, but unsafe if the streaming source can hand you a partial first
 /// quote (e.g., a parquet row group that cuts mid-quote). Pipelines that may
 /// receive partial first chunks should pass `n_steps` explicitly.
-#[pyclass(name = "QuoteGridBuilder")]
+#[pyclass(name = "_QuoteGridBuilder")]
 pub struct PyQuoteGridBuilder {
     inner: Option<QuoteGridBuilder>,
     // Column name configuration

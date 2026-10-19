@@ -175,7 +175,7 @@ fn cast_column_to_strings(df: &DataFrame, column_name: &str) -> PyResult<Vec<Str
             })
             .collect()
     } else {
-        ca.into_no_null_iter().map(|s| s.to_string()).collect()
+        ca.no_null_iter().map(|s| s.to_string()).collect()
     };
     Ok(labels)
 }
