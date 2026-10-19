@@ -1480,8 +1480,10 @@ it first onto the columns that call reads:
 One helper (`_native_columns.select_native_columns`) does the projection for
 all of them. It keeps the named columns that are present, in the order
 named, without duplicates; a missing column is left for the native
-validation to report with the message it always gave, so the projection
-never hides an error.
+validation to report with the message it always gave. A non-empty frame
+with none of the named columns raises `ValueError` in the helper instead,
+because the projection would leave a frame with no rows, which the native
+call would take for an empty input. The projection never hides an error.
 
 `QuoteGridBuilder` is a Python class that holds the native builder and
 projects each chunk in `append` before the native call. Its constructor,
@@ -1519,3 +1521,14 @@ order is part of a contract states it:
 A lazy `collect()` runs on the streaming engine by default in Polars 2. The
 library's inputs are eager frames, so its queries are written eagerly: the
 explainer baseline lookup is an eager `group_by`.
+
+### 15.4 Quote order is lexical whatever the id's dtype
+
+A grid orders its quotes by the id's string, byte-wise, whether the id is
+String, Categorical or Enum: `QuoteGridBuilder.build()` sorts the strings,
+and the one-shot ingest behind `solve` and `apply` sorts the frame. Polars
+sorts a Categorical lexically but an Enum by its category order, and the
+0.25 bridge delivered an Enum as a Categorical. Since 0.7.0 an Enum
+arrives as an Enum, so the ingest sorts an Enum id through a Categorical
+copy with its own categories. Results, fingerprints and factor-context
+alignment therefore do not depend on an Enum's category order.

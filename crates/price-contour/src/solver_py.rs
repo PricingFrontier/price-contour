@@ -82,6 +82,36 @@ pub(crate) fn is_df_sorted(df: &DataFrame, col1: &str, col2: &str) -> bool {
     true
 }
 
+/// Sort by `(quote_id, scenario_index)`, with quote ids in lexical order
+/// whatever their dtype (DESIGN_DECISIONS §15.4).
+///
+/// Polars sorts a String or Categorical column lexically but an Enum by its
+/// category order. An Enum id is therefore sorted through a Categorical copy
+/// with its own (non-global) categories, dropped with the frame.
+fn sort_by_quote_id(
+    df: &DataFrame,
+    quote_id_col: &str,
+    scenario_index_col: &str,
+) -> PyResult<DataFrame> {
+    let sort_err = |e: PolarsError| PyValueError::new_err(format!("Sort failed: {e}"));
+    let mut df = df.clone();
+    if let Ok(col) = df.column(quote_id_col) {
+        if let DataType::Enum(frozen, _) = col.dtype() {
+            let cats =
+                Categories::random(PlSmallStr::from_static("price_contour"), frozen.physical());
+            let lexical = col
+                .cast(&DataType::from_categories(cats))
+                .map_err(sort_err)?;
+            df.with_column(lexical).map_err(sort_err)?;
+        }
+    }
+    df.sort(
+        [quote_id_col, scenario_index_col],
+        SortMultipleOptions::default(),
+    )
+    .map_err(sort_err)
+}
+
 /// Ingest a PyDataFrame, validate columns, sort, and build a QuoteGrid.
 pub(crate) fn ingest_dataframe(
     df: &DataFrame,
@@ -96,11 +126,7 @@ pub(crate) fn ingest_dataframe(
     let df = if is_df_sorted(df, quote_id_col, scenario_index_col) {
         df.clone()
     } else {
-        df.sort(
-            [quote_id_col, scenario_index_col],
-            SortMultipleOptions::default(),
-        )
-        .map_err(|e| PyValueError::new_err(format!("Sort failed: {e}")))?
+        sort_by_quote_id(df, quote_id_col, scenario_index_col)?
     };
 
     // Extract scenario_value grid from first quote's steps

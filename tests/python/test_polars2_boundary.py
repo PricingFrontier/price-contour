@@ -32,12 +32,14 @@ LAMBDAS = {"volume": 3.0, "loss_ratio": 1.5}
 
 
 def _with_quote_id_dtype(df: pl.DataFrame, dtype: str) -> pl.DataFrame:
-    """``df`` with ``quote_id`` as String, Categorical or Enum."""
+    """``df`` with ``quote_id`` as String, Categorical or Enum. The Enum's
+    categories are in reverse lexical order, so a sort by category order
+    differs from the lexical order grids use (§15.4)."""
     if dtype == "String":
         return df
     if dtype == "Categorical":
         return df.with_columns(pl.col("quote_id").cast(pl.Categorical))
-    categories = df["quote_id"].unique(maintain_order=True).to_list()
+    categories = sorted(df["quote_id"].unique().to_list(), reverse=True)
     return df.with_columns(pl.col("quote_id").cast(pl.Enum(categories)))
 
 
@@ -118,24 +120,36 @@ RESULT_SCHEMA = {
 
 @pytest.mark.parametrize("dtype", ["String", "Categorical", "Enum"])
 class TestQuoteIdDtypeRoundTrip:
-    def test_apply(self, dtype: str) -> None:
+    """Every dtype, sorted or shuffled, gives the String result: rows and
+    the grid's quote order are lexical by id (§15.4)."""
+
+    @pytest.mark.parametrize("shuffle", [False, True], ids=["sorted", "shuffled"])
+    def test_apply(self, dtype: str, shuffle: bool) -> None:
         df = make_small_df(n_quotes=30, n_steps=5)
         applier = pc.ApplyOptimiser(lambdas=LAMBDAS, constraints=SUM_CONSTRAINTS)
         expected = applier.apply(df)
-        result = applier.apply(_with_quote_id_dtype(df, dtype))
+        given = _with_quote_id_dtype(_shuffled(df) if shuffle else df, dtype)
+        result = applier.apply(given)
         assert dict(result.dataframe.schema) == RESULT_SCHEMA
         assert result.dataframe.equals(expected.dataframe)
         assert result.total_objective == expected.total_objective
         assert result.total_constraints == expected.total_constraints
 
-    def test_solve(self, dtype: str) -> None:
+    @pytest.mark.parametrize("shuffle", [False, True], ids=["sorted", "shuffled"])
+    def test_solve(self, dtype: str, shuffle: bool) -> None:
         df = make_small_df(n_quotes=30, n_steps=5)
         solver = pc.OnlineOptimiser(constraints=SUM_CONSTRAINTS, max_iter=200)
         expected = solver.solve(df)
-        result = solver.solve(_with_quote_id_dtype(df, dtype))
+        given = _with_quote_id_dtype(_shuffled(df) if shuffle else df, dtype)
+        result = solver.solve(given)
         assert dict(result.dataframe.schema) == RESULT_SCHEMA
         assert result.dataframe.equals(expected.dataframe)
         assert result.lambdas == expected.lambdas
+        builder = pc.QuoteGridBuilder(["loss_ratio", "volume"])
+        builder.append(_with_quote_id_dtype(df, dtype))
+        built = builder.build()
+        assert result.grid.quote_ids == built.quote_ids
+        assert result.grid.quote_id_fingerprint == built.quote_id_fingerprint
 
     def test_parquet_chunked(self, dtype: str, tmp_path: Path) -> None:
         df = make_small_df(n_quotes=30, n_steps=5)
@@ -291,6 +305,25 @@ class TestUnreadColumnsAreNotSent:
         expected = opt.solve(df, factors)
         assert result.factor_tables == expected.factor_tables
 
+    @pytest.mark.parametrize("earlier_chunks", [0, 1])
+    def test_chunk_with_no_read_column_is_rejected(self, earlier_chunks: int) -> None:
+        # Projecting it would leave a frame with no rows, which the native
+        # builder would skip as an empty chunk.
+        builder = pc.QuoteGridBuilder(["volume"])
+        if earlier_chunks:
+            builder.append(make_small_df(n_quotes=4, n_steps=3))
+        unrelated = pl.DataFrame({"unrelated": [1, 2, 3]}).with_columns(
+            _exotic_columns(3)
+        )
+        with pytest.raises(ValueError, match=r"Missing column\(s\): quote_id"):
+            builder.append(unrelated)
+
+    def test_empty_chunk_with_no_read_column_is_a_no_op(self) -> None:
+        builder = pc.QuoteGridBuilder(["volume"])
+        builder.append(pl.DataFrame({"unrelated": pl.Series([], dtype=pl.Int64)}))
+        builder.append(make_small_df(n_quotes=4, n_steps=3))
+        assert builder.build().n_quotes == 4
+
     def test_missing_column_error_is_unchanged(self) -> None:
         # The projection leaves a missing column for the native validation,
         # which names it as before.
@@ -337,18 +370,27 @@ class TestRowOrder:
         assert "optimal_loss_ratio" in frame.columns
 
     def test_ratio_history_totals_are_sums_in_input_order(self) -> None:
-        df = _shuffled(make_small_df(n_quotes=40, n_steps=5))
+        # Numerators spanning 16 orders of magnitude make the Float64 total
+        # depend on summation order, so a replay that summed the chosen rows
+        # in any other order would report different last bits.
+        exponent = (pl.col("quote_id").str.slice(1).cast(pl.Int32) % 3 - 1) * 8
+        df = _shuffled(
+            make_small_df(n_quotes=60, n_steps=5).with_columns(
+                (pl.col("loss_ratio") * pl.lit(10.0).pow(exponent)).cast(pl.Float32)
+            )
+        )
         constraints = {
-            "lr": {"numerator": "loss_ratio", "denominator": "volume", "max": 0.55}
+            "lr": {"numerator": "loss_ratio", "denominator": "volume", "min_pct": 1.05}
         }
         result = pc.OnlineOptimiser(
             constraints=constraints, max_iter=30, record_history=True
         ).solve(df)
         history = result.history
-        assert history is not None and len(history) >= 2
+        assert history is not None and len(history) >= 3
         # The last record carries the final pass's ratio; check the replayed
         # ones against an oracle that picks each quote's step with the native
         # apply argmax and sums the chosen rows in input order via a filter.
+        order_sensitive = 0
         for record in history[:-1]:
             steps = pc.ApplyOptimiser(
                 lambdas=record["lambdas"], constraints=constraints
@@ -363,6 +405,12 @@ class TestRowOrder:
                 pl.col("scenario_index")
                 == pl.col("quote_id").replace_strict(chosen_step, return_dtype=pl.Int32)
             )
-            num = chosen["loss_ratio"].cast(pl.Float64).sum()
-            den = chosen["volume"].cast(pl.Float64).sum()
-            assert record["total_constraints"]["lr"] == num / den
+
+            def ratio(rows: pl.DataFrame) -> float:
+                num = rows["loss_ratio"].cast(pl.Float64).sum()
+                return num / rows["volume"].cast(pl.Float64).sum()
+
+            assert record["total_constraints"]["lr"] == ratio(chosen)
+            order_sensitive += ratio(chosen) != ratio(chosen.reverse())
+        # Precondition: the fixture really is order-sensitive.
+        assert order_sensitive >= 1
