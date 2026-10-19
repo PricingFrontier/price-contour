@@ -7,10 +7,10 @@ import pytest
 import polars as pl
 
 import price_contour as pc
+from price_contour import QuoteGridBuilder
 from price_contour._price_contour import (
     FactorContext,
     QuoteGrid,
-    QuoteGridBuilder,
     run_cd_pass_py,
     solve_grouped_py,
 )
