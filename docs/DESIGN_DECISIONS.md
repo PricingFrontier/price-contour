@@ -1435,3 +1435,87 @@ synthetic grid of 1,000,000 quotes × 41 steps × 3 constraints, online and
 ratebook, cancelling at random points in every phase. The p99 must stay under
 50 ms. The one step that does not poll is handing the finished frame to
 Python, which is zero-copy.
+
+## 15. Polars 2 (0.7.0)
+
+### Context
+
+Python Polars 2.0.0 was published on 6 October 2026. price-contour 0.6.0
+declared `polars>=0.20` with no upper bound, and its own CI only ever ran
+Polars 1.38. haute, the one consumer, runs Polars 2.0. 0.7.0 declares and
+tests the Polars it supports, and moves the native bridge to the newest
+released crates. The supported range and the dependency set change, so it is
+a minor version bump.
+
+### 15.1 Supported range and bridge
+
+- The package requires `polars>=2.0,<3` and nothing else at runtime. CI
+  installs from `uv.lock`, which pins the Polars the suite runs on.
+- The bindings build on pyo3-polars 0.28, the Polars 0.55 Rust crates and
+  PyO3 0.29. Frames cross the boundary through Polars' own FFI
+  (`Series._export` into Rust, `Series._import` back), not through pyarrow,
+  so pyarrow is no longer a dependency.
+- Numeric and string columns arrive as they are, without the rechunk the
+  0.25 bridge applied to every column. Categorical and Enum columns are
+  rebuilt from their strings on the way in, and an Enum `quote_id` arrives
+  as `DataType::Enum`.
+- These are not Polars 2's own Rust crates; Polars has not published any.
+  The FFI format and the Categorical/Enum metadata keys are the same at
+  rs-0.55.1 and py-2.0.0, which is why the bridge works with Python Polars
+  2.0. A later release moves to the 2.0 crates once they exist.
+
+### 15.2 Only the columns a native call reads cross the boundary
+
+The bridge converts every column of a frame it is handed. Every Python entry
+point that passes a caller's frame to the native module therefore projects
+it first onto the columns that call reads:
+
+- online solve, apply and grid building: `quote_id`, `scenario_index`,
+  `scenario_value`, the objective and the constraint columns (for a ratio
+  constraint, the synthetic linearised column, whose numerator and
+  denominator stay on the Python side);
+- ratebook factor contexts built from a factors frame: the `quote_id` column,
+  when one is used, and the factor columns.
+
+One helper (`_native_columns.select_native_columns`) does the projection for
+all of them. It keeps the named columns that are present, in the order
+named, without duplicates; a missing column is left for the native
+validation to report with the message it always gave, so the projection
+never hides an error.
+
+`QuoteGridBuilder` is a Python class that holds the native builder and
+projects each chunk in `append` before the native call. Its constructor,
+methods and `n_quotes` match the native class.
+
+So an unrelated column costs nothing, and a column the extension's Polars
+cannot import (Polars 2's `Map`, or a `Struct`, `Decimal` or `Array` column,
+whose Polars features the extension does not enable) cannot fail a call.
+`with_explainer_columns` still returns every input column, because it builds
+them in Python.
+
+`RatebookFactorContexts.from_dataframe`, called directly, is the native
+class's own method and still receives the whole frame; the library's own
+callers project before calling it.
+
+### 15.3 Row order is stated, never assumed
+
+Polars 2.0's `DataFrame.join` defaults `maintain_order` to `"none"`: the
+output order may differ between versions and runs. Every join whose output
+order is part of a contract states it:
+
+- `with_explainer_columns`: both left joins use `maintain_order="left"`, so
+  the output has the input's rows in the input's order (§ the method's
+  docstring).
+- The ratio stitch (`_stitch_optimal_ratio_columns`) uses
+  `maintain_order="left"`. With ratio constraints its frame is
+  `SolveResult.dataframe`, `ApplyResult.dataframe` and the ratebook
+  `quote_results`, whose rows follow the grid's quote order (§13.2), and the
+  Float64 ratio totals summed over it depend on that order in their last
+  bits.
+- The ratio history replay (`_actual_ratios_for_lambdas`) uses
+  `maintain_order="left"`, for the same last-bits reason in
+  `history[*]["total_constraints"]`.
+
+A lazy `collect()` runs on the streaming engine by default in Polars 2. The
+library's inputs are eager frames, so its queries are written eagerly: the
+explainer baseline lookup is an eager `group_by`.

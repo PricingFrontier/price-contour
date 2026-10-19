@@ -102,8 +102,8 @@ The library accepts a **long-format Polars DataFrame** — one row per quote per
 
 | Column | Type | Description |
 |---|---|---|
-| `quote_id` | str/int | Identifies each quote/risk. Column name is configurable. |
-| `scenario_index` | int | Index into the scenario value grid (0, 1, 2, ..., M-1). Column name is configurable. |
+| `quote_id` | String, Categorical or Enum | Identifies each quote/risk. Integer ids are refused. Column name is configurable. |
+| `scenario_index` | Int32 | Index into the scenario value grid (0, 1, 2, ..., M-1). Column name is configurable. |
 | `scenario_value` | f32 | The price scenario value at this index (e.g. 0.80, 0.81, ..., 1.20). |
 | `objective` | f32 | Objective function value at this index (e.g. expected income). Column name is configurable. |
 | `constraint_*` | f32 | One column per constraint (e.g. `volume`, `loss_ratio`). Names are configurable. |
@@ -618,9 +618,9 @@ No ndarray, no nalgebra — the data structures are flat `Vec<f32>` for maximum 
 ```toml
 [dependencies]
 price-contour-core = { path = "../price-contour-core" }
-pyo3 = { version = "0.23", features = ["extension-module"] }
-pyo3-polars = "0.20"     # Native Polars DataFrame interop
-polars = "0.46"           # For internal DataFrame operations
+pyo3 = { version = "0.29", features = ["extension-module", "indexmap"] }
+pyo3-polars = "0.28"     # Native Polars DataFrame interop (Polars' own FFI, no pyarrow)
+polars = "0.55"           # For internal DataFrame operations
 ```
 
 ---

@@ -18,7 +18,7 @@ Hot loops, linear algebra, and data-parallel work live in `crates/rustystats-cor
 
 ### Minimal dependencies
 
-Core runtime requires only `numpy` and `polars`. No scipy, no pandas, no sklearn in `[project.dependencies]`. Heavy packages belong in `[project.optional-dependencies]` or `[dependency-groups]` only.
+Core runtime requires only `polars` (`>=2.0,<3`). No scipy, no pandas, no sklearn in `[project.dependencies]`. Heavy packages belong in `[project.optional-dependencies]` or `[dependency-groups]` only.
 
 ### Dict-first API
 
@@ -253,7 +253,7 @@ Copy into PR descriptions:
 Design Philosophy
 - [ ] Numerical results verified against reference (statsmodels/R)
 - [ ] Computation in Rust, orchestration in Python, PyO3 bindings are thin
-- [ ] No new core runtime dependencies (only numpy + polars)
+- [ ] No new core runtime dependencies (only polars)
 - [ ] Dict API schema unchanged (or migration path documented)
 - [ ] Single code path — no special-case branches per family unless mathematically required
 - [ ] Invalid inputs produce clear errors, not silent wrong results

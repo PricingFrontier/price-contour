@@ -214,8 +214,9 @@ Developer commits code
 ```
 Bump version in pyproject.toml
   → merge to main
-  → CI runs and passes
   → Publish workflow detects version bump
+  → Publish workflow runs the full CI workflow (ci.yml) on that commit;
+    nothing is built or published unless it passes
   → Builds wheels for 4 platforms
   → Publishes to PyPI via OIDC (manual approval if configured)
   → Creates GitHub Release with changelog and wheel attachments
@@ -260,7 +261,7 @@ git commit --no-verify -m "wip: work in progress"
 
 ### CI fails with "target-cpu" errors
 
-The CI workflows override `.cargo/config.toml`'s `target-cpu=native` with `x86-64-v3` (AVX2). If a CI runner doesn't support AVX2 (unlikely for GitHub-hosted runners), change the env var to `x86-64` (baseline SSE2) in the workflow file.
+The CI workflows set `RUSTFLAGS="-C target-cpu=x86-64-v3"` (AVX2); `.cargo/config.toml` sets no target CPU, and local builds choose their own through `RUSTFLAGS`. If a CI runner doesn't support AVX2 (unlikely for GitHub-hosted runners), change the env var to `x86-64` (baseline SSE2) in the workflow file.
 
 ### Publish workflow doesn't trigger
 

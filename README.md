@@ -27,6 +27,8 @@ The core algorithm is Lagrangian dual decomposition, implemented in Rust for spe
 uv add price-contour
 ```
 
+price-contour requires Polars 2 (`polars>=2.0,<3`) and Python 3.10 or later. It has no other runtime dependency.
+
 ```python
 import polars as pl
 import price_contour as pc
