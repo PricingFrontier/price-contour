@@ -161,6 +161,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.check-version.outputs.new_version }}
+          # Tag the commit that was tested and built, not whatever main points
+          # at once CI and the wheel builds have finished.
+          target_commitish: ${{ github.sha }}
           name: v${{ needs.check-version.outputs.new_version }}
           generate_release_notes: true
           files: dist/*

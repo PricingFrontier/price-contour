@@ -1452,9 +1452,10 @@ a minor version bump.
 - The package requires `polars>=2.0,<3` and nothing else at runtime. CI
   installs from `uv.lock`, which pins the Polars the suite runs on.
 - The bindings build on pyo3-polars 0.28, the Polars 0.55 Rust crates and
-  PyO3 0.29. Frames cross the boundary through Polars' own FFI
-  (`Series._export` into Rust, `Series._import` back), not through pyarrow,
-  so pyarrow is no longer a dependency.
+  PyO3 0.29. Frames cross the boundary through Polars' own FFI (the native
+  series' `_export`, reached as `Series._s._export`, into Rust;
+  `Series._import` back), not through pyarrow, so pyarrow is no longer a
+  dependency.
 - Numeric and string columns arrive as they are, without the rechunk the
   0.25 bridge applied to every column. Categorical and Enum columns are
   rebuilt from their strings on the way in, and an Enum `quote_id` arrives
