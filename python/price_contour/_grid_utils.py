@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import polars as pl
 
-from price_contour._price_contour import QuoteGrid, QuoteGridBuilder
+from price_contour._price_contour import QuoteGrid
+from price_contour.builder import QuoteGridBuilder
 
 
 def build_grid(
