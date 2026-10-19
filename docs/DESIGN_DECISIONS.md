@@ -1513,7 +1513,10 @@ order is part of a contract states it:
   `SolveResult.dataframe`, `ApplyResult.dataframe` and the ratebook
   `quote_results`, whose rows follow the grid's quote order (§13.2), and the
   Float64 ratio totals summed over it depend on that order in their last
-  bits.
+  bits. On Polars 2, 0.6.0 returned these frames in the input's quote order
+  (sum-only frames were already in grid order); 0.7.0 returns them in grid
+  order, as documented. haute's trace test for a ratio apply encoded the
+  input order and moves with its pin.
 - The ratio history replay (`_actual_ratios_for_lambdas`) uses
   `maintain_order="left"`, for the same last-bits reason in
   `history[*]["total_constraints"]`.
