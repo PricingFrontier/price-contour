@@ -230,6 +230,7 @@ class OnlineOptimiser:
         initial_lambdas: dict[str, float] | None = None,
         max_total_points: int = 10_000,
         parallel: bool = False,
+        record_history: bool = False,
     ) -> FrontierResult:
         """Sweep the efficient frontier over constraint threshold ranges.
 
@@ -247,11 +248,15 @@ class OnlineOptimiser:
             Lambdas to warm-start the first frontier point. Typically from
             a prior ``solve()`` call on the same grid. Subsequent points
             warm-start from their nearest neighbour as usual.
+        record_history : bool
+            Record each point's steps in ``point_history`` (DESIGN_DECISIONS
+            §16): its bisection probes, or the subgradient iterations its
+            solve runs. Recording adds no probe or iteration.
 
         Returns
         -------
         FrontierResult
-            Result with .points (DataFrame) and .n_points.
+            Result with .points (DataFrame), .n_points and .point_history.
         """
         # Detect ratio constraints up front. When any are present we
         # dispatch to the Python-side sweep so that each point can run
@@ -293,6 +298,7 @@ class OnlineOptimiser:
                 n_points_per_dim=n_points_per_dim,
                 initial_lambdas=initial_lambdas,
                 max_total_points=max_total_points,
+                record_history=record_history,
             )
 
         if isinstance(df_or_grid, pl.DataFrame):
@@ -339,6 +345,7 @@ class OnlineOptimiser:
             initial_lambdas=initial_lambdas,
             max_total_points=max_total_points,
             parallel=parallel,
+            record_history=record_history,
         )
 
     def _python_frontier_sweep(
@@ -349,6 +356,7 @@ class OnlineOptimiser:
         n_points_per_dim: int,
         initial_lambdas: dict[str, float] | None,
         max_total_points: int,
+        record_history: bool,
     ) -> "_PythonFrontierResult":
         """Sweep the frontier in Python by calling ``solve()`` per point.
 
@@ -437,7 +445,7 @@ class OnlineOptimiser:
                 scenario_value=self.scenario_value,
                 max_iter=self.max_iter,
                 tolerance=self.tolerance,
-                record_history=False,
+                record_history=record_history,
             )
             result = point_solver.solve(df, lambdas=prev_lambdas)
             return result, dict(result.lambdas)
@@ -487,6 +495,7 @@ class OnlineOptimiser:
             initial_lambdas=initial_lambdas,
             solve_one=solve_one,
             compose_row=compose_row,
+            record_history=record_history,
         )
 
     def config_dict(self) -> dict[str, Any]:

@@ -196,6 +196,13 @@ Adjacent points are warm-started from each other (nearest-neighbour traversal of
 
 A ratebook frontier keeps each point's factor tables (`frontier.point_factor_tables(i)`); `optimiser.evaluate(grid, factors, frontier.point_factor_tables(i))` reproduces row `i` exactly. Re-solving with a row's λ is not guaranteed to land on the same tables.
 
+**How each point converged.** `frontier(..., record_history=True)` records the steps the sweep takes for every point, without adding any: a 1-D sweep's bisection probes (the probed λ, the bracket it halved, the totals, and whether the probe became the point's answer), a multi-constraint sweep's subgradient iterations (the entries `solve(record_history=True)` records), and a ratebook point's coordinate-descent inner solves (`per_factor_results`). `frontier.point_history` is one long frame keyed by `point_index` (the row of `points`); `frontier_point_history_schema(mode, constraint_names)` returns its exact schema. It is `None` when the sweep did not record.
+
+```python
+frontier = optimiser.frontier(df, threshold_ranges={"volume": (0.85, 1.0)}, record_history=True)
+trace = frontier.point_history.filter(pl.col("point_index") == 3)
+```
+
 **Sweeping a ratio target** — declare the constraint with `None` so the constructor doesn't fix it, then supply the range to `frontier()`:
 
 ```python
@@ -544,7 +551,7 @@ maturin develop
 | Method | Description |
 |---|---|
 | `solve(df_or_grid, *, lambdas=None)` | Run full optimisation. Returns `SolveResult`. Ratio constraints require a DataFrame (the linearisation needs raw numerator/denominator columns); a pre-built `QuoteGrid` with ratio constraints raises `ValueError`. |
-| `frontier(df_or_grid, *, threshold_ranges, n_points_per_dim=10, initial_lambdas=None)` | Sweep the efficient frontier. Returns `FrontierResult`. Numeric thresholds are optional in `threshold_ranges` (held fixed if omitted); `None` thresholds require a range. |
+| `frontier(df_or_grid, *, threshold_ranges, n_points_per_dim=10, initial_lambdas=None, record_history=False)` | Sweep the efficient frontier. Returns `FrontierResult`. Numeric thresholds are optional in `threshold_ranges` (held fixed if omitted); `None` thresholds require a range. `record_history=True` records each point's steps in `point_history`. |
 | `summary(result)` | Package result into MLflow-ready `params`, `metrics`, `artifacts` dicts. |
 | `config_dict()` | Serialisable solver configuration. |
 
@@ -554,7 +561,7 @@ maturin develop
 |---|---|
 | `solve(df_or_grid, factors, *, factor_columns=None, lambdas=None)` | Run ratebook optimisation via coordinate descent. Returns `RatebookResult`. |
 | `evaluate(df_or_grid, factors, factor_tables, *, cancel=None)` | Evaluate factor tables per quote with the canonical kernel. Returns `RatebookEvaluation`. Tables must cover exactly the factors and levels in `factors`; rates must be finite and > 0. Ratio constraints raise. `cancel` takes a `CancelToken`; pass a `QuoteGrid` and `RatebookFactorContexts` to make the whole call cancellable (building either from a DataFrame is not). |
-| `frontier(df_or_grid, factors, *, threshold_ranges, n_points_per_dim=5, factor_columns=None, initial_lambdas=None)` | Sweep the efficient frontier via coordinate descent at each threshold. Returns `RatebookFrontierResult` (points plus each point's factor tables). `parallel=True` raises. |
+| `frontier(df_or_grid, factors, *, threshold_ranges, n_points_per_dim=5, factor_columns=None, initial_lambdas=None, record_history=False)` | Sweep the efficient frontier via coordinate descent at each threshold. Returns `RatebookFrontierResult` (points plus each point's factor tables). `parallel=True` raises. `record_history=True` records each point's coordinate-descent trace in `point_history`. |
 | `summary(result)` | Package result into MLflow-ready dicts. |
 
 ### ApplyOptimiser
@@ -624,6 +631,7 @@ Returned by `apply_lambdas_to_parquet_chunked`. Carries the same aggregate total
 |---|---|---|
 | `points` | `pl.DataFrame` | One row per frontier point: `threshold_*`, `bound_*`, `total_objective`, `total_*`, `lambda_*`, `iterations`, `converged`, `solver_path`, `non_convergence_reason`, and scenario value statistics (`sv_mean`, `sv_std`, `sv_min`, `sv_p5`–`sv_p95`, `sv_max`, `sv_pct_increase`, `sv_pct_decrease`). Exact schema: `frontier_points_schema("online", constraint_names)`. |
 | `n_points` | `int` | Number of frontier points. |
+| `point_history` | `pl.DataFrame \| None` | Each point's steps, one row per step, keyed by `point_index` (if `record_history=True`). Exact schema: `frontier_point_history_schema("online", constraint_names)`; a ratebook frontier's follows `frontier_point_history_schema("ratebook", constraint_names)`. |
 
 ### RatebookResult
 

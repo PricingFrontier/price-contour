@@ -132,14 +132,20 @@ class _PythonFrontierResult:
     for parity even where the test contract doesn't pin them.
     """
 
-    __slots__ = ("_points", "_n_points", "_constraint_names")
+    __slots__ = ("_points", "_n_points", "_constraint_names", "_point_history")
 
     def __init__(
-        self, *, points_df: pl.DataFrame, n_points: int, constraint_names: list[str]
+        self,
+        *,
+        points_df: pl.DataFrame,
+        n_points: int,
+        constraint_names: list[str],
+        point_history: pl.DataFrame | None,
     ) -> None:
         self._points = points_df
         self._n_points = int(n_points)
         self._constraint_names = list(constraint_names)
+        self._point_history = point_history
 
     @property
     def points(self) -> pl.DataFrame:
@@ -156,6 +162,12 @@ class _PythonFrontierResult:
     @property
     def constraint_names(self) -> list[str]:
         return list(self._constraint_names)
+
+    @property
+    def point_history(self) -> pl.DataFrame | None:
+        """Each point's subgradient iterations (DESIGN_DECISIONS §16.2), or
+        ``None`` when the sweep did not record them."""
+        return self._point_history
 
 
 def frontier_points_schema(
@@ -191,6 +203,75 @@ def frontier_points_schema(
     return schema
 
 
+def frontier_point_history_schema(
+    mode: str, constraint_names: list[str]
+) -> dict[str, pl.DataType]:
+    """Exact ``{column: dtype}`` of a frontier's ``point_history``
+    (DESIGN_DECISIONS §16.2), in column order.
+
+    ``mode`` is ``"online"`` (bisection probes and subgradient iterations
+    share one schema, each leaving the other's columns null) or
+    ``"ratebook"`` (the coordinate-descent inner solves).
+    """
+    if mode not in ("online", "ratebook"):
+        raise ValueError(f"mode must be 'online' or 'ratebook', got {mode!r}")
+    schema: dict[str, pl.DataType] = {"point_index": pl.Int64()}
+    if mode == "online":
+        schema["step"] = pl.Int64()
+        schema["phase"] = pl.String()
+        schema["bracket_lo"] = pl.Float64()
+        schema["bracket_hi"] = pl.Float64()
+        for name in constraint_names:
+            schema[f"lambda_{name}"] = pl.Float64()
+        schema["total_objective"] = pl.Float64()
+        for name in constraint_names:
+            schema[f"total_{name}"] = pl.Float64()
+        schema["all_satisfied"] = pl.Boolean()
+        schema["accepted"] = pl.Boolean()
+        schema["max_lambda_change"] = pl.Float64()
+    else:
+        schema["cd_iteration"] = pl.Int64()
+        schema["factor"] = pl.String()
+        schema["factor_index"] = pl.Int64()
+        schema["total_objective"] = pl.Float64()
+        for name in constraint_names:
+            schema[f"total_{name}"] = pl.Float64()
+        for name in constraint_names:
+            schema[f"lambda_{name}"] = pl.Float64()
+        schema["clamp_rate"] = pl.Float64()
+        schema["inner_iterations"] = pl.Int64()
+        schema["inner_converged"] = pl.Boolean()
+    return schema
+
+
+def _subgradient_history_rows(
+    point_index: int, history: list[dict[str, Any]], constraint_names: list[str]
+) -> list[dict[str, Any]]:
+    """One online ``point_history`` row per entry of a ``solve()`` history."""
+    return [
+        {
+            "point_index": point_index,
+            "step": int(record["iteration"]),
+            "phase": "subgradient",
+            "bracket_lo": None,
+            "bracket_hi": None,
+            **{
+                f"lambda_{name}": float(record["lambdas"][name])
+                for name in constraint_names
+            },
+            "total_objective": float(record["total_objective"]),
+            **{
+                f"total_{name}": float(record["total_constraints"][name])
+                for name in constraint_names
+            },
+            "all_satisfied": bool(record["all_constraints_satisfied"]),
+            "accepted": None,
+            "max_lambda_change": float(record["max_lambda_change"]),
+        }
+        for record in history
+    ]
+
+
 def _build_points_dataframe(
     rows: list[dict[str, Any]], constraint_names: list[str]
 ) -> pl.DataFrame:
@@ -222,6 +303,7 @@ def _python_frontier_orchestrator(
         [list[float], dict[str, float] | None], tuple[Any, dict[str, float]]
     ],
     compose_row: Callable[[Any, list[float], list[str]], dict[str, Any]],
+    record_history: bool,
 ) -> _PythonFrontierResult:
     """Drive a Python-side frontier sweep over the swept axes.
 
@@ -249,6 +331,7 @@ def _python_frontier_orchestrator(
         )
 
     rows: list[dict[str, Any]] = []
+    history_rows: list[dict[str, Any]] = []
     prev_lambdas: dict[str, float] | None = (
         dict(initial_lambdas) if initial_lambdas else None
     )
@@ -256,6 +339,14 @@ def _python_frontier_orchestrator(
     for combo in combos:
         result, next_lambdas = solve_one(combo, prev_lambdas)
         prev_lambdas = next_lambdas
+        if record_history:
+            if result.history is None:
+                raise RuntimeError(
+                    "a frontier point solved with record_history=True returned no history"
+                )
+            history_rows.extend(
+                _subgradient_history_rows(len(rows), result.history, constraint_names)
+            )
         row = compose_row(result, combo, swept_names)
         rows.append(row)
 
@@ -269,6 +360,17 @@ def _python_frontier_orchestrator(
                 row[key] = float(unswept_thresholds[name])
 
     points_df = _build_points_dataframe(rows, constraint_names)
+    point_history = (
+        pl.DataFrame(
+            history_rows,
+            schema=frontier_point_history_schema("online", constraint_names),
+        )
+        if record_history
+        else None
+    )
     return _PythonFrontierResult(
-        points_df=points_df, n_points=len(rows), constraint_names=constraint_names
+        points_df=points_df,
+        n_points=len(rows),
+        constraint_names=constraint_names,
+        point_history=point_history,
     )

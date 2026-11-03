@@ -1339,6 +1339,8 @@ edge; `n_quotes_clamped_low` / `n_quotes_clamped_high` and `quote_results` do.
   one schema (the orchestrated sweep reports `solver_path = "subgradient"`
   and, when a point does not converge, `non_convergence_reason =
   "iteration_budget_exhausted"`).
+- `frontier_point_history_schema(mode, constraint_names)` returns the exact
+  schema of a frontier's `point_history` (§16.2).
 - `frontier_summary` reads per-constraint values by constraint name, not by
   parsing column prefixes.
 - The package ships `py.typed`, and `_price_contour.pyi` matches the bindings.
@@ -1536,3 +1538,83 @@ sorts a Categorical lexically but an Enum by its category order, and the
 arrives as an Enum, so the ingest sorts an Enum id through a Categorical
 copy with its own categories. Results, fingerprints and factor-context
 alignment therefore do not depend on an Enum's category order.
+
+## 16. Frontier point history (0.8.0)
+
+### Context
+
+`solve(record_history=True)` records how a solve converged, but a frontier
+returned only each point's totals, λ and iteration count. A consumer that
+charts the selected frontier point's own convergence had nothing to chart: a
+1-D sweep solves each point by bisection on λ, a different algorithm from
+`solve()`'s subgradient method, and replaying a point through `solve()` from a
+neighbour's λ does not reproduce the steps that produced it (haute measured 14
+of 15 points hitting the iteration cap with λ far from the bisection result).
+Re-running a bisection outside the library would double the frontier's cost
+and still not match the library's steps.
+
+### 16.1 The switch
+
+`OnlineOptimiser.frontier(..., record_history=False)`,
+`sweep_frontier_py(..., record_history=False)` and
+`RatebookOptimiser.frontier(..., record_history=False)`. When set, each point
+records the steps the sweep already takes. Tracing adds no probe, no solve
+and no pass over the book: a bisection point records each fixed-λ apply it
+runs, a subgradient point the iterations its solve runs, a ratebook point the
+inner grouped solves of its coordinate descent. The one exception is a ratio
+constraint on the Python-orchestrated online sweep: its per-iteration totals
+are the actual ratio, which `solve()`'s history replays from the frame for
+every iteration (§15.3), so tracing such a sweep costs that replay per point. In Rust the switch is
+`SolverConfig.record_history`, which the sweep already passes to every
+subgradient solve; each `FrontierPoint` then carries `history:
+Some(PointHistory)`.
+
+### 16.2 `point_history`
+
+`FrontierResult.point_history` (and the same property on the
+Python-orchestrated online result and `RatebookFrontierResult`) is one long
+frame, `None` when the sweep did not record. Its rows are grouped by
+`point_index`, the row of `points` they belong to, ascending, and within a
+point in the order the steps ran. Its exact schema is
+`frontier_point_history_schema(mode, constraint_names)`, beside
+`frontier_points_schema` (§13.12). Its size is bounded per point: a bisection
+point runs at most 1 + 1 + 32 + 56 probes (the λ=0 probe, the first bracket
+probe, the bracket-expansion cap and the bisection cap), a subgradient point
+`max_iter` iterations, a ratebook point `max_cd_iterations × n_factors` inner
+solves.
+
+Online (`mode="online"`), in column order:
+
+| Column | Dtype | Bisection probe | Subgradient iteration |
+|---|---|---|---|
+| `point_index` | Int64 | row of `points` | row of `points` |
+| `step` | Int64 | 0-based probe number | `iteration` of `solve()`'s history |
+| `phase` | String | `"bracket"` (the λ=0 probe and each doubling) or `"bisect"` (a halving) | `"subgradient"` |
+| `bracket_lo`, `bracket_hi` | Float64 | the bracket a `"bisect"` probe halved; null for `"bracket"` probes | null |
+| `lambda_<c>` | Float64 | the probed λ | the λ the iteration's argmax used (pre-update, as `solve()` records) |
+| `total_objective` | Float64 | at the probed λ | at that iteration |
+| `total_<c>` | Float64 | at the probed λ | at that iteration |
+| `all_satisfied` | Boolean | the target is met one-sidedly | `all_constraints_satisfied` of the iteration |
+| `accepted` | Boolean | the probe became the point's answer: it met the target (so the bracket's high end moved to it), or it is the highest-λ probe of a target outside the envelope | null |
+| `max_lambda_change` | Float64 | null | that iteration's largest λ step |
+
+A bisection point's λ and totals in `points` are exactly its last accepted
+probe's, and its `iterations` equals its number of probes. A subgradient
+point's trace is exactly the history `solve(record_history=True)` records for
+the same constraints and starting λ, so its row count equals its
+`iterations`; as with `solve()`, the reported λ is the post-update λ of the
+last iteration, and a point that does not converge reports the extra
+averaged-λ pass that follows the loop, which is not an iteration. On the
+Python-orchestrated sweep (unswept or ratio constraints) each point's
+`solve()` records its history, so a ratio label's per-iteration total is the
+actual ratio, through the same replay `solve()` performs (§15.3).
+
+A residual is not a column: it is `total_<c>` less the point's `bound_<c>`.
+
+Ratebook (`mode="ratebook"`), in column order: `point_index` (Int64),
+`cd_iteration` (Int64, 1-based), `factor` (String), `factor_index` (Int64),
+`total_objective` (Float64), `total_<c>` (Float64), `lambda_<c>` (Float64),
+`clamp_rate` (Float64), `inner_iterations` (Int64), `inner_converged`
+(Boolean): one row per `per_factor_results` record (§13.9) of the point's
+solve. Its totals are the inner grouped solves', not the point's canonical
+evaluation (§13.1), as for `RatebookResult.per_factor_results`.

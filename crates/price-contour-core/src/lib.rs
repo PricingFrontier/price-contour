@@ -15,8 +15,8 @@ pub use data::{
 pub use error::{PriceContourError, Result};
 pub use factor_context::{FactorContextBuilder, FactorContextsBuilt};
 pub use frontier::{
-    sweep_frontier, FrontierConfig, FrontierPoint, FrontierResult, NonConvergenceReason,
-    ScenarioValueStats, SolverPath,
+    sweep_frontier, BisectionPhase, BisectionProbe, FrontierConfig, FrontierPoint, FrontierResult,
+    NonConvergenceReason, PointHistory, ScenarioValueStats, SolverPath,
 };
 pub use solver::{
     apply_lambdas, apply_lambdas_cancellable, check_specs_cover_grid, compute_lambda_signs_f32,

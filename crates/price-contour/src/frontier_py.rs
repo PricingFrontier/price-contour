@@ -7,8 +7,8 @@ use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
 use price_contour_core::{
-    sweep_frontier, ConstraintSpec, FrontierConfig, FrontierResult, NonConvergenceReason,
-    SolverConfig, SolverPath,
+    sweep_frontier, BisectionPhase, ConstraintSpec, FrontierConfig, FrontierResult,
+    NonConvergenceReason, PointHistory, SolverConfig, SolverPath,
 };
 
 use crate::constraint_parsing::{direction_for, is_pct_key, validate_constraints_dict};
@@ -158,6 +158,32 @@ impl PyFrontierResult {
         Ok(py_df)
     }
 
+    /// Each point's steps as one long frame keyed by ``point_index`` (the
+    /// row of ``points``), or ``None`` when the sweep did not record them.
+    /// Schema: ``frontier_point_history_schema("online", constraint_names)``.
+    #[getter]
+    fn point_history(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        let recorded = self
+            .inner
+            .points
+            .iter()
+            .filter(|p| p.history.is_some())
+            .count();
+        if recorded == 0 {
+            return Ok(None);
+        }
+        if recorded != self.inner.points.len() {
+            return Err(PyValueError::new_err(format!(
+                "{recorded} of {} frontier points recorded a history",
+                self.inner.points.len()
+            )));
+        }
+        let df = point_history_frame(&self.inner)
+            .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))?;
+        let py_df: Py<PyAny> = PyDataFrame(df).into_pyobject(py)?.into();
+        Ok(Some(py_df))
+    }
+
     #[getter]
     fn n_points(&self) -> usize {
         self.inner.points.len()
@@ -174,6 +200,87 @@ impl PyFrontierResult {
     }
 }
 
+/// The online ``point_history`` frame: one row per bisection probe or
+/// subgradient iteration, in ``points`` order and then step order. Columns a
+/// path does not have are null on its rows.
+fn point_history_frame(result: &FrontierResult) -> PolarsResult<DataFrame> {
+    let names = &result.constraint_names;
+    let n_constraints = names.len();
+    let mut point_index: Vec<i64> = Vec::new();
+    let mut step: Vec<i64> = Vec::new();
+    let mut phase: Vec<&'static str> = Vec::new();
+    let mut bracket_lo: Vec<Option<f64>> = Vec::new();
+    let mut bracket_hi: Vec<Option<f64>> = Vec::new();
+    let mut lambdas: Vec<Vec<f64>> = vec![Vec::new(); n_constraints];
+    let mut total_objective: Vec<f64> = Vec::new();
+    let mut totals: Vec<Vec<f64>> = vec![Vec::new(); n_constraints];
+    let mut all_satisfied: Vec<bool> = Vec::new();
+    let mut accepted: Vec<Option<bool>> = Vec::new();
+    let mut max_lambda_change: Vec<Option<f64>> = Vec::new();
+
+    for (index, point) in result.points.iter().enumerate() {
+        match point.history.as_ref() {
+            Some(PointHistory::Bisection(probes)) => {
+                for (k, probe) in probes.iter().enumerate() {
+                    point_index.push(index as i64);
+                    step.push(k as i64);
+                    phase.push(match probe.phase {
+                        BisectionPhase::Bracket => "bracket",
+                        BisectionPhase::Bisect => "bisect",
+                    });
+                    bracket_lo.push(probe.bracket.map(|(lo, _)| lo));
+                    bracket_hi.push(probe.bracket.map(|(_, hi)| hi));
+                    // A bisection point has exactly one constraint.
+                    lambdas[0].push(probe.lambda);
+                    total_objective.push(probe.total_objective);
+                    totals[0].push(probe.total_constraint);
+                    all_satisfied.push(probe.satisfied);
+                    accepted.push(Some(probe.accepted));
+                    max_lambda_change.push(None);
+                }
+            }
+            Some(PointHistory::Subgradient(history)) => {
+                for record in &history.records {
+                    point_index.push(index as i64);
+                    step.push(record.iteration as i64);
+                    phase.push("subgradient");
+                    bracket_lo.push(None);
+                    bracket_hi.push(None);
+                    for k in 0..n_constraints {
+                        lambdas[k].push(record.lambdas[k]);
+                        totals[k].push(record.total_constraints[k]);
+                    }
+                    total_objective.push(record.total_objective);
+                    all_satisfied.push(record.all_constraints_satisfied);
+                    accepted.push(None);
+                    max_lambda_change.push(Some(record.max_lambda_change));
+                }
+            }
+            None => unreachable!("point_history checks every point recorded"),
+        }
+    }
+
+    let height = point_index.len();
+    let mut columns: Vec<Column> = vec![
+        Column::new("point_index".into(), &point_index),
+        Column::new("step".into(), &step),
+        Column::new("phase".into(), &phase),
+        Column::new("bracket_lo".into(), &bracket_lo),
+        Column::new("bracket_hi".into(), &bracket_hi),
+    ];
+    for (k, name) in names.iter().enumerate() {
+        columns.push(Column::new(format!("lambda_{name}").into(), &lambdas[k]));
+    }
+    columns.push(Column::new("total_objective".into(), &total_objective));
+    for (k, name) in names.iter().enumerate() {
+        columns.push(Column::new(format!("total_{name}").into(), &totals[k]));
+    }
+    columns.push(Column::new("all_satisfied".into(), &all_satisfied));
+    columns.push(Column::new("accepted".into(), &accepted));
+    columns.push(Column::new("max_lambda_change".into(), &max_lambda_change));
+    DataFrame::new(height, columns)
+}
+
 #[pyfunction]
 #[allow(clippy::too_many_arguments)] // PyO3 binding: each arg is a Python keyword argument
 #[pyo3(signature = (
@@ -186,6 +293,7 @@ impl PyFrontierResult {
     initial_lambdas = None,
     max_total_points = 10_000,
     parallel = false,
+    record_history = false,
 ))]
 pub fn sweep_frontier_py(
     py: Python<'_>,
@@ -198,6 +306,7 @@ pub fn sweep_frontier_py(
     initial_lambdas: Option<HashMap<String, f64>>,
     max_total_points: usize,
     parallel: bool,
+    record_history: bool,
 ) -> PyResult<PyFrontierResult> {
     let (_, baseline_totals) = grid.inner.baseline_totals();
 
@@ -338,6 +447,7 @@ pub fn sweep_frontier_py(
     let solver_config = SolverConfig {
         max_iter,
         tolerance,
+        record_history,
         ..Default::default()
     };
 
