@@ -19,7 +19,10 @@ except PackageNotFoundError:
 from price_contour.apply import ApplyOptimiser, apply_from_grid
 from price_contour.builder import QuoteGrid, QuoteGridBuilder
 from price_contour.frontier import FrontierResult, FrontierResultLike, frontier_summary
-from price_contour._frontier_helpers import frontier_points_schema
+from price_contour._frontier_helpers import (
+    frontier_point_history_schema,
+    frontier_points_schema,
+)
 from price_contour.ratebook import (
     FACTOR_SEPARATOR,
     PerFactorRecord,
@@ -300,6 +303,7 @@ __all__ = [
     "RatebookEvaluation",
     "RatebookFrontierResult",
     "ResultUnavailableError",
+    "frontier_point_history_schema",
     "frontier_points_schema",
     "quote_results_schema",
     "ApplyOptimiser",

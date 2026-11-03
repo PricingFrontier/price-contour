@@ -1,9 +1,10 @@
 use rayon::prelude::*;
 
-use crate::data::{ConstraintDirection, ConstraintSpec, QuoteGrid, SolverConfig};
+use crate::data::{ConstraintDirection, ConstraintSpec, IterationHistory, QuoteGrid, SolverConfig};
 use crate::error::Result;
 use crate::solver::apply_lambdas_no_baselines;
 use crate::solver::solve_online_with_precomputed;
+use crate::solver::ApplyPass;
 
 /// Hard upper bound on lambda during 1-D bisection bracket expansion.
 ///
@@ -100,6 +101,45 @@ pub enum NonConvergenceReason {
     IterationBudgetExhausted,
 }
 
+/// Which part of a 1-D bisection a probe belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BisectionPhase {
+    /// The λ=0 probe and each probe that expands the bracket by doubling λ,
+    /// before the target is bracketed.
+    Bracket,
+    /// A probe at the midpoint of the established bracket.
+    Bisect,
+}
+
+/// One fixed-λ apply probe a 1-D bisection point ran.
+#[derive(Debug, Clone)]
+pub struct BisectionProbe {
+    pub phase: BisectionPhase,
+    /// The bracket `(lo, hi)` a `Bisect` probe halved; `None` for a
+    /// `Bracket` probe.
+    pub bracket: Option<(f64, f64)>,
+    /// The probed λ.
+    pub lambda: f64,
+    pub total_objective: f64,
+    pub total_constraint: f64,
+    /// The probe met the target one-sidedly.
+    pub satisfied: bool,
+    /// The probe became the point's answer: it met the target, so the
+    /// bracket's high end moved to it, or it is the highest-λ probe of a
+    /// target outside the envelope. A point's λ and totals are exactly its
+    /// last accepted probe's.
+    pub accepted: bool,
+}
+
+/// How one frontier point was solved, step by step (`record_history`).
+#[derive(Debug, Clone)]
+pub enum PointHistory {
+    /// Every probe of a 1-D bisection point, in the order it ran.
+    Bisection(Vec<BisectionProbe>),
+    /// The iterations of a subgradient point, as `solve_online` records them.
+    Subgradient(IterationHistory),
+}
+
 /// A single solved point on the efficient frontier.
 #[derive(Debug, Clone)]
 pub struct FrontierPoint {
@@ -128,6 +168,8 @@ pub struct FrontierPoint {
     pub non_convergence_reason: Option<NonConvergenceReason>,
     /// Distribution statistics over per-quote optimal scenario values.
     pub sv_stats: ScenarioValueStats,
+    /// The point's steps, when `SolverConfig::record_history` was set.
+    pub history: Option<PointHistory>,
 }
 
 /// Aggregate result of a frontier sweep across constraint threshold combinations.
@@ -335,6 +377,46 @@ struct BisectionOutcome {
     /// the result still carries the highest-lambda probe so callers
     /// see the envelope clamp rather than a silent undershoot.
     non_convergence: Option<NonConvergenceReason>,
+    /// Every probe, when recording.
+    history: Option<Vec<BisectionProbe>>,
+}
+
+/// The probes a bisection records when asked to; a no-op otherwise.
+struct ProbeTrace(Option<Vec<BisectionProbe>>);
+
+impl ProbeTrace {
+    fn new(record: bool) -> Self {
+        Self(record.then(Vec::new))
+    }
+
+    /// Record one probe; a probe that meets the target becomes the answer.
+    fn push(
+        &mut self,
+        phase: BisectionPhase,
+        bracket: Option<(f64, f64)>,
+        lambda: f64,
+        pass: &ApplyPass,
+        satisfied: bool,
+    ) {
+        if let Some(probes) = self.0.as_mut() {
+            probes.push(BisectionProbe {
+                phase,
+                bracket,
+                lambda,
+                total_objective: pass.total_objective,
+                total_constraint: pass.total_constraints[0],
+                satisfied,
+                accepted: satisfied,
+            });
+        }
+    }
+
+    /// The last probe is the answer of a target outside the envelope.
+    fn accept_last(&mut self) {
+        if let Some(last) = self.0.as_mut().and_then(|probes| probes.last_mut()) {
+            last.accepted = true;
+        }
+    }
 }
 
 /// Solve a single 1-D frontier point by bisecting over `lambda`.
@@ -371,14 +453,18 @@ struct BisectionOutcome {
 /// `target_residual_tolerance` is the absolute residual on `total - target`
 /// that ends bisection early once the bracket has shrunk enough that
 /// further halvings can't improve the user-visible answer.
+///
+/// `record_history` records every probe as it runs; it adds none.
 fn solve_point_1d_bisection(
     grid: &QuoteGrid,
     spec: &ConstraintSpec,
     warm_lo: Option<f64>,
     target_residual_tolerance: f64,
+    record_history: bool,
 ) -> Result<BisectionOutcome> {
     let target = spec.threshold;
     let direction = spec.direction;
+    let mut trace = ProbeTrace::new(record_history);
 
     // Probe at lambda=0: this is either already-satisfied (lambda=0 wins)
     // or the side of the bracket the target sits across from. We always
@@ -386,7 +472,15 @@ fn solve_point_1d_bisection(
     // already-feasible short-circuit, which the warm-start path can't.
     let zero_pass = apply_at_lambda(grid, spec, 0.0)?;
     let mut probes = 1usize;
-    if direction.is_satisfied(zero_pass.total_constraints[0], target) {
+    let zero_satisfied = direction.is_satisfied(zero_pass.total_constraints[0], target);
+    trace.push(
+        BisectionPhase::Bracket,
+        None,
+        0.0,
+        &zero_pass,
+        zero_satisfied,
+    );
+    if zero_satisfied {
         return Ok(BisectionOutcome {
             optimal_steps: zero_pass.optimal_steps,
             total_objective: zero_pass.total_objective,
@@ -394,6 +488,7 @@ fn solve_point_1d_bisection(
             lambda: 0.0,
             probes,
             non_convergence: None,
+            history: trace.0,
         });
     }
 
@@ -404,12 +499,15 @@ fn solve_point_1d_bisection(
     let mut hi = warm_lo.filter(|&w| w > 0.0).unwrap_or(1.0);
     let mut hi_pass = apply_at_lambda(grid, spec, hi)?;
     probes += 1;
+    let mut hi_satisfied = direction.is_satisfied(hi_pass.total_constraints[0], target);
+    trace.push(BisectionPhase::Bracket, None, hi, &hi_pass, hi_satisfied);
     let mut expand_iters = 0usize;
-    while !direction.is_satisfied(hi_pass.total_constraints[0], target) {
+    while !hi_satisfied {
         if hi >= FRONTIER_LAMBDA_BISECTION_CAP {
             // Target is above (Min) / below (Max) the achievable envelope.
             // Return the highest-lambda apply with the AboveEnvelope reason
             // so callers see the actual ceiling, not a silent undershoot.
+            trace.accept_last();
             return Ok(BisectionOutcome {
                 optimal_steps: hi_pass.optimal_steps,
                 total_objective: hi_pass.total_objective,
@@ -417,6 +515,7 @@ fn solve_point_1d_bisection(
                 lambda: hi,
                 probes,
                 non_convergence: Some(NonConvergenceReason::AboveEnvelope),
+                history: trace.0,
             });
         }
         if expand_iters >= FRONTIER_BRACKET_EXPAND_MAX_ITER {
@@ -424,6 +523,7 @@ fn solve_point_1d_bisection(
             // the cap. In practice unreachable from any `warm_lo <= cap`
             // (32 doublings cover 1.0 → ~4e9), but defensive against a
             // future caller passing `warm_lo` close to the cap.
+            trace.accept_last();
             return Ok(BisectionOutcome {
                 optimal_steps: hi_pass.optimal_steps,
                 total_objective: hi_pass.total_objective,
@@ -431,12 +531,15 @@ fn solve_point_1d_bisection(
                 lambda: hi,
                 probes,
                 non_convergence: Some(NonConvergenceReason::BracketExpansionExhausted),
+                history: trace.0,
             });
         }
         hi = (hi * 2.0).min(FRONTIER_LAMBDA_BISECTION_CAP);
         hi_pass = apply_at_lambda(grid, spec, hi)?;
         probes += 1;
         expand_iters += 1;
+        hi_satisfied = direction.is_satisfied(hi_pass.total_constraints[0], target);
+        trace.push(BisectionPhase::Bracket, None, hi, &hi_pass, hi_satisfied);
     }
 
     // Bisect [lo, hi] to the smallest lambda that one-sidedly satisfies
@@ -467,7 +570,15 @@ fn solve_point_1d_bisection(
         let mid = 0.5 * (lo + hi_lambda);
         let mid_pass = apply_at_lambda(grid, spec, mid)?;
         probes += 1;
-        if direction.is_satisfied(mid_pass.total_constraints[0], target) {
+        let mid_satisfied = direction.is_satisfied(mid_pass.total_constraints[0], target);
+        trace.push(
+            BisectionPhase::Bisect,
+            Some((lo, hi_lambda)),
+            mid,
+            &mid_pass,
+            mid_satisfied,
+        );
+        if mid_satisfied {
             hi_lambda = mid;
             best_optimal_steps = mid_pass.optimal_steps;
             best_total_obj = mid_pass.total_objective;
@@ -484,17 +595,14 @@ fn solve_point_1d_bisection(
         lambda: hi_lambda,
         probes,
         non_convergence: None,
+        history: trace.0,
     })
 }
 
 /// Single fixed-lambda apply probe. Skips the per-call baseline pass
 /// since the bisection caller doesn't need baselines on the result.
 #[inline]
-fn apply_at_lambda(
-    grid: &QuoteGrid,
-    spec: &ConstraintSpec,
-    lambda: f64,
-) -> Result<crate::solver::ApplyPass> {
+fn apply_at_lambda(grid: &QuoteGrid, spec: &ConstraintSpec, lambda: f64) -> Result<ApplyPass> {
     apply_lambdas_no_baselines(grid, std::slice::from_ref(spec), &[lambda])
 }
 
@@ -633,6 +741,7 @@ pub fn sweep_frontier(
             solver_path: SolverPath::Subgradient,
             non_convergence_reason,
             sv_stats,
+            history: result.history.map(PointHistory::Subgradient),
         }
     };
 
@@ -644,7 +753,7 @@ pub fn sweep_frontier(
             &threshold_combos,
             initial_lambdas,
             frontier_config.parallel,
-            solver_config.tolerance,
+            solver_config,
             baseline_cons[0].abs(),
         )
     } else if frontier_config.parallel {
@@ -751,6 +860,7 @@ fn bisection_outcome_to_point(
         solver_path: SolverPath::Bisection,
         non_convergence_reason: outcome.non_convergence,
         sv_stats,
+        history: outcome.history.map(PointHistory::Bisection),
     }
 }
 
@@ -791,9 +901,11 @@ fn run_1d_bisection_sweep(
     threshold_combos: &[Vec<f64>],
     initial_lambdas: Option<&[f64]>,
     parallel: bool,
-    relative_tolerance: f64,
+    solver_config: &SolverConfig,
     baseline_abs: f64,
 ) -> Vec<FrontierPoint> {
+    let relative_tolerance = solver_config.tolerance;
+    let record_history = solver_config.record_history;
     debug_assert_eq!(specs_template.len(), 1);
     let n_points = threshold_combos.len();
 
@@ -811,7 +923,8 @@ fn run_1d_bisection_sweep(
                     baseline_abs,
                     relative_tolerance,
                 );
-                let outcome = solve_point_1d_bisection(grid, &specs[0], warm, tol).ok()?;
+                let outcome =
+                    solve_point_1d_bisection(grid, &specs[0], warm, tol, record_history).ok()?;
                 let sv_stats = compute_sv_stats(&outcome.optimal_steps, grid);
                 Some((
                     idx,
@@ -843,7 +956,7 @@ fn run_1d_bisection_sweep(
         let specs = build_specs(specs_template, thresholds);
         let tol =
             bisection_residual_tolerance(specs[0].threshold, baseline_abs, relative_tolerance);
-        let outcome = match solve_point_1d_bisection(grid, &specs[0], warm, tol) {
+        let outcome = match solve_point_1d_bisection(grid, &specs[0], warm, tol, record_history) {
             Ok(o) => o,
             Err(_) => continue,
         };
@@ -1498,7 +1611,7 @@ mod tests {
         let mut spec = min_spec();
         spec.threshold = zero_lambda_total(&grid, &spec);
 
-        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6).unwrap();
+        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6, false).unwrap();
         assert!(outcome.non_convergence.is_none());
         assert_eq!(outcome.lambda, 0.0);
         assert_eq!(
@@ -1518,7 +1631,7 @@ mod tests {
         let mut spec = min_spec();
         spec.threshold = env_hi;
 
-        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6).unwrap();
+        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6, false).unwrap();
         let env_span = env_hi - zero_lambda_total(&grid, &spec);
         assert!(
             outcome.total_constraint >= env_hi - env_span * 0.01,
@@ -1536,7 +1649,7 @@ mod tests {
         spec.threshold = f64::from_bits(env_hi.to_bits() + 1);
         // Just above representable max — must be flagged.
 
-        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6).unwrap();
+        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6, false).unwrap();
         assert!(
             outcome.non_convergence.is_some(),
             "1-ULP-above-envelope target should be flagged; got converged with \
@@ -1567,8 +1680,8 @@ mod tests {
         let mut spec = min_spec();
         spec.threshold = baseline + 0.4 * (env_hi - baseline);
 
-        let cold = solve_point_1d_bisection(&grid, &spec, None, 1e-6).unwrap();
-        let warm = solve_point_1d_bisection(&grid, &spec, Some(0.5), 1e-6).unwrap();
+        let cold = solve_point_1d_bisection(&grid, &spec, None, 1e-6, false).unwrap();
+        let warm = solve_point_1d_bisection(&grid, &spec, Some(0.5), 1e-6, false).unwrap();
 
         let env_span = env_hi - baseline;
         assert!(
@@ -1588,7 +1701,7 @@ mod tests {
         let mut spec = min_spec();
         spec.threshold = env_hi * 1.10;
 
-        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6).unwrap();
+        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6, false).unwrap();
         assert_eq!(
             outcome.non_convergence,
             Some(NonConvergenceReason::AboveEnvelope),
@@ -1609,10 +1722,10 @@ mod tests {
         let mut spec = min_spec();
         spec.threshold = baseline + 0.85 * (env_hi - baseline);
 
-        let cold = solve_point_1d_bisection(&grid, &spec, None, 1e-6).unwrap();
+        let cold = solve_point_1d_bisection(&grid, &spec, None, 1e-6, false).unwrap();
         // Warm with the cold's converged lambda — this is exactly what
         // the sequential sweep does for a neighbour with the same target.
-        let warm = solve_point_1d_bisection(&grid, &spec, Some(cold.lambda), 1e-6).unwrap();
+        let warm = solve_point_1d_bisection(&grid, &spec, Some(cold.lambda), 1e-6, false).unwrap();
 
         assert!(
             warm.probes < cold.probes,
@@ -1667,7 +1780,7 @@ mod tests {
             tol > 1e-10,
             "zero-baseline tolerance should fall back to target scale; got {tol}"
         );
-        let outcome = solve_point_1d_bisection(&grid, &spec, None, tol).unwrap();
+        let outcome = solve_point_1d_bisection(&grid, &spec, None, tol, false).unwrap();
         // Either converged or genuinely infeasible — never a silent
         // EPSILON-tolerance grind that runs to the iter cap.
         assert!(
@@ -1708,5 +1821,237 @@ mod tests {
              to f64 precision",
             FRONTIER_LAMBDA_BISECTION_MAX_ITER
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Point history (record_history): the trace records the steps the sweep
+    // takes, adds none, and ends at the point it reports.
+    // -----------------------------------------------------------------------
+
+    fn bisection_probes(outcome: &BisectionOutcome) -> &[BisectionProbe] {
+        outcome
+            .history
+            .as_deref()
+            .expect("a recorded bisection has its probes")
+    }
+
+    /// The trace of one bisection outcome is the outcome's own steps: one
+    /// probe per counted probe, and its last accepted probe is the answer.
+    fn assert_trace_is_the_outcome(outcome: &BisectionOutcome) {
+        let probes = bisection_probes(outcome);
+        assert_eq!(probes.len(), outcome.probes);
+        let answer = probes
+            .iter()
+            .rev()
+            .find(|probe| probe.accepted)
+            .expect("a bisection always accepts a probe");
+        assert_eq!(answer.lambda, outcome.lambda);
+        assert_eq!(answer.total_objective, outcome.total_objective);
+        assert_eq!(answer.total_constraint, outcome.total_constraint);
+    }
+
+    #[test]
+    fn test_bisection_history_records_every_probe_and_changes_nothing() {
+        let grid = make_high_lambda_grid();
+        let baseline = grid.baseline_totals().1[0];
+        let env_hi = max_achievable_constraint(&grid);
+        let mut spec = min_spec();
+        spec.threshold = baseline + 0.4 * (env_hi - baseline);
+
+        let plain = solve_point_1d_bisection(&grid, &spec, None, 1e-6, false).unwrap();
+        let traced = solve_point_1d_bisection(&grid, &spec, None, 1e-6, true).unwrap();
+        assert!(plain.history.is_none());
+        assert_eq!(traced.probes, plain.probes);
+        assert_eq!(traced.lambda, plain.lambda);
+        assert_eq!(traced.total_objective, plain.total_objective);
+        assert_eq!(traced.total_constraint, plain.total_constraint);
+        assert_eq!(traced.optimal_steps, plain.optimal_steps);
+        assert_trace_is_the_outcome(&traced);
+
+        let probes = bisection_probes(&traced);
+        // λ=0, then doublings from 1.0 until the target is met, then halvings.
+        assert_eq!(probes[0].phase, BisectionPhase::Bracket);
+        assert_eq!(probes[0].lambda, 0.0);
+        assert!(!probes[0].satisfied);
+        let first_bisect = probes
+            .iter()
+            .position(|probe| probe.phase == BisectionPhase::Bisect)
+            .expect("an interior target is bisected");
+        let expansion = &probes[1..first_bisect];
+        for (k, probe) in expansion.iter().enumerate() {
+            assert_eq!(probe.lambda, 2f64.powi(k as i32));
+            assert!(probe.bracket.is_none());
+            // Only the doubling that brackets the target meets it.
+            assert_eq!(probe.satisfied, k + 1 == expansion.len());
+        }
+        let mut bracket = (0.0, expansion.last().unwrap().lambda);
+        for probe in &probes[first_bisect..] {
+            assert_eq!(probe.phase, BisectionPhase::Bisect);
+            assert_eq!(probe.bracket, Some(bracket));
+            assert_eq!(probe.lambda, 0.5 * (bracket.0 + bracket.1));
+            assert_eq!(probe.accepted, probe.satisfied);
+            assert_eq!(
+                probe.satisfied,
+                probe.total_constraint >= spec.threshold,
+                "a Min probe is satisfied when its total reaches the target"
+            );
+            bracket = if probe.satisfied {
+                (bracket.0, probe.lambda)
+            } else {
+                (probe.lambda, bracket.1)
+            };
+        }
+    }
+
+    #[test]
+    fn test_bisection_history_of_a_feasible_target_is_the_zero_probe() {
+        let grid = make_high_lambda_grid();
+        let mut spec = min_spec();
+        spec.threshold = zero_lambda_total(&grid, &spec);
+
+        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6, true).unwrap();
+        let probes = bisection_probes(&outcome);
+        assert_eq!(probes.len(), 1);
+        assert!(probes[0].satisfied && probes[0].accepted);
+        assert_trace_is_the_outcome(&outcome);
+    }
+
+    #[test]
+    fn test_bisection_history_of_an_unreachable_target_accepts_the_cap_probe() {
+        let grid = make_high_lambda_grid();
+        let mut spec = min_spec();
+        spec.threshold = max_achievable_constraint(&grid) * 1.10;
+
+        let outcome = solve_point_1d_bisection(&grid, &spec, None, 1e-6, true).unwrap();
+        assert_eq!(
+            outcome.non_convergence,
+            Some(NonConvergenceReason::AboveEnvelope)
+        );
+        let probes = bisection_probes(&outcome);
+        assert!(probes.iter().all(|probe| !probe.satisfied));
+        let (last, earlier) = probes.split_last().unwrap();
+        assert!(last.accepted && last.lambda == FRONTIER_LAMBDA_BISECTION_CAP);
+        assert!(earlier.iter().all(|probe| !probe.accepted));
+        assert_trace_is_the_outcome(&outcome);
+    }
+
+    #[test]
+    fn test_sweep_records_bisection_points_without_changing_them() {
+        let grid = make_high_lambda_grid();
+        let (_, baseline_cons) = grid.baseline_totals();
+        let max_envelope = max_achievable_constraint(&grid);
+        let specs_template = vec![min_spec()];
+        for parallel in [false, true] {
+            let frontier_config = FrontierConfig {
+                n_points_per_dim: 6,
+                threshold_ranges: vec![(baseline_cons[0] * 0.9, max_envelope * 1.05)],
+                max_total_points: Some(100),
+                parallel,
+            };
+            let plain_config = SolverConfig::default();
+            let traced_config = SolverConfig {
+                record_history: true,
+                ..Default::default()
+            };
+            let plain = sweep_frontier(
+                &grid,
+                &specs_template,
+                &frontier_config,
+                &plain_config,
+                None,
+            )
+            .unwrap();
+            let traced = sweep_frontier(
+                &grid,
+                &specs_template,
+                &frontier_config,
+                &traced_config,
+                None,
+            )
+            .unwrap();
+            assert_eq!(traced.points.len(), plain.points.len());
+            for (p, t) in plain.points.iter().zip(&traced.points) {
+                assert!(p.history.is_none());
+                assert_eq!(t.lambdas, p.lambdas);
+                assert_eq!(t.total_objective, p.total_objective);
+                assert_eq!(t.total_constraints, p.total_constraints);
+                assert_eq!(t.iterations, p.iterations);
+                let Some(PointHistory::Bisection(probes)) = &t.history else {
+                    panic!("a 1-D point records bisection probes");
+                };
+                assert_eq!(probes.len(), t.iterations);
+                let answer = probes.iter().rev().find(|probe| probe.accepted).unwrap();
+                assert_eq!(answer.lambda, t.lambdas[0]);
+                assert_eq!(answer.total_objective, t.total_objective);
+                assert_eq!(answer.total_constraint, t.total_constraints[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sweep_records_each_subgradient_point_as_its_solve_records_it() {
+        // The parallel subgradient sweep solves each point from the same
+        // starting lambdas, so each point's trace must equal a standalone
+        // solve's history for that point's constraints.
+        let grid = make_test_grid_2d();
+        let specs_template = vec![
+            ConstraintSpec {
+                name: "volume".to_string(),
+                direction: ConstraintDirection::Min,
+                threshold: 0.0,
+            },
+            ConstraintSpec {
+                name: "loss".to_string(),
+                direction: ConstraintDirection::Max,
+                threshold: 0.0,
+            },
+        ];
+        let (_, baseline_cons) = grid.baseline_totals();
+        let frontier_config = FrontierConfig {
+            n_points_per_dim: 3,
+            threshold_ranges: vec![
+                (baseline_cons[0] * 0.95, baseline_cons[0] * 1.05),
+                (baseline_cons[1] * 0.99, baseline_cons[1] * 1.01),
+            ],
+            max_total_points: Some(100),
+            parallel: true,
+        };
+        let solver_config = SolverConfig {
+            max_iter: 40,
+            record_history: true,
+            ..Default::default()
+        };
+        let initial = [0.1, 0.0];
+        let result = sweep_frontier(
+            &grid,
+            &specs_template,
+            &frontier_config,
+            &solver_config,
+            Some(&initial),
+        )
+        .unwrap();
+        assert_eq!(result.points.len(), 9);
+        for point in &result.points {
+            let specs = build_specs(&specs_template, &point.thresholds);
+            let standalone =
+                crate::solver::solve_online(&grid, &specs, &solver_config, Some(&initial)).unwrap();
+            let Some(PointHistory::Subgradient(history)) = &point.history else {
+                panic!("a multi-constraint point records its subgradient iterations");
+            };
+            let expected = standalone.history.unwrap();
+            assert_eq!(history.records.len(), point.iterations);
+            assert_eq!(history.records.len(), expected.records.len());
+            for (got, want) in history.records.iter().zip(&expected.records) {
+                assert_eq!(got.iteration, want.iteration);
+                assert_eq!(got.lambdas, want.lambdas);
+                assert_eq!(got.total_objective, want.total_objective);
+                assert_eq!(got.total_constraints, want.total_constraints);
+                assert_eq!(got.max_lambda_change, want.max_lambda_change);
+                assert_eq!(
+                    got.all_constraints_satisfied,
+                    want.all_constraints_satisfied
+                );
+            }
+        }
     }
 }

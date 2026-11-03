@@ -37,6 +37,13 @@ class FrontierResultLike(Protocol):
         """Constraint names, in column order."""
         ...
 
+    @property
+    def point_history(self) -> pl.DataFrame | None:
+        """Each point's steps, keyed by ``point_index``; ``None`` unless the
+        sweep ran with ``record_history=True``. Follows
+        ``frontier_point_history_schema(mode, constraint_names)``."""
+        ...
+
 
 def frontier_summary(
     frontier_result: FrontierResultLike, selected_index: int

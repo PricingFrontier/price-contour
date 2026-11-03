@@ -14,6 +14,7 @@ import polars as pl
 from price_contour._frontier_helpers import (
     _cartesian_product,
     _linspace,
+    frontier_point_history_schema,
     frontier_points_schema,
 )
 from price_contour._grid_utils import build_grid
@@ -1011,6 +1012,7 @@ class RatebookOptimiser:
         initial_lambdas: dict[str, float] | None = None,
         max_total_points: int = 10_000,
         parallel: bool = False,
+        record_history: bool = False,
     ) -> RatebookFrontierResult:
         """Sweep the efficient frontier by running coordinate descent at each threshold.
 
@@ -1039,13 +1041,17 @@ class RatebookOptimiser:
             Must be False: the ratebook frontier runs sequentially, each
             point warm-started from its neighbours. True raises rather than
             being silently ignored.
+        record_history : bool
+            Keep each point's coordinate-descent trace (its
+            ``per_factor_results``) in ``point_history`` (DESIGN_DECISIONS
+            §16.2). Every point's solve computes it; recording only keeps it.
 
         Returns
         -------
         RatebookFrontierResult
             ``.points`` (one row per point; see ``frontier_points_schema``),
-            ``.n_points``, ``.constraint_names`` and ``.factor_tables`` (one
-            table set per row). A point's totals are the canonical
+            ``.n_points``, ``.constraint_names``, ``.factor_tables`` (one
+            table set per row) and ``.point_history``. A point's totals are the canonical
             evaluation of its tables, so
             ``evaluate(grid, factors, frontier.point_factor_tables(i))``
             reproduces row ``i`` exactly; re-solving with the row's λ is not
@@ -1272,7 +1278,9 @@ class RatebookOptimiser:
 
             # Record only what the row and the point's tables need, so the
             # point's per-quote evaluation is released before the next solve.
-            points.append((idx, thresholds, _FrontierRow.from_result(result)))
+            points.append(
+                (idx, thresholds, _FrontierRow.from_result(result, record_history))
+            )
             del result
 
         # Sort back to original (cartesian product) order
@@ -1304,12 +1312,43 @@ class RatebookOptimiser:
         columns["n_quotes_clamped_low"] = [r.n_quotes_clamped_low for r in results]
         columns["n_quotes_clamped_high"] = [r.n_quotes_clamped_high for r in results]
 
+        point_history = (
+            pl.DataFrame(
+                [
+                    {
+                        "point_index": point_index,
+                        "cd_iteration": record.cd_iteration,
+                        "factor": record.factor,
+                        "factor_index": record.factor_index,
+                        "total_objective": record.total_objective,
+                        **{
+                            f"total_{name}": record.total_constraints[name]
+                            for name in constraint_names
+                        },
+                        **{
+                            f"lambda_{name}": record.lambdas[name]
+                            for name in constraint_names
+                        },
+                        "clamp_rate": record.clamp_rate,
+                        "inner_iterations": record.inner_iterations,
+                        "inner_converged": record.inner_converged,
+                    }
+                    for point_index, row in enumerate(results)
+                    for record in row.require_per_factor_results()
+                ],
+                schema=frontier_point_history_schema("ratebook", constraint_names),
+            )
+            if record_history
+            else None
+        )
+
         return RatebookFrontierResult(
             points=pl.DataFrame(
                 columns, schema=frontier_points_schema("ratebook", constraint_names)
             ),
             constraint_names=constraint_names,
             factor_tables=[r.factor_tables for r in results],
+            point_history=point_history,
         )
 
     def summary(self, result: RatebookResult) -> dict[str, Any]:
@@ -1516,9 +1555,11 @@ class _FrontierRow:
     clamp_rate: float
     n_quotes_clamped_low: int
     n_quotes_clamped_high: int
+    # The point's coordinate-descent trace, kept only when the sweep records.
+    per_factor_results: tuple[PerFactorRecord, ...] | None
 
     @classmethod
-    def from_result(cls, result: RatebookResult) -> _FrontierRow:
+    def from_result(cls, result: RatebookResult, record_history: bool) -> _FrontierRow:
         return cls(
             factor_tables=result.factor_tables,
             total_objective=result.total_objective,
@@ -1530,7 +1571,13 @@ class _FrontierRow:
             clamp_rate=result.clamp_rate,
             n_quotes_clamped_low=result.n_quotes_clamped_low,
             n_quotes_clamped_high=result.n_quotes_clamped_high,
+            per_factor_results=result.per_factor_results if record_history else None,
         )
+
+    def require_per_factor_results(self) -> tuple[PerFactorRecord, ...]:
+        if self.per_factor_results is None:
+            raise RuntimeError("this frontier point did not record its trace")
+        return self.per_factor_results
 
 
 class RatebookFrontierResult:
@@ -1545,6 +1592,7 @@ class RatebookFrontierResult:
         points: pl.DataFrame,
         constraint_names: list[str],
         factor_tables: list[dict[str, dict[str, float]]],
+        point_history: pl.DataFrame | None = None,
     ) -> None:
         if len(factor_tables) != points.height:
             raise ValueError(
@@ -1553,6 +1601,7 @@ class RatebookFrontierResult:
         self._points = points
         self._constraint_names = constraint_names
         self._factor_tables = factor_tables
+        self._point_history = point_history
 
     @property
     def points(self) -> pl.DataFrame:
@@ -1574,6 +1623,12 @@ class RatebookFrontierResult:
     def factor_tables(self) -> list[dict[str, dict[str, float]]]:
         """One ``factor_tables`` dict per row of ``points``."""
         return self._factor_tables
+
+    @property
+    def point_history(self) -> pl.DataFrame | None:
+        """Each point's coordinate-descent trace (DESIGN_DECISIONS §16.2), or
+        ``None`` when the sweep did not record it."""
+        return self._point_history
 
     def point_factor_tables(self, index: int) -> dict[str, dict[str, float]]:
         """The factor tables of point ``index`` (a row of ``points``)."""

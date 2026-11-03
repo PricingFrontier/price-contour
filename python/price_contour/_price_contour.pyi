@@ -249,6 +249,8 @@ class FrontierResult:
     def n_converged(self) -> int: ...
     @property
     def constraint_names(self) -> list[str]: ...
+    @property
+    def point_history(self) -> pl.DataFrame | None: ...
 
 # ---------------------------------------------------------------------------
 # Functions
@@ -324,6 +326,7 @@ def sweep_frontier_py(
     initial_lambdas: dict[str, float] | None = None,
     max_total_points: int = 10_000,
     parallel: bool = False,
+    record_history: bool = False,
 ) -> FrontierResult: ...
 def run_cd_pass_py(
     grid: QuoteGrid,
