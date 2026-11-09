@@ -18,6 +18,12 @@ except PackageNotFoundError:
 
 from price_contour.apply import ApplyOptimiser, apply_from_grid
 from price_contour.builder import QuoteGrid, QuoteGridBuilder
+from price_contour._frontier_report import (
+    FrontierReport,
+    Projection,
+    ScenarioDisplay,
+)
+from price_contour._frontier_report_html import frontier_report_html
 from price_contour.frontier import FrontierResult, FrontierResultLike, frontier_summary
 from price_contour._frontier_helpers import (
     frontier_point_history_schema,
@@ -297,6 +303,10 @@ def apply_lambdas_to_parquet_chunked(
 
 
 __all__ = [
+    "FrontierReport",
+    "Projection",
+    "ScenarioDisplay",
+    "frontier_report_html",
     "__version__",
     "FACTOR_SEPARATOR",
     "PerFactorRecord",

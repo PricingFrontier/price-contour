@@ -393,7 +393,7 @@ Input:
 
 Initialise:
   factor_values[f] = 1.0 for every level of every factor f
-  base_i           = the quote's base multiplier (1.0 when none is set)
+  base_i           = the quote's starting price: its base multiplier times today's rates (1.0 when neither is set)
 
 Outer loop (cycle through factors until convergence):
 

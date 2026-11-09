@@ -4,6 +4,7 @@ pub mod data;
 pub mod error;
 pub mod factor_context;
 pub mod frontier;
+pub mod report;
 pub mod solver;
 
 pub use cancel::{check_cancelled, CancelFlag};
@@ -24,5 +25,5 @@ pub use solver::{
     evaluate_ratebook, evaluate_ratebook_cancellable, evaluate_ratebook_with_base,
     evaluate_ratebook_with_base_cancellable, lagrangian_argmax_pass,
     lagrangian_argmax_pass_cancellable, quote_baseline_steps, solve_grouped,
-    solve_grouped_with_base, solve_online, GroupedBaseline, RatebookEvaluation,
+    solve_grouped_with_base, solve_online, starting_products, GroupedBaseline, RatebookEvaluation,
 };

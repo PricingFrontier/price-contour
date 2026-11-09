@@ -144,14 +144,17 @@ Every reported ratebook total is the **canonical evaluation** of the final facto
 
 #### Starting from an existing rate card
 
-To change today's rate card rather than build one from scratch, give each quote a **base multiplier**: a float column on the per-quote factors frame, named by `base_multiplier`. Each quote is priced at the grid step nearest `base × product of factor values`, so `factor_tables` hold rates **relative to the base**. With `candidate_min = exp(-b)` and `candidate_max = exp(b)`, every level stays within `±b` of its current log-relativity.
+To change today's rate card rather than build one from scratch, pass it as `existing_rates`, in the same shape as `factor_tables`. Each quote starts at today's price, and `factor_tables` comes back as the **complete new card**, to deploy by itself.
 
 ```python
 import math
 
 # A commission engine prices commission = 0.4 * sigmoid(sum of relativities).
 # The shared grid holds each commission's odds against the cap, c / (0.4 - c), so a
-# quote's odds are exp(sum of relativities), and base_odds = exp(sum of today's).
+# quote's odds are exp(sum of relativities), and a rate is exp(relativity).
+existing = {factor: {level: math.exp(w) for level, w in levels.items()}
+            for factor, levels in todays_relativities.items()}
+
 optimiser = pc.RatebookOptimiser(
     objective="conversion",
     constraints={"profit": {"min_pct": 0.98}},
@@ -159,22 +162,79 @@ optimiser = pc.RatebookOptimiser(
     candidate_min=math.exp(-0.2),
     candidate_max=math.exp(0.2),
     candidate_steps=41,
-    base_multiplier="base_odds",
+    existing_rates=existing,
 )
 result = optimiser.solve(grid_df, factors_df)
 
-# Convert an optimised rate back to an additive relativity.
-new_relativity = today["region"]["North"] + math.log(result.factor_tables["region"]["North"])
+# The new card: nothing to combine with today's.
+new_relativity = math.log(result.factor_tables["region"]["North"])
 ```
 
-With a base multiplier:
+Candidates stay multipliers on today's rate, so `candidate_min = exp(-b)` and `candidate_max = exp(b)` keep every level within `±b` of its current log-rate. Levels in `existing_rates` that aren't in the data are carried unchanged into the output.
 
-- **The baseline is per quote.** `baseline_objective`, `baseline_constraints` and `min_pct` / `max_pct` thresholds use each quote at the step nearest its own base, so today's rate card. `baseline_scenario_value` raises, because there is no single value; `quote_results["baseline_step"]` has each quote's.
+If the starting point isn't a rate card, such as a per-quote optimised value, name a float column on the per-quote factors frame as `base_multiplier` instead. The library then has no per-level rate to combine with, so the tables stay relative to that column.
+
+| You pass | Starting price | `factor_tables` | Deployed price |
+|---|---|---|---|
+| neither | 1.0 | absolute rates | the tables |
+| `existing_rates` | product of today's rates | the complete new card | the tables alone |
+| `base_multiplier` | the column | rates relative to the column | column × tables |
+| both | column × product of today's rates | the complete new card for those factors | column × tables |
+
+Passing both is how to hold part of today's price fixed: put anything you aren't optimising in the per-quote column.
+
+With a starting point of either kind:
+
+- **The baseline is per quote.** `baseline_objective`, `baseline_constraints` and `min_pct` / `max_pct` thresholds use each quote at the step nearest its own starting price. `baseline_scenario_value` raises, because there is no single value; `quote_results["baseline_step"]` has each quote's.
 - **"No change" is always available.** When the candidate range includes 1.0, the candidate nearest 1.0 becomes exactly 1.0, keeping `candidate_steps`.
 - **A level with no preference stays put.** When candidates tie exactly, the one closest to 1.0 wins.
 - **Rounding follows the grid's units.** The commission example rounds in odds, not commission, so a quote near a step boundary can land one step lower than rounding its commission would give.
-- **The column** may be any float dtype, is converted to f32, and must be positive and finite after conversion. `quote_results` gains `base_multiplier` and `baseline_step`, and its `factor_product` includes the base.
+- **`quote_results` gains columns:** `base_multiplier` with a per-quote column, `baseline_product` with `existing_rates`, and `baseline_step` with either. `factor_product` is the full product.
+- **`existing_rates`** must cover every factor in `factor_columns` and every level in the data, with finite, positive rates.
+- **A per-quote column** may be any float dtype, is converted to f32, and must be positive and finite after conversion.
 - **Not supported:** ratio constraints, and discovering factors automatically. Pass `factor_columns`.
+
+### Frontier impact report
+
+`FrontierReport` turns a ratebook frontier into one self-contained HTML page that shows a reviewer what each point does to the objective and the constraints, compared with the starting point if you gave one, or with no adjustment if you didn't. It holds no scripts and loads nothing, so it opens offline and in MLflow's artifact viewer.
+
+```python
+frontier = optimiser.frontier(df, factors, threshold_ranges={"profit": (0.95, 1.05)})
+
+report = pc.FrontierReport(
+    optimiser, frontier, df, factors,
+    title="New business frontier",
+    labels={"conversion": "Expected sales", "profit": "Expected profit"},
+    formats={"profit": "£{:,.0f}"},
+    report_columns=["premium_income"],
+    segment_columns=["channel", ["channel", "region"]],   # a list is an interaction
+    band_columns=["premium"],                             # ten equal-count bands
+    sensitivity_grids={"Lower": low_df, "Upper": high_df},  # the same quotes, rescored
+    ratios={"Margin rate": ("profit", "premium_income")},
+    movement_band=0.10,
+    scenario_display=pc.ScenarioDisplay("Commission rate", rates, "{:.1%}", target=0.225),
+    projection=pc.Projection(window_days=29),
+    point_artifacts={i: f"rates_point{i:02d}.csv" for i in range(frontier.n_points)},
+)
+report.save("frontier_report.html")
+mlflow.log_artifact("frontier_report.html", artifact_path="reports")
+
+report.data                          # the JSON-safe record
+pc.frontier_report_html(report.data) # rebuilds the page from that record
+```
+
+A switch in the sticky bar selects the frontier point, and the tabs are:
+
+| Tab | Shows |
+|---|---|
+| Overview | The frontier, a table of every point against the baseline, and open review flags |
+| Impact | An executive summary with any sensitivity bounds; movement by direction; per-quote change distributions; the shift in the scenario distribution; baseline against point by step; where the change comes from; forward projection |
+| Rate card | SHAP-style beeswarms of the rate changes and the full set of new rates, and each factor's levels |
+| Segments | The impact and movement by each `segment_columns` value, and by bands of each `band_columns` value |
+| Compare | Marginal rates along the frontier, dominance, and the levels that differ most across points |
+| Checks | Every review flag, the constraint audit, solve health and convergence per point, run facts and definitions |
+
+The report describes the data it is given: it checks that each point's totals equal the frontier's exactly, but can't prove the data is the sweep's. Sum constraints only.
 
 ### Live scoring with stored lambdas
 
@@ -522,6 +582,7 @@ price-contour/
 │   │       │   ├── lambda.rs      # Subgradient lambda updates
 │   │       │   └── apply.rs       # Fixed-lambda forward pass
 │   │       ├── frontier.rs        # Efficient frontier sweeping
+│   │       ├── report.rs          # Aggregates for the frontier report
 │   │       ├── constants.rs       # Solver defaults
 │   │       └── error.rs           # Error types
 │   └── price-contour/             # PyO3 bindings (thin wrappers)
@@ -530,6 +591,7 @@ price-contour/
 │           ├── grouped_py.rs      # Grouped solve bindings
 │           ├── apply_py.rs        # Apply bindings
 │           ├── frontier_py.rs     # Frontier bindings
+│           ├── report_py.rs       # Frontier report bindings
 │           ├── builder_py.rs      # QuoteGridBuilder bindings
 │           ├── grid_py.rs         # QuoteGrid bindings
 │           └── parquet_grid_py.rs # Parquet → QuoteGrid loader
@@ -539,6 +601,8 @@ price-contour/
 │       ├── ratebook.py            # RatebookOptimiser + RatebookResult
 │       ├── apply.py               # ApplyOptimiser + apply_from_grid
 │       ├── frontier.py            # FrontierResult helpers + frontier_summary
+│       ├── _frontier_report.py    # FrontierReport: the report record
+│       ├── _frontier_report_html.py # Renders the record as one HTML page
 │       ├── builder.py             # QuoteGridBuilder wrapper
 │       ├── _ratio_results.py      # Shared ratio reporting (actual ratios + column stitching)
 │       └── _frontier_helpers.py   # Shared frontier orchestrator (used by online + ratebook)
@@ -594,11 +658,11 @@ maturin develop
 | Method | Description |
 |---|---|
 | `solve(df_or_grid, factors, *, factor_columns=None, lambdas=None)` | Run ratebook optimisation via coordinate descent. Returns `RatebookResult`. |
-| `evaluate(df_or_grid, factors, factor_tables, *, cancel=None)` | Evaluate factor tables per quote with the canonical kernel. Returns `RatebookEvaluation`. Tables must cover exactly the factors and levels in `factors`; rates must be finite and > 0. Ratio constraints raise. `cancel` takes a `CancelToken`; pass a `QuoteGrid` and `RatebookFactorContexts` to make the whole call cancellable (building either from a DataFrame is not). |
+| `evaluate(df_or_grid, factors, factor_tables, *, cancel=None)` | Evaluate factor tables per quote with the canonical kernel. Returns `RatebookEvaluation`. Tables must cover exactly the factors and levels in `factors`, plus any levels carried from `existing_rates`; rates must be finite and > 0. Ratio constraints raise. `cancel` takes a `CancelToken`; pass a `QuoteGrid` and `RatebookFactorContexts` to make the whole call cancellable (building either from a DataFrame is not). |
 | `frontier(df_or_grid, factors, *, threshold_ranges, n_points_per_dim=5, factor_columns=None, initial_lambdas=None, record_history=False)` | Sweep the efficient frontier via coordinate descent at each threshold. Returns `RatebookFrontierResult` (points plus each point's factor tables). `parallel=True` raises. `record_history=True` records each point's coordinate-descent trace in `point_history`. |
 | `summary(result)` | Package result into MLflow-ready dicts. |
 
-The constructor's `base_multiplier` names a float column on the factors frame; see [Starting from an existing rate card](#starting-from-an-existing-rate-card). When `factors` is a prebuilt `RatebookFactorContexts`, build it with the same `base_multiplier` (`RatebookFactorContexts.from_dataframe` and `build_ratebook_factor_contexts_from_parquet_chunked` both accept it); a mismatch raises.
+The constructor's `existing_rates` takes today's rate tables, and `base_multiplier` names a float column on the factors frame; see [Starting from an existing rate card](#starting-from-an-existing-rate-card). When `factors` is a prebuilt `RatebookFactorContexts`, build it with the same `base_multiplier` (`RatebookFactorContexts.from_dataframe` and `build_ratebook_factor_contexts_from_parquet_chunked` both accept it); a mismatch raises. `existing_rates` is checked against the contexts' levels.
 
 ### ApplyOptimiser
 
@@ -678,20 +742,21 @@ Returned by `apply_lambdas_to_parquet_chunked`. Carries the same aggregate total
 | `total_objective` | `float` | Objective of the canonical evaluation of `factor_tables`. |
 | `total_constraints` | `dict[str, float]` | Constraint totals of the canonical evaluation. |
 | `constraint_bounds` | `dict[str, float]` | Absolute bound of each constraint. |
-| `baseline_objective` | `float` | Objective at the baseline step (the scenario value nearest 1.0, f32, lowest on a tie), or at each quote's own step with a base multiplier. |
+| `baseline_objective` | `float` | Objective at the baseline step (the scenario value nearest 1.0, f32, lowest on a tie), or at each quote's own step with a starting point. |
 | `baseline_constraints` | `dict[str, float]` | Constraints at the baseline step. |
-| `baseline_scenario_value` | `float` | Scenario value of the baseline step. Raises `ResultUnavailableError` with a base multiplier. |
-| `base_multiplier` | `str \| None` | The base-multiplier column these tables are relative to, or `None`. |
+| `baseline_scenario_value` | `float` | Scenario value of the baseline step. Raises `ResultUnavailableError` with a starting point. |
+| `base_multiplier` | `str \| None` | The per-quote column the deployed price is relative to, or `None`. |
+| `existing_rates` | `dict \| None` | The rate tables the optimisation started from, or `None`. |
 | `scenario_values` | `tuple[float, ...]` | The grid's scenario values, ascending. |
 | `converged` | `bool` | Coordinate descent converged (factor values stopped moving). Not a feasibility check. |
 | `cd_iterations` | `int` | Coordinate descent passes. |
 | `clamp_rate` | `float` | Search-space diagnostic: the mean, over every grouped solve, of the fraction of (quote, candidate) targets that fell strictly outside the scenario range. It does not count quotes at a grid edge. |
 | `n_quotes` | `int` | Quotes evaluated. |
 | `n_quotes_clamped_low` / `n_quotes_clamped_high` | `int` | Quotes whose factor product lies strictly below / above the scenario range. |
-| `quote_results` | `pl.DataFrame` | Per-quote evaluation: `quote_id`, `optimal_step`, `optimal_scenario_value`, `optimal_objective`, `optimal_<c>`, `factor_product`, `clamped_low`, `clamped_high` (`quote_results_schema(constraint_names)`). With a base multiplier, `factor_product` includes the base and the frame gains `base_multiplier` and `baseline_step` (`quote_results_schema(constraint_names, base_multiplier=True)`). Not persisted: raises `ResultUnavailableError` on a loaded result; use `evaluate()`. |
+| `quote_results` | `pl.DataFrame` | Per-quote evaluation: `quote_id`, `optimal_step`, `optimal_scenario_value`, `optimal_objective`, `optimal_<c>`, `factor_product`, `clamped_low`, `clamped_high` (`quote_results_schema(constraint_names)`). With a starting point, `factor_product` is the full product and the frame gains `base_multiplier`, `baseline_product` and `baseline_step` as applicable (`quote_results_schema(constraint_names, base_multiplier=..., existing_rates=...)`). Not persisted: raises `ResultUnavailableError` on a loaded result; use `evaluate()`. |
 | `per_factor_results` | `tuple[PerFactorRecord, ...]` | One record per inner grouped solve, with explicit `cd_iteration`, `factor`, `factor_index`, totals, λ, `clamp_rate`, `inner_iterations`, `inner_converged`. |
-| `save(path)` | | Save to a directory (format 2, or format 3 with a base multiplier: config.json plus one JSON per factor). Factor names that map to the same file name raise. |
-| `RatebookResult.load(path)` | | Load format 1, 2 or 3. Rejects unknown keys and missing factor files; fields a format-1 save lacks raise `ResultUnavailableError`. |
+| `save(path)` | | Save to a directory (format 2, format 3 with only a per-quote column, or format 4 with `existing_rates`: config.json plus one JSON per factor). Factor names that map to the same file name raise. |
+| `RatebookResult.load(path)` | | Load format 1, 2, 3 or 4. Rejects unknown keys and missing factor files; fields a format-1 save lacks raise `ResultUnavailableError`. |
 | `to_rating_entries()` | `dict[str, pl.DataFrame]` | Convert to rating-step DataFrames. |
 
 ### Utility functions

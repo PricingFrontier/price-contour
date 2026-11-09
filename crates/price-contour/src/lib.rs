@@ -10,6 +10,7 @@ mod grouped_py;
 pub(crate) mod parquet_grid_py;
 pub(crate) mod quote_id;
 mod ratebook_helpers_py;
+mod report_py;
 mod solver_py;
 pub(crate) mod utils;
 
@@ -52,6 +53,7 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_class::<ratebook_helpers_py::PyFactorContext>()?;
     m.add_class::<factor_context_py::PyRatebookFactorContexts>()?;
+    m.add_function(wrap_pyfunction!(report_py::report_points_py, m)?)?;
     m.add_function(wrap_pyfunction!(
         factor_context_py::validate_base_multiplier_column_py,
         m

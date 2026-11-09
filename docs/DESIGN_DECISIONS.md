@@ -1130,7 +1130,7 @@ ratebook result is evaluated for reporting.
 
 For each quote *i*, in factor-spec order:
 
-1. **Product.** `p_i = 1.0f32` (or the quote's base multiplier, §17.2), then
+1. **Product.** `p_i = 1.0f32` (or the quote's base multiplier, §17.2 and §18.2), then
    `p_i *= factor_values[f][group_of_f[i]]` for each factor *f*, in f32, left to
    right.
 2. **Step.** `step_i = nearest_step(p_i)`, the same function the grouped
@@ -1184,8 +1184,8 @@ returns it):
 
 Rows follow the grid's quote order (quote IDs cast to string and sorted).
 With ratio constraints, the frame gains the numerator and denominator columns
-exactly as the online `SolveResult.dataframe` does. With a base multiplier it
-gains `base_multiplier` and `baseline_step` after `clamped_high` (§17.2). The
+exactly as the online `SolveResult.dataframe` does. With a base multiplier or
+existing rates it gains further columns after `clamped_high` (§17.2, §18.3). The
 retained state is
 compact (steps, products and flags: about 50 MB at 5M quotes); the frame is
 built on first access.
@@ -1210,7 +1210,8 @@ the evaluation is fully determined.
 Tables are matched to factor specs by name (`":".join(columns)`) and applied
 in the contexts' spec order, never dict order. It raises `ValueError` for an
 unknown or missing factor, a level present in the data but missing from the
-table, a table level absent from the data, a non-finite or non-positive value,
+table, a table level absent from the data (unless it is in `existing_rates`,
+§18.3), a non-finite or non-positive value,
 and ratio constraints (the grid cannot linearise them).
 
 `evaluate(grid, factors, result.factor_tables)` reproduces `result`'s totals
@@ -1258,8 +1259,8 @@ baseline for sum totals, pct bounds and ratio constraints alike, and it is
 exposed as `QuoteGrid.baseline_step` and `baseline_scenario_value` on grids and
 results. Ratio baselines no longer filter for an exact `scenario_value == 1.0`;
 a quote missing its baseline row raises. Grids that contain an exact 1.0
-behave exactly as before. A ratebook with a base multiplier replaces this one
-step with one step per quote (§17.3).
+behave exactly as before. A ratebook with a base multiplier or existing rates
+replaces this one step with one step per quote (§17.3, §18.2).
 
 ### 13.7 Fail loud
 
@@ -1284,8 +1285,8 @@ Each of these raises instead of returning a default:
 - `summary()` of a result missing any configured constraint;
 - `frontier(parallel=True)` where the sweep runs sequentially (the ratebook
   frontier, and the Python-orchestrated online frontier);
-- an invalid base multiplier, or one combined with ratio constraints or factor
-  auto-discovery (§17.5);
+- an invalid base multiplier or existing rates, or either combined with ratio
+  constraints or factor auto-discovery (§17.5, §18.1);
 - a quote whose scenario values differ from the first quote's, on every path
   that builds a grid from a frame (§17.7).
 
@@ -1293,7 +1294,8 @@ Each of these raises instead of returning a default:
 
 `lambdas`, `total_constraints`, `baseline_constraints` and
 `constraint_bounds` are ordered dicts in constraint order. `factor_tables`
-follows factor-spec order; levels follow first appearance in quote order.
+follows factor-spec order; levels follow first appearance in quote order,
+then levels carried from `existing_rates` in that mapping's order.
 Reductions over quotes have a fixed order, so repeated runs are bit-identical.
 Every total, including a reported ratio's numerator and denominator,
 accumulates the f32 grid values in f64, so a reported ratio agrees with the
@@ -1325,8 +1327,8 @@ the persisted tables. On a loaded result, `quote_results` raises
 config keys, and raises on a missing factor file or table. A format-1 file
 loads; its missing fields raise `ResultUnavailableError` on access.
 `ResultUnavailableError` subclasses `RuntimeError`, not `AttributeError`, so
-`hasattr` cannot hide it. A result with a base multiplier is saved as format 3
-(§17.6).
+`hasattr` cannot hide it. A result with only a base multiplier is saved as
+format 3 (§17.6), and one with existing rates as format 4 (§18.3).
 
 ### 13.11 `clamp_rate`
 
@@ -1748,3 +1750,147 @@ now applies `QuoteGridBuilder`'s tolerance and message to every step of every
 quote, and rejects null and non-finite values. The comparison runs over each
 chunk's contiguous values with a global row offset, so a large grid pays no
 per-row lookup and a chunk boundary can split a quote.
+
+## 18. Existing rates (0.10.0)
+
+### Context
+
+A per-quote base multiplier (§17) tells the library where each quote starts, but
+not what today's rate is for each level, so its tables are adjustments that a
+consumer has to combine with today's card. When today's price is a rate card,
+each optimisation is deployed by itself, so the output has to be the complete new
+card. That needs today's rates per level as an input.
+
+### 18.1 The input
+
+`RatebookOptimiser(existing_rates={factor: {level: rate}})` has the shape of
+`factor_tables`. It is a second way to give the starting point and can be
+combined with `base_multiplier`: the column then holds whatever isn't being
+optimised, so a part of today's price can be held fixed.
+
+Rates are finite and positive after conversion to f32. Its factors must be
+exactly the factor specs, and every level in the data must have a rate, because
+today's card can't price it otherwise. Levels that aren't in the data are allowed
+and carried unchanged. With ratio constraints or factor auto-discovery it raises,
+as a base multiplier does (§17.5).
+
+### 18.2 Numerical rules
+
+With `b_q` the per-quote column (1.0 if there is none) and `e_f[g]` today's f32
+rate (1.0 if there are none), `baseline_product_q = b_q × prod_f e_f[g]`,
+multiplied in f32 from `b_q` in factor order, at the step nearest that product.
+Those steps supply the baseline totals, pct bounds and the inner solve's scale
+factors, as in §17.3.
+
+Coordinate descent is unchanged: `overall_mult` starts at `baseline_product_q`
+and the working factor values start at 1.0. The §17.4 candidate and tie rules
+apply to those working values, so they mean "no change from today". The output
+is `fresh_f[g] = e_f[g] * delta_f[g]` in f32, so an unchanged level is exactly
+its existing rate. Reported totals are the canonical evaluation of the published
+tables (§13.1), with each product starting from `b_q`.
+
+With `existing_rates` alone, the f32 product of the output tables in factor order
+selects each quote's step, with nothing from today's card. A consumer that sums
+logs in f64 agrees except for quotes within about 1e-5 of a step boundary, which
+is a difference between two arithmetics and not an error.
+
+### 18.3 Results
+
+`factor_tables` is the complete new card, including levels carried from
+`existing_rates` after the data's levels, in that mapping's order.
+`evaluate()` accepts those extra levels and no others.
+
+`quote_results` gains, after `clamped_high` and in this order: `base_multiplier`
+(Float32) with a per-quote column, `baseline_product` (Float32) with existing
+rates, and `baseline_step` (Int32) with either.
+
+`save()` writes format 4 when `existing_rates` is set: format 2's keys minus
+`baseline_scenario_value`, plus `existing_rates` and `base_multiplier` (a column
+name or null). Formats 2 and 3 are unchanged, and `load()` accepts 1 to 4.
+
+## 19. Frontier impact report (0.10.0)
+
+### Context
+
+A frontier gives several candidate rate cards, and someone has to pick one to
+deploy. Every consumer was building its own report. `FrontierReport` produces one
+page that shows what each point does to the objective and constraints.
+
+### 19.1 A record and a view
+
+As in t-boost's model report, `FrontierReport.data` is a JSON-safe dict with
+`report_version: 1`, and `frontier_report_html(data)` is a pure view of it. The
+page can be rebuilt from the record logged next to a run. The record keeps every
+level; only the page applies display caps.
+
+The page has no JavaScript and loads nothing: tabs and the point switch are
+CSS-only radio inputs, charts are inline SVG with `<title>` hovers, and theme comes
+from CSS custom properties. It opens offline and in MLflow's sandboxed artifact
+viewer, and adds no runtime dependency.
+
+### 19.2 What it computes
+
+The report builds one grid holding the objective, constraints and report columns,
+then evaluates each point's tables with the canonical kernel (§13.1), so every
+column's total comes from one code path. Each point's objective and constraint
+totals must equal `frontier.points` exactly, or the report raises naming the
+point. That catches a wrong frame or wrong factors; it can't prove the data is the
+sweep's, and the page says so. `RatebookFrontierResult.provenance` records the
+configuration, so a frontier passed with a different optimiser raises.
+
+Per-quote work is in Rust (`report.rs`), and only aggregates cross FFI. Reductions
+run over fixed chunks combined in chunk order, in batches of at most 32, so results
+don't depend on the thread count and scratch memory stays bounded. An accumulator
+over 4 MB (a high-cardinality segment) makes that reduction sequential.
+
+Beyond the totals, the record holds what a reviewer needs to judge a point: the scenario
+value's mean, largest and rail shares at baseline and at the point, quotes per step, the
+table of baseline-to-point step transitions with each column's change, movement by
+direction, display statistics per segment, ten equal-count bands of any numeric column,
+ratios of columns, a forward projection scaled from the data's window, and each column's
+total under alternative scorings with the point's steps held fixed. The transition table
+keeps the per-policy view of baseline against optimised while staying aggregated.
+
+### 19.3 Numerical contracts
+
+- A change is `point − baseline` in f64. Display-unit changes are per quote.
+- `pct = change / abs(baseline)`. A zero baseline gives null with a reason.
+- Percentiles use nearest rank on the sorted per-quote values, with no
+  interpolation.
+- A histogram has 40 equal-width bins from p1 to p99, plus counts below and above.
+  If p1 equals p99 there is one bin at that value.
+- Between consecutive points of a slice, the marginal rate is Δobjective /
+  Δconstraint, or null with a reason if the constraint didn't change.
+- A point is dominated if another is at least as good on the objective and every
+  constraint, and strictly better on one. Identical points don't dominate each
+  other.
+- A quote is beyond the movement band when its absolute display change is strictly
+  greater than the band.
+- A band is `rank × 10 // n` over quotes sorted by the column and then quote ID, so
+  band sizes differ by at most one and the cut doesn't depend on row order.
+- A sensitivity total reads the other grid at the point's own steps, in quote order.
+  Nothing is re-solved, so it shows how far the point's totals depend on the
+  assumptions behind the scores.
+- A ratio divides totals; a zero denominator gives null with a reason. A projection
+  multiplies a total by `horizon / window_days`.
+
+### 19.4 Beeswarms
+
+Both plots follow the SHAP style used by the consumer's existing impact report: one
+row per factor, one dot per level. Diameter is `6 + 28 × sqrt(quotes / largest)` px, so
+dots show how much of the book has that level. Colour is a linear blend from
+`rgb(11,138,251)` to `rgb(255,11,81)` by the level's rank within its factor: by value
+when every level parses as a number, by quotes otherwise. x is the relativity
+`log(rate)`, or its change. Rows order by the quote-weighted mean of `abs(x)`. Vertical
+jitter is deterministic, so the same data draws the same page. Levels with no quotes
+aren't drawn, and a plot draws at most its 500 largest levels, or fewer on a page
+with so many points that it would pass 18,000 dots.
+
+### 19.5 Size
+
+CSS-hidden panels still occupy the file, so the page has global budgets: 120,000
+table cells across all points, of which segments take at most 60,000 (their row
+limit lowered uniformly, with the rest rolled into "Other"), and then the
+per-factor row limit lowered uniformly, 500 beeswarm dots per plot and 18,000 per page, and 2,000
+convergence-trace rows. There is no chart per factor per point, which at 25 points and 55 factors
+would exceed the budget by itself.

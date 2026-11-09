@@ -111,6 +111,41 @@ pub fn quote_baseline_steps(scenario_values: &[f32], base: &[f32]) -> Vec<u32> {
         .collect()
 }
 
+/// Each quote's starting price: its base multiplier, if any, times today's
+/// rate for each of its levels, in f32 in factor order
+/// (`docs/DESIGN_DECISIONS.md` §18.2).
+pub fn starting_products(
+    grid: &QuoteGrid,
+    mappings: &[&GroupMapping],
+    existing: &[&[f32]],
+    base: Option<&[f32]>,
+) -> Result<Vec<f32>> {
+    grid.validate()?;
+    validate_inputs(grid, mappings, existing, base)?;
+    let mut products = vec![0.0f32; grid.n_quotes];
+    products
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(i, slot)| *slot = quote_product(i, base, mappings, existing));
+    Ok(products)
+}
+
+/// One quote's product: multiplied left to right in factor order from its
+/// base multiplier, or from 1.0.
+#[inline]
+fn quote_product(
+    i: usize,
+    base: Option<&[f32]>,
+    mappings: &[&GroupMapping],
+    factor_values: &[&[f32]],
+) -> f32 {
+    let mut product = base.map_or(1.0f32, |b| b[i]);
+    for (mapping, values) in mappings.iter().zip(factor_values.iter()) {
+        product *= values[mapping.group_of[i] as usize];
+    }
+    product
+}
+
 fn evaluate_ratebook_polling(
     grid: &QuoteGrid,
     mappings: &[&GroupMapping],
@@ -157,10 +192,7 @@ fn evaluate_ratebook_polling(
             }
             for local_i in 0..products.len() {
                 let i = start + local_i;
-                let mut product = base.map_or(1.0f32, |b| b[i]);
-                for (mapping, values) in mappings.iter().zip(factor_values.iter()) {
-                    product *= values[mapping.group_of[i] as usize];
-                }
+                let product = quote_product(i, base, mappings, factor_values);
                 let (step, _) = nearest_step(scenario_values, product);
                 let low = product < first_sv;
                 let high = product > last_sv;
@@ -413,6 +445,30 @@ mod tests {
             quote_baseline_steps(&sv, &[1.0])[0] as usize,
             crate::data::baseline_step(&sv)
         );
+    }
+
+    #[test]
+    fn starting_products_multiply_base_and_rates_by_hand() {
+        let grid = indexed_grid(vec![0.5, 1.0, 2.0], 2);
+        let f = build_group_mapping(&labels(&["x", "y"]));
+        let g = build_group_mapping(&labels(&["u", "u"]));
+        let existing: [&[f32]; 2] = [&[0.5, 2.0], &[1.5]];
+        assert_eq!(
+            starting_products(&grid, &[&f, &g], &existing, None).unwrap(),
+            vec![0.5 * 1.5, 2.0 * 1.5]
+        );
+        assert_eq!(
+            starting_products(&grid, &[&f, &g], &existing, Some(&[2.0, 3.0])).unwrap(),
+            vec![(2.0 * 0.5) * 1.5, (3.0 * 2.0) * 1.5]
+        );
+    }
+
+    #[test]
+    fn starting_products_reject_invalid_rates() {
+        let grid = indexed_grid(vec![1.0], 1);
+        let f = build_group_mapping(&labels(&["x"]));
+        let err = starting_products(&grid, &[&f], &[&[0.0]], None).unwrap_err();
+        assert!(format!("{err}").contains("finite and > 0"), "{err}");
     }
 
     #[test]
