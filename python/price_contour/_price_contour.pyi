@@ -340,6 +340,7 @@ def run_cd_pass_py(
     lambdas: dict[str, float] | None = None,
     *,
     base_contexts: RatebookFactorContexts | None = None,
+    existing_values: list[list[float]] | None = None,
 ) -> RatebookCDResult: ...
 def evaluate_ratebook_py(
     grid: QuoteGrid,
@@ -347,8 +348,22 @@ def evaluate_ratebook_py(
     factor_values: list[list[float]],
     *,
     base_contexts: RatebookFactorContexts | None = None,
+    existing_values: list[list[float]] | None = None,
     cancel: CancelToken | None = None,
 ) -> RatebookEvaluation: ...
+def report_points_py(
+    grid: QuoteGrid,
+    contexts: list[FactorContext],
+    group_contexts: list[FactorContext],
+    points: list[list[list[float]]],
+    *,
+    base_contexts: RatebookFactorContexts | None = None,
+    existing_values: list[list[float]] | None = None,
+    display_values: list[float] | None = None,
+    movement_band: float | None = None,
+    sensitivity_grids: list[QuoteGrid] = ...,
+    n_bins: int = 40,
+) -> list[dict[str, object]]: ...
 def _baseline_step_index(scenario_values: list[float]) -> int: ...
 def _received_columns(df: pl.DataFrame) -> list[tuple[str, str, int]]:
     """Test hook: each column as the native module receives it, as

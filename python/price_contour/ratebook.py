@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
+import struct
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -124,6 +127,7 @@ FACTOR_SEPARATOR = "\x1f"
 
 _FORMAT_VERSION = 2
 _FORMAT_VERSION_WITH_BASE = 3
+_FORMAT_VERSION_WITH_EXISTING_RATES = 4
 
 # ``config.json`` keys by save format. ``load`` accepts exactly these.
 _CONFIG_KEYS_V1 = frozenset(
@@ -151,6 +155,7 @@ _CONFIG_KEYS_V2 = _CONFIG_KEYS_V1 | {
     "n_quotes_clamped_high",
 }
 _CONFIG_KEYS_V3 = (_CONFIG_KEYS_V2 - {"baseline_scenario_value"}) | {"base_multiplier"}
+_CONFIG_KEYS_V4 = _CONFIG_KEYS_V3 | {"existing_rates"}
 
 
 class ResultUnavailableError(RuntimeError):
@@ -162,11 +167,14 @@ class ResultUnavailableError(RuntimeError):
 
 
 def quote_results_schema(
-    constraint_names: list[str], *, base_multiplier: bool = False
+    constraint_names: list[str],
+    *,
+    base_multiplier: bool = False,
+    existing_rates: bool = False,
 ) -> dict[str, pl.DataType]:
     """Exact ``{column: dtype}`` of ``quote_results`` for sum constraints
-    ``constraint_names`` (DESIGN_DECISIONS §13.2), in column order. With
-    ``base_multiplier``, the schema of a ratebook that has one (§17.2)."""
+    ``constraint_names`` (DESIGN_DECISIONS §13.2), in column order. The keywords
+    give the schema of a ratebook with that starting point (§17.2, §18.3)."""
     schema: dict[str, pl.DataType] = {
         "quote_id": pl.String(),
         "optimal_step": pl.Int32(),
@@ -180,6 +188,9 @@ def quote_results_schema(
     schema["clamped_high"] = pl.Boolean()
     if base_multiplier:
         schema["base_multiplier"] = pl.Float32()
+    if existing_rates:
+        schema["baseline_product"] = pl.Float32()
+    if base_multiplier or existing_rates:
         schema["baseline_step"] = pl.Int32()
     return schema
 
@@ -255,12 +266,21 @@ class RatebookResult:
         default=None, repr=False, compare=False
     )
     _base_multiplier: str | None = field(default=None, repr=False)
+    _existing_rates: dict[str, dict[str, float]] | None = field(
+        default=None, repr=False
+    )
 
     @property
     def base_multiplier(self) -> str | None:
-        """The base-multiplier column these tables are relative to, or
+        """The per-quote column the deployed price is relative to, or
         ``None`` (§17.2)."""
         return self._base_multiplier
+
+    @property
+    def existing_rates(self) -> dict[str, dict[str, float]] | None:
+        """The rate tables this optimisation started from, as f32 values, or
+        ``None`` (§18.1)."""
+        return self._existing_rates
 
     @property
     def per_factor_results(self) -> tuple[PerFactorRecord, ...]:
@@ -286,10 +306,10 @@ class RatebookResult:
     @property
     def baseline_scenario_value(self) -> float:
         """Scenario value of the baseline step (nearest 1.0, §13.6)."""
-        if self._base_multiplier is not None:
+        if self._base_multiplier is not None or self._existing_rates is not None:
             raise _unavailable(
                 "baseline_scenario_value",
-                "with a base multiplier each quote has its own baseline; "
+                "with a starting point each quote has its own baseline; "
                 'see quote_results["baseline_step"]',
             )
         if self._baseline_scenario_value is None:
@@ -335,7 +355,7 @@ class RatebookResult:
 
     def save(self, path: str | Path) -> None:
         """Save the result to a parameters folder (format 2, §13.10; format 3
-        with a base multiplier, §17.6).
+        with only a base multiplier, §17.6; format 4 with existing rates, §18.3).
 
         Creates one JSON per factor plus a config.json:
 
@@ -359,11 +379,7 @@ class RatebookResult:
                 f"map to the same file name; rename a factor column"
             )
         config = {
-            "format_version": (
-                _FORMAT_VERSION
-                if self._base_multiplier is None
-                else _FORMAT_VERSION_WITH_BASE
-            ),
+            "format_version": self._format_version(),
             "factor_separator": FACTOR_SEPARATOR,
             "lambdas": self.lambdas,
             "constraints": self.total_constraints,
@@ -377,11 +393,7 @@ class RatebookResult:
             "per_factor_results": [asdict(r) for r in self.per_factor_results],
             "constraint_bounds": self.constraint_bounds,
             "scenario_values": list(self.scenario_values),
-            **(
-                {"baseline_scenario_value": self.baseline_scenario_value}
-                if self._base_multiplier is None
-                else {"base_multiplier": self._base_multiplier}
-            ),
+            **self._starting_point_config(),
             "n_quotes": self.n_quotes,
             "n_quotes_clamped_low": self.n_quotes_clamped_low,
             "n_quotes_clamped_high": self.n_quotes_clamped_high,
@@ -393,6 +405,24 @@ class RatebookResult:
             (path / filenames[factor_name]).write_text(
                 json.dumps(factor_data, indent=2)
             )
+
+    def _format_version(self) -> int:
+        if self._existing_rates is not None:
+            return _FORMAT_VERSION_WITH_EXISTING_RATES
+        if self._base_multiplier is not None:
+            return _FORMAT_VERSION_WITH_BASE
+        return _FORMAT_VERSION
+
+    def _starting_point_config(self) -> dict[str, Any]:
+        """The keys that differ between save formats, in their file position."""
+        if self._existing_rates is not None:
+            return {
+                "base_multiplier": self._base_multiplier,
+                "existing_rates": self._existing_rates,
+            }
+        if self._base_multiplier is not None:
+            return {"base_multiplier": self._base_multiplier}
+        return {"baseline_scenario_value": self.baseline_scenario_value}
 
     def to_rating_entries(self) -> dict[str, pl.DataFrame]:
         """Convert factor tables to rating-step DataFrames.
@@ -416,7 +446,7 @@ class RatebookResult:
 
     @classmethod
     def load(cls, path: str | Path) -> RatebookResult:
-        """Load a result saved by :meth:`save` (format 1, 2 or 3).
+        """Load a result saved by :meth:`save` (format 1, 2, 3 or 4).
 
         The loaded result has no per-quote frame. A format-1 save lacks the
         0.5.0 fields; they raise :class:`ResultUnavailableError` on access.
@@ -427,9 +457,12 @@ class RatebookResult:
             raise FileNotFoundError(f"Config file not found: {config_path}")
         config = json.loads(config_path.read_text())
         version = config.get("format_version", 1)
-        allowed = {1: _CONFIG_KEYS_V1, 2: _CONFIG_KEYS_V2, 3: _CONFIG_KEYS_V3}.get(
-            version
-        )
+        allowed = {
+            1: _CONFIG_KEYS_V1,
+            2: _CONFIG_KEYS_V2,
+            3: _CONFIG_KEYS_V3,
+            4: _CONFIG_KEYS_V4,
+        }.get(version)
         if allowed is None:
             raise ValueError(f"unsupported RatebookResult format_version {version!r}")
         unknown = set(config) - allowed
@@ -490,6 +523,7 @@ class RatebookResult:
             _n_quotes_clamped_low=config["n_quotes_clamped_low"],
             _n_quotes_clamped_high=config["n_quotes_clamped_high"],
             _base_multiplier=config.get("base_multiplier"),
+            _existing_rates=config.get("existing_rates"),
         )
 
 
@@ -559,6 +593,13 @@ class RatebookOptimiser:
         ``base × its factor values``, tables are relative to the base, and the
         baseline is per quote (DESIGN_DECISIONS §17). Requires explicit
         factors and sum constraints only. Default ``None``: no base.
+    existing_rates : Mapping[str, Mapping[str, float]], optional
+        Today's rate tables, in the shape of ``factor_tables``. Each quote
+        starts at today's price and ``factor_tables`` is the complete new
+        card (DESIGN_DECISIONS §18). Levels not in the data are carried
+        unchanged. Can be combined with ``base_multiplier``, which then holds
+        whatever isn't being optimised. Requires explicit factors and sum
+        constraints only.
     candidate_min, candidate_max : float
         Range for candidate factor values.
     candidate_steps : int
@@ -583,6 +624,7 @@ class RatebookOptimiser:
         scenario_value: str = "scenario_value",
         factor_columns: list[list[str]] | None = None,
         base_multiplier: str | None = None,
+        existing_rates: Mapping[str, Mapping[str, float]] | None = None,
         candidate_min: float = 0.70,
         candidate_max: float = 1.40,
         candidate_steps: int = 50,
@@ -598,6 +640,7 @@ class RatebookOptimiser:
         self.scenario_value = scenario_value
         self.factor_columns = factor_columns
         self.base_multiplier = base_multiplier
+        self.existing_rates = _normalise_existing_rates(existing_rates)
         self.candidate_min = candidate_min
         self.candidate_max = candidate_max
         self.candidate_steps = candidate_steps
@@ -609,13 +652,21 @@ class RatebookOptimiser:
         _validate_candidate_settings(
             candidate_min, candidate_max, candidate_steps, max_cd_iterations
         )
-        _validate_base_multiplier_setting(
-            base_multiplier, self.constraints, quote_id, factor_columns
+        _validate_starting_point_setting(
+            base_multiplier,
+            self.existing_rates,
+            self.constraints,
+            quote_id,
+            factor_columns,
         )
 
+    @property
+    def _has_starting_point(self) -> bool:
+        return self.base_multiplier is not None or self.existing_rates is not None
+
     def _build_candidates(self) -> list[float]:
-        """Build the evenly-spaced candidate factor values. With a base
-        multiplier, "no change" is always one of them (§17.4)."""
+        """Build the evenly-spaced candidate factor values. With a starting
+        point, "no change" is always one of them (§17.4)."""
         candidates = [
             self.candidate_min
             + (self.candidate_max - self.candidate_min)
@@ -623,10 +674,7 @@ class RatebookOptimiser:
             / max(self.candidate_steps - 1, 1)
             for i in range(self.candidate_steps)
         ]
-        if (
-            self.base_multiplier is not None
-            and self.candidate_min <= 1.0 <= self.candidate_max
-        ):
+        if self._has_starting_point and self.candidate_min <= 1.0 <= self.candidate_max:
             nearest = min(
                 range(len(candidates)), key=lambda i: abs(candidates[i] - 1.0)
             )
@@ -687,6 +735,9 @@ class RatebookOptimiser:
             factors,
             factor_columns or self.factor_columns,
             self.quote_id,
+        )
+        _validate_existing_rates_input(
+            self.existing_rates, factors, factor_columns or self.factor_columns
         )
 
         # Detect ratio constraints. The ratebook supports ratio constraints
@@ -838,6 +889,9 @@ class RatebookOptimiser:
             cd_tolerance=self.cd_tolerance,
             lambdas=lambdas,
             base_contexts=factor_contexts_obj,
+            existing_values=_existing_values(
+                factor_specs, factor_contexts, self.existing_rates
+            ),
         )
 
         evaluation = cd_result.evaluation
@@ -856,6 +910,12 @@ class RatebookOptimiser:
                 spec_names, factor_group_labels, cd_result.factor_values
             )
         }
+        # The card is deployed by itself, so levels the data didn't reach stay
+        # at today's rate, after the data's levels (§18.3).
+        if self.existing_rates is not None:
+            for name, table in named_tables.items():
+                for level, rate in self.existing_rates[name].items():
+                    table.setdefault(level, rate)
 
         # Every total is the canonical evaluation of the final factor
         # tables (§13.1). Ratio labels are then reported as the actual ratio
@@ -903,9 +963,7 @@ class RatebookOptimiser:
             _constraint_bounds=constraint_bounds,
             _scenario_values=tuple(evaluation.scenario_values),
             _baseline_scenario_value=(
-                None
-                if self.base_multiplier is not None
-                else evaluation.baseline_scenario_value
+                None if self._has_starting_point else evaluation.baseline_scenario_value
             ),
             _n_quotes=evaluation.n_quotes,
             _n_quotes_clamped_low=evaluation.n_quotes_clamped_low,
@@ -913,6 +971,7 @@ class RatebookOptimiser:
             _evaluation=evaluation,
             _quote_results_frame=quote_results_frame,
             _base_multiplier=self.base_multiplier,
+            _existing_rates=copy.deepcopy(self.existing_rates),
         )
 
     def evaluate(
@@ -969,6 +1028,9 @@ class RatebookOptimiser:
         _validate_base_multiplier_input(
             self.base_multiplier, factors, self.factor_columns, self.quote_id
         )
+        _validate_existing_rates_input(
+            self.existing_rates, factors, self.factor_columns
+        )
         if isinstance(factors, RatebookFactorContexts):
             factor_specs = _resolve_factor_specs_from_contexts(
                 factors, None, self.factor_columns
@@ -1002,8 +1064,16 @@ class RatebookOptimiser:
         return evaluate_ratebook_py(
             grid,
             solver_contexts,
-            _factor_values_for_contexts(factor_specs, solver_contexts, factor_tables),
+            _factor_values_for_contexts(
+                factor_specs,
+                solver_contexts,
+                factor_tables,
+                carried=self.existing_rates,
+            ),
             base_contexts=contexts,
+            existing_values=_existing_values(
+                factor_specs, solver_contexts, self.existing_rates
+            ),
             cancel=cancel,
         )
 
@@ -1176,6 +1246,9 @@ class RatebookOptimiser:
             factors,
             factor_columns or self.factor_columns,
             self.quote_id,
+        )
+        _validate_existing_rates_input(
+            self.existing_rates, factors, factor_columns or self.factor_columns
         )
 
         # Per-axis reporting value for unswept constraints — the
@@ -1439,6 +1512,24 @@ class RatebookOptimiser:
             constraint_names=constraint_names,
             factor_tables=[r.factor_tables for r in results],
             point_history=point_history,
+            # A snapshot: the optimiser can be mutated after the sweep.
+            provenance=copy.deepcopy(
+                {
+                    "objective": self.objective,
+                    "constraints": self.constraints,
+                    "factor_specs": resolved_factor_specs,
+                    "swept": swept_names,
+                    "candidate_min": self.candidate_min,
+                    "candidate_max": self.candidate_max,
+                    "candidate_steps": self.candidate_steps,
+                    "base_multiplier": self.base_multiplier,
+                    "existing_rates": self.existing_rates,
+                    "max_cd_iterations": self.max_cd_iterations,
+                    "cd_tolerance": self.cd_tolerance,
+                    "max_iter": self.max_iter,
+                    "tolerance": self.tolerance,
+                }
+            ),
         )
 
     def summary(self, result: RatebookResult) -> dict[str, Any]:
@@ -1457,6 +1548,8 @@ class RatebookOptimiser:
             params["constraints"] = json.dumps(self.constraints)
         if self.base_multiplier is not None:
             params["base_multiplier"] = self.base_multiplier
+        if self.existing_rates is not None:
+            params["existing_rates"] = True
 
         metrics: dict[str, float] = {
             "total_objective": result.total_objective,
@@ -1511,26 +1604,90 @@ def _validate_candidate_settings(
         raise ValueError(f"max_cd_iterations must be >= 1, got {max_cd_iterations}")
 
 
-def _validate_base_multiplier_setting(
+def _f32(value: float) -> float:
+    """``value`` at the kernel's width; out of range becomes infinite."""
+    try:
+        return struct.unpack("f", struct.pack("f", value))[0]
+    except OverflowError:
+        return math.copysign(math.inf, value)
+
+
+def _valid_rate(rate: Any) -> bool:
+    """Whether ``rate`` is a number that is finite and positive as an f32."""
+    if isinstance(rate, bool) or not isinstance(rate, Real):
+        return False
+    value = _f32(float(rate))
+    return math.isfinite(value) and value > 0.0
+
+
+def _normalise_existing_rates(
+    existing_rates: Mapping[str, Mapping[str, float]] | None,
+) -> dict[str, dict[str, float]] | None:
+    """Validate ``existing_rates`` and return it as plain dicts of f32 values
+    (§18.1). Whether it covers the data is checked at solve time."""
+    if existing_rates is None:
+        return None
+    if not isinstance(existing_rates, Mapping):
+        raise TypeError(
+            "existing_rates must map factor names to {level: rate} tables, got "
+            f"{type(existing_rates).__name__}"
+        )
+    normalised: dict[str, dict[str, float]] = {}
+    invalid: list[tuple[str, str, Any]] = []
+    for factor, table in existing_rates.items():
+        if not isinstance(factor, str) or not isinstance(table, Mapping):
+            raise TypeError(
+                f"existing_rates[{factor!r}] must be a {{level: rate}} table, got "
+                f"{type(table).__name__}"
+            )
+        rates: dict[str, float] = {}
+        for level, rate in table.items():
+            if not isinstance(level, str) or not (
+                rate is None or (isinstance(rate, Real) and not isinstance(rate, bool))
+            ):
+                raise TypeError(
+                    f"existing_rates[{factor!r}] must map level names to numbers, "
+                    f"got {level!r}: {rate!r}"
+                )
+            value = math.nan if rate is None else _f32(float(rate))
+            if not math.isfinite(value) or value <= 0.0:
+                invalid.append((factor, level, rate))
+            rates[level] = value
+        normalised[factor] = rates
+    if invalid:
+        factor, level, rate = invalid[0]
+        raise ValueError(
+            f"existing_rates has {len(invalid)} invalid rate(s): each must be finite "
+            f"and > 0 after conversion to f32; first at factor {factor!r}, level "
+            f"{level!r}: {rate!r}"
+        )
+    return normalised
+
+
+def _validate_starting_point_setting(
     base_multiplier: str | None,
+    existing_rates: dict[str, dict[str, float]] | None,
     constraints: dict[str, dict[str, float]],
     quote_id: str,
     factor_columns: list[list[str]] | None,
 ) -> None:
-    """The base-multiplier checks that need no data (§17.5)."""
-    if base_multiplier is None:
+    """The starting-point checks that need no data (§17.5, §18.1)."""
+    if base_multiplier is None and existing_rates is None:
         return
-    if not isinstance(base_multiplier, str):
+    if base_multiplier is not None and not isinstance(base_multiplier, str):
         raise TypeError(
             f"base_multiplier must be a column name or None, got {base_multiplier!r}"
         )
     ratio_names = _ratio_constraint_names(constraints)
     if ratio_names:
+        given = "base_multiplier" if base_multiplier is not None else "existing_rates"
         raise ValueError(
-            f"base_multiplier cannot be combined with ratio constraints "
+            f"{given} cannot be combined with ratio constraints "
             f"({ratio_names}): the ratio path linearises against the grid-level "
             f"baseline, not each quote's own."
         )
+    if base_multiplier is None:
+        return
     if base_multiplier == quote_id:
         raise ValueError(
             f"base_multiplier column {base_multiplier!r} is also the quote_id column"
@@ -1585,23 +1742,74 @@ def _validate_base_multiplier_input(
     )
 
 
+_EXISTING_TABLE = "existing rate table"
+
+
+def _existing_values(
+    factor_specs: list[list[str]],
+    contexts: list[FactorContext],
+    existing_rates: dict[str, dict[str, float]] | None,
+) -> list[list[float]] | None:
+    """Today's rates as per-context value lists, or ``None`` without any."""
+    if existing_rates is None:
+        return None
+    return _factor_values_for_contexts(
+        factor_specs,
+        contexts,
+        existing_rates,
+        what=_EXISTING_TABLE,
+        carried=existing_rates,
+    )
+
+
+def _validate_existing_rates_input(
+    existing_rates: dict[str, dict[str, float]] | None,
+    factors: pl.DataFrame | RatebookFactorContexts,
+    factor_specs: list[list[str]] | None,
+) -> None:
+    """Reject ``existing_rates`` that can't price the data, before any grid is
+    built (§18.1)."""
+    if existing_rates is None:
+        return
+    if isinstance(factors, RatebookFactorContexts):
+        contexts = factors
+        factor_specs = factors.factor_specs
+    elif factor_specs is None:
+        raise ValueError(
+            "existing_rates needs explicit factor_columns: auto-discovery screens "
+            "factors from a starting point of 1.0, not each quote's rates."
+        )
+    else:
+        contexts = RatebookFactorContexts.from_dataframe(
+            select_native_columns(factors, [c for spec in factor_specs for c in spec]),
+            factor_specs,
+            quote_id=None,
+            separator=FACTOR_SEPARATOR,
+        )
+    _existing_values(
+        factor_specs, contexts._factor_contexts_for_solver(), existing_rates
+    )
+
+
 def _factor_values_for_contexts(
     factor_specs: list[list[str]],
     contexts: list[FactorContext],
     factor_tables: Mapping[str, Mapping[str, float]],
+    *,
+    what: str = "factor table",
+    carried: Mapping[str, Mapping[str, float]] | None = None,
 ) -> list[list[float]]:
     """Order ``factor_tables`` into per-context value lists (context spec
     order, each context's ``group_labels`` order). Tables must cover exactly
-    the factors and the levels present in the data."""
+    the factors and the levels present in the data, plus any levels in
+    ``carried`` (§18.3)."""
     names = [":".join(spec) for spec in factor_specs]
     unknown = sorted(set(factor_tables) - set(names))
     if unknown:
-        raise ValueError(
-            f"factor tables for unknown factor(s) {unknown}; factors: {names}"
-        )
+        raise ValueError(f"{what}s for unknown factor(s) {unknown}; factors: {names}")
     missing = [name for name in names if name not in factor_tables]
     if missing:
-        raise ValueError(f"no factor table for factor(s) {missing}")
+        raise ValueError(f"no {what} for factor(s) {missing}")
     values: list[list[float]] = []
     for name, context in zip(names, contexts):
         table = factor_tables[name]
@@ -1609,13 +1817,25 @@ def _factor_values_for_contexts(
         absent = [label for label in labels if label not in table]
         if absent:
             raise ValueError(
-                f"factor table '{name}' has no rate for level(s) {absent[:10]!r}"
+                f"{what} '{name}' has no rate for level(s) {absent[:10]!r}"
                 f"{' …' if len(absent) > 10 else ''}"
             )
-        extra = sorted(set(table) - set(labels))
+        allowed = set(labels) | (set(carried[name]) if carried else set())
+        extra = sorted(set(table) - allowed)
+        # Only the data's levels reach the kernel, which validates them.
+        invalid = sorted(
+            level
+            for level in set(table) - set(labels)
+            if level in allowed and not _valid_rate(table[level])
+        )
+        if invalid:
+            raise ValueError(
+                f"{what} '{name}' has invalid rate(s) for level(s) {invalid[:10]!r}; "
+                f"rates must be finite and > 0"
+            )
         if extra:
             raise ValueError(
-                f"factor table '{name}' has level(s) {extra[:10]!r} that no quote "
+                f"{what} '{name}' has level(s) {extra[:10]!r} that no quote "
                 f"has{' …' if len(extra) > 10 else ''}"
             )
         values.append([table[label] for label in labels])
@@ -1759,6 +1979,7 @@ class RatebookFrontierResult:
         constraint_names: list[str],
         factor_tables: list[dict[str, dict[str, float]]],
         point_history: pl.DataFrame | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> None:
         if len(factor_tables) != points.height:
             raise ValueError(
@@ -1768,6 +1989,15 @@ class RatebookFrontierResult:
         self._constraint_names = constraint_names
         self._factor_tables = factor_tables
         self._point_history = point_history
+        self._provenance = provenance
+
+    @property
+    def provenance(self) -> dict[str, Any] | None:
+        """The configuration this frontier was swept with (DESIGN_DECISIONS
+        §19.2): objective, constraints, factor specs, swept constraints,
+        candidate settings and starting point. A copy, so the record can't be
+        changed through it."""
+        return copy.deepcopy(self._provenance)
 
     @property
     def points(self) -> pl.DataFrame:
