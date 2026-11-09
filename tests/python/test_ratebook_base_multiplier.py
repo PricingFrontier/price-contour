@@ -417,11 +417,12 @@ class TestEngineEquivalence:
             "scheme": [f"s{i}" for i in range(4)],
         }
         w0 = {
-            f: {l: float(rng.normal(-0.4, 0.3)) for l in ls} for f, ls in levels.items()
+            f: {level: float(rng.normal(-0.4, 0.3)) for level in ls}
+            for f, ls in levels.items()
         }
         membership = {f: rng.choice(ls, n_quotes).tolist() for f, ls in levels.items()}
         sum_w0 = sum(
-            np.array([w0[f][l] for l in membership[f]], dtype=np.float64)
+            np.array([w0[f][level] for level in membership[f]], dtype=np.float64)
             for f in levels
         )
         base_odds = np.exp(sum_w0)
@@ -458,8 +459,8 @@ class TestEngineEquivalence:
         w_new_sum = sum(
             np.array(
                 [
-                    w0[f][l] + math.log(result.factor_tables[f][l])
-                    for l in membership[f]
+                    w0[f][level] + math.log(result.factor_tables[f][level])
+                    for level in membership[f]
                 ],
                 dtype=np.float64,
             )
