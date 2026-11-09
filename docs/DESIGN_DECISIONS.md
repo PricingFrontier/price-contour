@@ -1130,8 +1130,9 @@ ratebook result is evaluated for reporting.
 
 For each quote *i*, in factor-spec order:
 
-1. **Product.** `p_i = 1.0f32`, then `p_i *= factor_values[f][group_of_f[i]]`
-   for each factor *f*, in f32, left to right.
+1. **Product.** `p_i = 1.0f32` (or the quote's base multiplier, §17.2), then
+   `p_i *= factor_values[f][group_of_f[i]]` for each factor *f*, in f32, left to
+   right.
 2. **Step.** `step_i = nearest_step(p_i)`, the same function the grouped
    solver uses: the nearest scenario value; `p ≤ sv[0]` gives 0 and
    `p ≥ sv[n−1]` gives n−1; an exact midpoint gives the lower step.
@@ -1183,7 +1184,9 @@ returns it):
 
 Rows follow the grid's quote order (quote IDs cast to string and sorted).
 With ratio constraints, the frame gains the numerator and denominator columns
-exactly as the online `SolveResult.dataframe` does. The retained state is
+exactly as the online `SolveResult.dataframe` does. With a base multiplier it
+gains `base_multiplier` and `baseline_step` after `clamped_high` (§17.2). The
+retained state is
 compact (steps, products and flags: about 50 MB at 5M quotes); the frame is
 built on first access.
 
@@ -1255,7 +1258,8 @@ baseline for sum totals, pct bounds and ratio constraints alike, and it is
 exposed as `QuoteGrid.baseline_step` and `baseline_scenario_value` on grids and
 results. Ratio baselines no longer filter for an exact `scenario_value == 1.0`;
 a quote missing its baseline row raises. Grids that contain an exact 1.0
-behave exactly as before.
+behave exactly as before. A ratebook with a base multiplier replaces this one
+step with one step per quote (§17.3).
 
 ### 13.7 Fail loud
 
@@ -1279,7 +1283,11 @@ Each of these raises instead of returning a default:
   label composite levels with `FACTOR_SEPARATOR`);
 - `summary()` of a result missing any configured constraint;
 - `frontier(parallel=True)` where the sweep runs sequentially (the ratebook
-  frontier, and the Python-orchestrated online frontier).
+  frontier, and the Python-orchestrated online frontier);
+- an invalid base multiplier, or one combined with ratio constraints or factor
+  auto-discovery (§17.5);
+- a quote whose scenario values differ from the first quote's, on every path
+  that builds a grid from a frame (§17.7).
 
 ### 13.8 Deterministic ordering
 
@@ -1317,7 +1325,8 @@ the persisted tables. On a loaded result, `quote_results` raises
 config keys, and raises on a missing factor file or table. A format-1 file
 loads; its missing fields raise `ResultUnavailableError` on access.
 `ResultUnavailableError` subclasses `RuntimeError`, not `AttributeError`, so
-`hasattr` cannot hide it.
+`hasattr` cannot hide it. A result with a base multiplier is saved as format 3
+(§17.6).
 
 ### 13.11 `clamp_rate`
 
@@ -1618,3 +1627,124 @@ Ratebook (`mode="ratebook"`), in column order: `point_index` (Int64),
 (Boolean): one row per `per_factor_results` record (§13.9) of the point's
 solve. Its totals are the inner grouped solves', not the point's canonical
 evaluation (§13.1), as for `RatebookResult.per_factor_results`.
+
+## 17. Base multiplier (0.9.0)
+
+### Context
+
+A ratebook started every factor at 1.0, drew candidates from one absolute range
+and measured everything against the single step nearest 1.0. A consumer that
+wants to change today's rate card needs each quote to start from its own price,
+with each level's rate kept within a band of its current value. The scenario
+grid has to stay shared, so the start cannot be folded into each quote's grid.
+
+### 17.1 Where the base lives
+
+`RatebookOptimiser(base_multiplier=<column>)` names a float column on the
+per-quote factors frame. It is per-quote data with the same axis as the factor
+columns, so it follows the same alignment path: `FactorContextBuilder` collects
+it chunk by chunk, under the same all-or-none contract as `quote_id`s, and
+applies the same reorder permutation as `group_of`. `RatebookFactorContexts`
+holds it in an `Arc<Vec<f32>>`, which the solver reads by reference, so a sweep
+does not copy it across FFI per point.
+
+The quote-ID fingerprint does not change. It is compared for equality with the
+grid's, and the values follow the same permutation as `group_of`, so the
+existing check already proves their alignment. A prebuilt contexts handle must
+carry the base the optimiser names: a missing, unexpected or differently named
+base raises.
+
+Any float dtype is accepted and converted to f32, the kernel's width. Values are
+validated after the conversion, so an f64 that overflows to infinity or
+underflows to zero is rejected.
+
+### 17.2 Pricing and reporting
+
+`p_i` starts from the quote's base instead of `1.0f32` (§13.1), and the rest of
+the kernel is unchanged. Clamp flags compare the full product, including the
+base. `overall_mult` in the CD pass starts at the base; the residual and update
+rules are unchanged.
+
+`factor_tables` hold rates relative to the base. `factor_product` is the full
+f32 product including the base, the value the step rule was given, so
+`optimal_step == nearest_step(sv, factor_product)` still holds. `quote_results`
+gains two columns after `clamped_high`:
+
+| Column | Dtype | Meaning |
+|---|---|---|
+| `base_multiplier` | Float32 | The f32 base used |
+| `baseline_step` | Int32 | The step nearest the base (§17.3) |
+
+`quote_results_schema(constraint_names, base_multiplier=True)` returns that
+schema; without the keyword it returns the §13.2 schema.
+
+### 17.3 Per-quote baseline
+
+`baseline_step_q = nearest_step(sv, m_q)`, today's rate card with every factor
+at 1.0. `baseline_step(sv)` and `nearest_step(sv, 1.0)` pick the same step, so a
+base of 1.0 everywhere reproduces §13.6. The steps are computed once per solve
+or evaluation and supply `baseline_objective`, `baseline_constraints`, every
+`min_pct` / `max_pct` bound (so `bound_<c>` on a frontier), and the baseline
+totals and scale factors that size each λ step in the inner solve. A grid-level
+scale would otherwise come from a step unrelated to where the book sits.
+
+There is no single baseline scenario value, so `baseline_scenario_value` raises:
+`ResultUnavailableError` on a `RatebookResult`, `RuntimeError` on a
+`RatebookEvaluation`. A mean would be dominated by the top of a convex grid.
+
+The online optimiser and the non-ratebook paths keep the grid-level baseline.
+
+### 17.4 Candidates and ties
+
+Both rules apply only with a base multiplier, so a ratebook without one is
+bit-identical to 0.8.0.
+
+**"No change" is always a candidate.** Candidates are spaced linearly, so a
+range from `exp(-b)` to `exp(b)` generally misses 1.0, and a small miss
+compounds across many factors. When `candidate_min <= 1.0 <= candidate_max`, the
+candidate nearest 1.0 (lowest index on a tie) is replaced by exactly 1.0. The
+count stays `candidate_steps`, the candidates stay ascending, and the band is
+unchanged.
+
+**On a tie, stay as close to no change as possible.** On a coarse grid a small
+level has runs of candidates that price its quotes at the same steps, so their
+Lagrangians are exactly equal. Taking the lowest index would push the level to
+the low end of the run for no modelled benefit, and a deployed engine charges
+the unsnapped price. Among the candidates whose Lagrangian equals the group's
+maximum exactly (f64 `==`), the one with the smallest `abs(candidate - 1.0)`
+wins, then the lowest index. Without a base the rule stays the lowest index.
+
+The step rule rounds in scenario-value units. On a grid of odds, that is odds
+and not the quantity the odds were derived from.
+
+### 17.5 What is rejected
+
+Each of these raises `ValueError`, before any grid is built:
+
+- a column that is missing or not a float dtype, or that is also the `quote_id`
+  column or named by a factor spec;
+- any null, NaN, infinite, zero or negative value after the conversion to f32,
+  with the count and an example quote (a row index without a `quote_id` column);
+- a base multiplier with ratio constraints, in the constructor: the ratio path
+  linearises against the grid-level baseline, and the consumer needs only sums;
+- a base multiplier with factor auto-discovery: the screen uses residuals of 1.0
+  against the grid-level baseline, so it would rank factors for the wrong start.
+
+### 17.6 Persistence (format 3)
+
+`load()` accepts only known keys, so the new field needs a new format. `save()`
+writes format 3 if and only if a base multiplier is set: format 2's keys, minus
+`baseline_scenario_value`, plus `base_multiplier` (the column name). A saved
+table is relative to a base the save does not contain, so the save has to say
+so. Without a base, `save()` writes format 2 unchanged. Formats 1 and 2 load with
+`base_multiplier` `None`, because they can only have been written without one.
+
+### 17.7 One shared grid on every frame path
+
+`ingest_dataframe` read the scenario values off the first quote and never checked
+the others, so the online solve, DataFrame apply and one-shot Parquet accepted
+quotes with different grids and reported values from the first quote's grid. It
+now applies `QuoteGridBuilder`'s tolerance and message to every step of every
+quote, and rejects null and non-finite values. The comparison runs over each
+chunk's contiguous values with a global row offset, so a large grid pays no
+per-row lookup and a chunk boundary can split a quote.

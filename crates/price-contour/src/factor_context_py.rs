@@ -17,7 +17,10 @@
 use std::sync::Arc;
 
 use polars::prelude::*;
-use price_contour_core::{FactorContextBuilder, FactorContextsBuilt, GroupMapping};
+use price_contour_core::{
+    validate_base_multipliers, FactorContextBuilder, FactorContextsBuilt, GroupMapping,
+    PriceContourError,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
@@ -50,6 +53,11 @@ pub struct PyRatebookFactorContexts {
     quote_id_fingerprint: Option<u64>,
     /// One `Arc<GroupMapping>` per factor spec, in spec order.
     mappings: Vec<Arc<GroupMapping>>,
+    /// The column the base multipliers came from.
+    base_multiplier_column: Option<String>,
+    /// Per-quote base multipliers in quote order, handed to the solver by
+    /// reference (`docs/DESIGN_DECISIONS.md` §17.1).
+    base_multiplier: Option<Arc<Vec<f32>>>,
 }
 
 impl PyRatebookFactorContexts {
@@ -60,6 +68,7 @@ impl PyRatebookFactorContexts {
         factor_specs: Vec<Vec<String>>,
         separator: String,
         built: FactorContextsBuilt,
+        base_multiplier_column: Option<String>,
     ) -> Self {
         let n_quotes = built.group_mappings.first().map_or(0, |m| m.group_of.len());
         let mappings = built
@@ -73,7 +82,14 @@ impl PyRatebookFactorContexts {
             n_quotes,
             quote_id_fingerprint: built.quote_id_fingerprint,
             mappings,
+            base_multiplier_column,
+            base_multiplier: built.base_multiplier.map(Arc::new),
         }
+    }
+
+    /// The per-quote base multipliers: a refcount bump, not a copy.
+    pub(crate) fn base_multiplier_values(&self) -> Option<Arc<Vec<f32>>> {
+        self.base_multiplier.clone()
     }
 }
 
@@ -108,9 +124,20 @@ impl PyRatebookFactorContexts {
         self.quote_id_fingerprint
     }
 
+    /// The base-multiplier column these contexts carry, or `None`.
+    #[getter]
+    fn base_multiplier(&self) -> Option<String> {
+        self.base_multiplier_column.clone()
+    }
+
     fn __repr__(&self) -> String {
+        let base = self
+            .base_multiplier_column
+            .as_deref()
+            .map(|column| format!(", base_multiplier='{column}'"))
+            .unwrap_or_default();
         format!(
-            "RatebookFactorContexts(n_factors={}, n_quotes={}, fingerprint={})",
+            "RatebookFactorContexts(n_factors={}, n_quotes={}, fingerprint={}{base})",
             self.mappings.len(),
             self.n_quotes,
             self.quote_id_fingerprint
@@ -144,6 +171,9 @@ impl PyRatebookFactorContexts {
     /// already align rows positionally to the quote grid — they must
     /// supply `expected_quote_ids` to get a fingerprint, otherwise
     /// `solve(QuoteGrid, contexts)` will reject the contexts.
+    ///
+    /// `base_multiplier` names a float column of per-quote base multipliers
+    /// to carry, reordered with the factors.
     #[classmethod]
     #[pyo3(signature = (
         factors,
@@ -153,6 +183,7 @@ impl PyRatebookFactorContexts {
         separator = "\x1f",
         expected_quote_ids = None,
         expected_n_quotes = None,
+        base_multiplier = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn from_dataframe(
@@ -164,8 +195,12 @@ impl PyRatebookFactorContexts {
         separator: &str,
         expected_quote_ids: Option<Vec<String>>,
         expected_n_quotes: Option<usize>,
+        base_multiplier: Option<&str>,
     ) -> PyResult<Self> {
         cross_validate_expected(&expected_quote_ids, expected_n_quotes)?;
+        if let Some(column) = base_multiplier {
+            validate_base_column_role(column, quote_id, &factor_specs)?;
+        }
 
         let df = factors.0;
         let separator_owned = separator.to_string();
@@ -191,18 +226,27 @@ impl PyRatebookFactorContexts {
                 None => None,
             };
 
+            let base_values: Option<Vec<f32>> = base_multiplier
+                .map(|column| extract_base_multiplier_column(&df, column))
+                .transpose()?;
+
             let mut builder = FactorContextBuilder::new(factor_specs_owned);
             builder
-                .append(quote_ids.as_deref(), per_factor_labels)
+                .append_with_base(
+                    quote_ids.as_deref(),
+                    per_factor_labels,
+                    base_values.as_deref(),
+                )
                 .map_err(|e| PyValueError::new_err(format!("{e}")))?;
             let built = builder
                 .build(expected_ref, expected_n_quotes)
-                .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+                .map_err(|e| builder_error(base_multiplier, e))?;
 
             Ok(PyRatebookFactorContexts::from_built(
                 factor_specs,
                 separator_owned,
                 built,
+                base_multiplier.map(str::to_string),
             ))
         })
     }
@@ -226,6 +270,7 @@ impl PyRatebookFactorContexts {
     separator = "\x1f",
     expected_quote_ids = None,
     expected_n_quotes = None,
+    base_multiplier = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn build_ratebook_factor_contexts_from_parquet_chunked_py(
@@ -237,6 +282,7 @@ pub fn build_ratebook_factor_contexts_from_parquet_chunked_py(
     separator: &str,
     expected_quote_ids: Option<Vec<String>>,
     expected_n_quotes: Option<usize>,
+    base_multiplier: Option<&str>,
 ) -> PyResult<PyRatebookFactorContexts> {
     if chunk_size == 0 {
         return Err(PyValueError::new_err("chunk_size must be > 0"));
@@ -254,6 +300,9 @@ pub fn build_ratebook_factor_contexts_from_parquet_chunked_py(
         }
     }
     cross_validate_expected(&expected_quote_ids, expected_n_quotes)?;
+    if let Some(column) = base_multiplier {
+        validate_base_column_role(column, quote_id, &factor_specs)?;
+    }
 
     // Collect the parquet projection: every column referenced by any
     // factor spec, plus `quote_id` if supplied. We deduplicate so the
@@ -269,6 +318,9 @@ pub fn build_ratebook_factor_contexts_from_parquet_chunked_py(
                 needed.push(col.clone());
             }
         }
+    }
+    if let Some(column) = base_multiplier {
+        needed.push(column.to_string());
     }
 
     let separator_owned = separator.to_string();
@@ -294,20 +346,116 @@ pub fn build_ratebook_factor_contexts_from_parquet_chunked_py(
         while offset < total_rows {
             let len = chunk_size.min(total_rows - offset);
             let df = read_parquet_slice(path, &metadata, offset, len, &needed)?;
-            append_dataframe_chunk(&mut builder, &df, quote_id, &factor_specs, &separator_owned)?;
+            append_dataframe_chunk(
+                &mut builder,
+                &df,
+                quote_id,
+                &factor_specs,
+                &separator_owned,
+                base_multiplier,
+            )?;
             offset += len;
         }
 
         let built = builder
             .build(expected_ref.as_deref(), expected_n_quotes)
-            .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+            .map_err(|e| builder_error(base_multiplier, e))?;
 
         Ok(PyRatebookFactorContexts::from_built(
             factor_specs,
             separator_owned,
             built,
+            base_multiplier.map(str::to_string),
         ))
     })
+}
+
+/// Check a base-multiplier column before any solve: the same rules as the
+/// builders, so `RatebookOptimiser` can fail before it builds a grid.
+#[pyfunction]
+#[pyo3(signature = (factors, column, factor_specs, *, quote_id = None))]
+pub fn validate_base_multiplier_column_py(
+    py: Python<'_>,
+    factors: PyDataFrame,
+    column: &str,
+    factor_specs: Vec<Vec<String>>,
+    quote_id: Option<&str>,
+) -> PyResult<()> {
+    let df = factors.0;
+    py.detach(move || -> PyResult<()> {
+        validate_base_column_role(column, quote_id, &factor_specs)?;
+        let values = extract_base_multiplier_column(&df, column)?;
+        if validate_base_multipliers(&values, None).is_ok() {
+            return Ok(());
+        }
+        // Only a failing column pays for reading the quote IDs.
+        let quote_ids = quote_id
+            .map(|id_column| extract_quote_ids_column(&df, id_column))
+            .transpose()?;
+        validate_base_multipliers(&values, quote_ids.as_deref())
+            .map_err(|e| builder_error(Some(column), e))
+    })
+}
+
+/// A base-multiplier column is neither the quote ID nor a factor.
+fn validate_base_column_role(
+    column: &str,
+    quote_id: Option<&str>,
+    factor_specs: &[Vec<String>],
+) -> PyResult<()> {
+    if quote_id == Some(column) {
+        return Err(PyValueError::new_err(format!(
+            "base_multiplier column '{column}' is also the quote_id column"
+        )));
+    }
+    if let Some(i) = factor_specs
+        .iter()
+        .position(|spec| spec.iter().any(|c| c == column))
+    {
+        return Err(PyValueError::new_err(format!(
+            "base_multiplier column '{column}' is also named by factor_specs[{i}]; \
+             a base multiplier is not a factor"
+        )));
+    }
+    Ok(())
+}
+
+/// Read a base-multiplier column as f32, the kernel's width. A null becomes
+/// NaN, which `validate_base_multipliers` rejects with the other invalid
+/// values, so a cast that overflows or underflows f32 is caught there too.
+fn extract_base_multiplier_column(df: &DataFrame, column: &str) -> PyResult<Vec<f32>> {
+    let col = df.column(column).map_err(|_| {
+        PyValueError::new_err(format!(
+            "base_multiplier column '{column}' not found in factor source"
+        ))
+    })?;
+    if !col.dtype().is_float() {
+        return Err(PyValueError::new_err(format!(
+            "base_multiplier column '{column}' must be a float dtype, got {}",
+            col.dtype()
+        )));
+    }
+    let cast = col.cast(&DataType::Float32).map_err(|e| {
+        PyValueError::new_err(format!(
+            "base_multiplier column '{column}' cannot be converted to f32: {e}"
+        ))
+    })?;
+    let values = cast.f32().map_err(|e| {
+        PyValueError::new_err(format!(
+            "base_multiplier column '{column}' cannot be read as f32: {e}"
+        ))
+    })?;
+    Ok(values.iter().map(|v| v.unwrap_or(f32::NAN)).collect())
+}
+
+/// A builder error, naming the column when it is about the base multiplier.
+fn builder_error(base_multiplier: Option<&str>, error: PriceContourError) -> PyErr {
+    match (base_multiplier, &error) {
+        (Some(column), PriceContourError::InvalidBaseMultiplier(_)) => {
+            PyValueError::new_err(format!("base_multiplier column '{column}': {error}"))
+        }
+        _ => PyValueError::new_err(format!("{error}")),
+    }
 }
 
 /// Shared cross-validation for the two public constructors: if both
@@ -388,18 +536,22 @@ fn append_dataframe_chunk(
     quote_id: Option<&str>,
     factor_specs: &[Vec<String>],
     separator: &str,
+    base_multiplier: Option<&str>,
 ) -> PyResult<()> {
     let quote_ids: Option<Vec<String>> = match quote_id {
         Some(col_name) => Some(extract_quote_ids_column(df, col_name)?),
         None => None,
     };
+    let base_values: Option<Vec<f32>> = base_multiplier
+        .map(|column| extract_base_multiplier_column(df, column))
+        .transpose()?;
     let mut chunk_labels: Vec<Vec<String>> = Vec::with_capacity(factor_specs.len());
     for spec in factor_specs {
         let labels = build_spec_labels(df, spec, separator)?;
         chunk_labels.push(labels);
     }
     builder
-        .append(quote_ids.as_deref(), chunk_labels)
+        .append_with_base(quote_ids.as_deref(), chunk_labels, base_values.as_deref())
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     Ok(())
 }

@@ -142,6 +142,40 @@ tables = result.to_rating_entries()
 
 Every reported ratebook total is the **canonical evaluation** of the final factor tables: each quote is priced at the grid step nearest the f32 product of its factor values (products outside the grid clamp to the end steps; an exact midpoint goes to the lower step). `evaluate()` runs the same kernel, so it reproduces a result's totals and `quote_results` exactly.
 
+#### Starting from an existing rate card
+
+To change today's rate card rather than build one from scratch, give each quote a **base multiplier**: a float column on the per-quote factors frame, named by `base_multiplier`. Each quote is priced at the grid step nearest `base × product of factor values`, so `factor_tables` hold rates **relative to the base**. With `candidate_min = exp(-b)` and `candidate_max = exp(b)`, every level stays within `±b` of its current log-relativity.
+
+```python
+import math
+
+# A commission engine prices commission = 0.4 * sigmoid(sum of relativities).
+# The shared grid holds each commission's odds against the cap, c / (0.4 - c), so a
+# quote's odds are exp(sum of relativities), and base_odds = exp(sum of today's).
+optimiser = pc.RatebookOptimiser(
+    objective="conversion",
+    constraints={"profit": {"min_pct": 0.98}},
+    factor_columns=[["region"], ["scheme"]],
+    candidate_min=math.exp(-0.2),
+    candidate_max=math.exp(0.2),
+    candidate_steps=41,
+    base_multiplier="base_odds",
+)
+result = optimiser.solve(grid_df, factors_df)
+
+# Convert an optimised rate back to an additive relativity.
+new_relativity = today["region"]["North"] + math.log(result.factor_tables["region"]["North"])
+```
+
+With a base multiplier:
+
+- **The baseline is per quote.** `baseline_objective`, `baseline_constraints` and `min_pct` / `max_pct` thresholds use each quote at the step nearest its own base, so today's rate card. `baseline_scenario_value` raises, because there is no single value; `quote_results["baseline_step"]` has each quote's.
+- **"No change" is always available.** When the candidate range includes 1.0, the candidate nearest 1.0 becomes exactly 1.0, keeping `candidate_steps`.
+- **A level with no preference stays put.** When candidates tie exactly, the one closest to 1.0 wins.
+- **Rounding follows the grid's units.** The commission example rounds in odds, not commission, so a quote near a step boundary can land one step lower than rounding its commission would give.
+- **The column** may be any float dtype, is converted to f32, and must be positive and finite after conversion. `quote_results` gains `base_multiplier` and `baseline_step`, and its `factor_product` includes the base.
+- **Not supported:** ratio constraints, and discovering factors automatically. Pass `factor_columns`.
+
 ### Live scoring with stored lambdas
 
 Apply pre-computed Lagrange multipliers to new quotes in a single forward pass, with no iteration. Use this in production to score individual quotes using lambdas learned from a batch solve.
@@ -247,7 +281,7 @@ Constraints with numeric thresholds may be omitted from `threshold_ranges` — t
 
 Constraints are specified as a dictionary. There are two shapes:
 
-**Sum constraints** apply to a single column. The dict key is the column name in your DataFrame, the value specifies direction and threshold. Use ``min`` / ``max`` for absolute thresholds and ``min_pct`` / ``max_pct`` for thresholds expressed as a fraction of baseline (the portfolio totals at the baseline step: the scenario value nearest 1.0, compared in f32, lowest on a tie):
+**Sum constraints** apply to a single column. The dict key is the column name in your DataFrame, the value specifies direction and threshold. Use ``min`` / ``max`` for absolute thresholds and ``min_pct`` / ``max_pct`` for thresholds expressed as a fraction of baseline (the portfolio totals at the baseline step: the scenario value nearest 1.0, compared in f32, lowest on a tie; a ratebook with a [base multiplier](#starting-from-an-existing-rate-card) uses each quote's own step):
 
 ```python
 constraints = {
@@ -564,6 +598,8 @@ maturin develop
 | `frontier(df_or_grid, factors, *, threshold_ranges, n_points_per_dim=5, factor_columns=None, initial_lambdas=None, record_history=False)` | Sweep the efficient frontier via coordinate descent at each threshold. Returns `RatebookFrontierResult` (points plus each point's factor tables). `parallel=True` raises. `record_history=True` records each point's coordinate-descent trace in `point_history`. |
 | `summary(result)` | Package result into MLflow-ready dicts. |
 
+The constructor's `base_multiplier` names a float column on the factors frame; see [Starting from an existing rate card](#starting-from-an-existing-rate-card). When `factors` is a prebuilt `RatebookFactorContexts`, build it with the same `base_multiplier` (`RatebookFactorContexts.from_dataframe` and `build_ratebook_factor_contexts_from_parquet_chunked` both accept it); a mismatch raises.
+
 ### ApplyOptimiser
 
 | Method | Description |
@@ -642,19 +678,20 @@ Returned by `apply_lambdas_to_parquet_chunked`. Carries the same aggregate total
 | `total_objective` | `float` | Objective of the canonical evaluation of `factor_tables`. |
 | `total_constraints` | `dict[str, float]` | Constraint totals of the canonical evaluation. |
 | `constraint_bounds` | `dict[str, float]` | Absolute bound of each constraint. |
-| `baseline_objective` | `float` | Objective at the baseline step (the scenario value nearest 1.0, f32, lowest on a tie). |
+| `baseline_objective` | `float` | Objective at the baseline step (the scenario value nearest 1.0, f32, lowest on a tie), or at each quote's own step with a base multiplier. |
 | `baseline_constraints` | `dict[str, float]` | Constraints at the baseline step. |
-| `baseline_scenario_value` | `float` | Scenario value of the baseline step. |
+| `baseline_scenario_value` | `float` | Scenario value of the baseline step. Raises `ResultUnavailableError` with a base multiplier. |
+| `base_multiplier` | `str \| None` | The base-multiplier column these tables are relative to, or `None`. |
 | `scenario_values` | `tuple[float, ...]` | The grid's scenario values, ascending. |
 | `converged` | `bool` | Coordinate descent converged (factor values stopped moving). Not a feasibility check. |
 | `cd_iterations` | `int` | Coordinate descent passes. |
 | `clamp_rate` | `float` | Search-space diagnostic: the mean, over every grouped solve, of the fraction of (quote, candidate) targets that fell strictly outside the scenario range. It does not count quotes at a grid edge. |
 | `n_quotes` | `int` | Quotes evaluated. |
 | `n_quotes_clamped_low` / `n_quotes_clamped_high` | `int` | Quotes whose factor product lies strictly below / above the scenario range. |
-| `quote_results` | `pl.DataFrame` | Per-quote evaluation: `quote_id`, `optimal_step`, `optimal_scenario_value`, `optimal_objective`, `optimal_<c>`, `factor_product`, `clamped_low`, `clamped_high` (`quote_results_schema(constraint_names)`). Not persisted: raises `ResultUnavailableError` on a loaded result; use `evaluate()`. |
+| `quote_results` | `pl.DataFrame` | Per-quote evaluation: `quote_id`, `optimal_step`, `optimal_scenario_value`, `optimal_objective`, `optimal_<c>`, `factor_product`, `clamped_low`, `clamped_high` (`quote_results_schema(constraint_names)`). With a base multiplier, `factor_product` includes the base and the frame gains `base_multiplier` and `baseline_step` (`quote_results_schema(constraint_names, base_multiplier=True)`). Not persisted: raises `ResultUnavailableError` on a loaded result; use `evaluate()`. |
 | `per_factor_results` | `tuple[PerFactorRecord, ...]` | One record per inner grouped solve, with explicit `cd_iteration`, `factor`, `factor_index`, totals, λ, `clamp_rate`, `inner_iterations`, `inner_converged`. |
-| `save(path)` | | Save to a directory (format 2: config.json plus one JSON per factor). Factor names that map to the same file name raise. |
-| `RatebookResult.load(path)` | | Load format 1 or 2. Rejects unknown keys and missing factor files; fields a format-1 save lacks raise `ResultUnavailableError`. |
+| `save(path)` | | Save to a directory (format 2, or format 3 with a base multiplier: config.json plus one JSON per factor). Factor names that map to the same file name raise. |
+| `RatebookResult.load(path)` | | Load format 1, 2 or 3. Rejects unknown keys and missing factor files; fields a format-1 save lacks raise `ResultUnavailableError`. |
 | `to_rating_entries()` | `dict[str, pl.DataFrame]` | Convert to rating-step DataFrames. |
 
 ### Utility functions

@@ -254,3 +254,106 @@ class TestFullPortfolio:
         cold = solver.solve(df)
         warm = solver.solve(df, lambdas=cold.lambdas)
         assert warm.iterations <= cold.iterations
+
+
+def _solve_online(df: pl.DataFrame, _tmp: Path) -> object:
+    return pc.OnlineOptimiser(objective="expected_income").solve(df)
+
+
+def _apply_frame(df: pl.DataFrame, _tmp: Path) -> object:
+    return pc.ApplyOptimiser(lambdas={}, objective="expected_income").apply(df)
+
+
+def _one_shot_parquet(df: pl.DataFrame, tmp: Path) -> object:
+    path = tmp / "grid.parquet"
+    df.write_parquet(path)
+    return pc.build_grid_from_parquet(str(path), [], objective="expected_income")
+
+
+DATAFRAME_PATHS = [
+    pytest.param(_solve_online, id="online"),
+    pytest.param(_apply_frame, id="apply"),
+]
+ALL_GRID_PATHS = [*DATAFRAME_PATHS, pytest.param(_one_shot_parquet, id="parquet")]
+
+
+class TestSharedScenarioGrid:
+    """Every quote must carry the first quote's grid (DESIGN_DECISIONS §17.7)."""
+
+    N_QUOTES = 12
+    N_STEPS = 3
+
+    def _book(self) -> pl.DataFrame:
+        return make_small_df(n_quotes=self.N_QUOTES, n_steps=self.N_STEPS)
+
+    @staticmethod
+    def _set_value(
+        df: pl.DataFrame, quote: str, step: int, value: float
+    ) -> pl.DataFrame:
+        hit = (pl.col("quote_id") == quote) & (pl.col("scenario_index") == step)
+        return df.with_columns(
+            pl.when(hit)
+            .then(pl.lit(value, dtype=pl.Float32))
+            .otherwise(pl.col("scenario_value"))
+            .alias("scenario_value")
+        )
+
+    @pytest.mark.parametrize("build", ALL_GRID_PATHS)
+    def test_a_second_quote_with_another_grid_raises(self, build, tmp_path):
+        rows = []
+        for q, grid in (
+            ("a", [0.5, 0.75, 1.0, 1.25, 1.5]),
+            ("b", [0.9, 0.95, 1.0, 1.05, 1.1]),
+        ):
+            for k, s in enumerate(grid):
+                rows.append(
+                    (q, k, s, -((s - 1.2) ** 2) if q == "a" else -((s - 0.95) ** 2))
+                )
+        df = pl.DataFrame(
+            rows,
+            schema=["quote_id", "scenario_index", "scenario_value", "expected_income"],
+            orient="row",
+        ).with_columns(
+            pl.col("scenario_index").cast(pl.Int32),
+            pl.col("scenario_value").cast(pl.Float32),
+            pl.col("expected_income").cast(pl.Float32),
+        )
+        with pytest.raises(ValueError, match="must share the same scenario grid"):
+            build(df, tmp_path)
+
+    @pytest.mark.parametrize("build", ALL_GRID_PATHS)
+    def test_a_mismatch_after_the_tenth_quote_raises(self, build, tmp_path):
+        df = self._set_value(self._book(), "Q0011", 1, 0.95)
+        with pytest.raises(
+            ValueError, match="Q0011.*must share the same scenario grid"
+        ):
+            build(df, tmp_path)
+
+    @pytest.mark.parametrize("build", ALL_GRID_PATHS)
+    def test_a_later_non_finite_value_raises(self, build, tmp_path):
+        df = self._set_value(self._book(), "Q0011", 2, float("inf"))
+        with pytest.raises(ValueError):
+            build(df, tmp_path)
+
+    @pytest.mark.parametrize("build", ALL_GRID_PATHS)
+    def test_matching_grids_are_accepted(self, build, tmp_path):
+        build(self._book(), tmp_path)
+
+    @staticmethod
+    def _split_inside_a_quote(df: pl.DataFrame, n_steps: int) -> pl.DataFrame:
+        cut = 5 * n_steps + 1
+        multi = pl.concat([df.head(cut), df.tail(df.height - cut)], rechunk=False)
+        assert multi["scenario_value"].n_chunks() == 2
+        return multi
+
+    @pytest.mark.parametrize("build", DATAFRAME_PATHS)
+    def test_a_chunk_boundary_may_split_a_quote(self, build, tmp_path):
+        build(self._split_inside_a_quote(self._book(), self.N_STEPS), tmp_path)
+
+    @pytest.mark.parametrize("build", DATAFRAME_PATHS)
+    def test_a_mismatch_in_a_later_chunk_raises(self, build, tmp_path):
+        df = self._set_value(self._book(), "Q0009", 2, 1.05)
+        with pytest.raises(
+            ValueError, match="Q0009.*must share the same scenario grid"
+        ):
+            build(self._split_inside_a_quote(df, self.N_STEPS), tmp_path)

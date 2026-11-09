@@ -13,6 +13,7 @@ use price_contour_core::{
     ConstraintSpec, QuoteGrid, SolveResult, SolverConfig,
 };
 
+use crate::builder_py::check_scenario_value;
 use crate::cancel_py::core_error;
 use crate::constraint_parsing::validate_constraints_dict;
 use crate::grid_py::PyQuoteGrid;
@@ -259,6 +260,8 @@ pub(crate) fn ingest_dataframe(
         }
     }
 
+    validate_shared_scenario_grid(mult_ca, &quote_ids, &scenario_values, scenario_value_col)?;
+
     let quote_id_fingerprint = fingerprint_quote_ids(&quote_ids);
     let grid = QuoteGrid {
         n_quotes,
@@ -273,6 +276,47 @@ pub(crate) fn ingest_dataframe(
     grid.validate()
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     Ok(grid)
+}
+
+/// Every quote must carry the first quote's scenario grid
+/// (`docs/DESIGN_DECISIONS.md` §17.7). Runs over every row, so it walks each
+/// chunk's contiguous values rather than looking rows up one at a time; a
+/// chunk boundary can fall inside a quote.
+fn validate_shared_scenario_grid(
+    mult_ca: &Float32Chunked,
+    quote_ids: &[String],
+    scenario_values: &[f32],
+    scenario_value_col: &str,
+) -> PyResult<()> {
+    if mult_ca.null_count() > 0 {
+        let row = mult_ca.iter().position(|v| v.is_none()).unwrap_or(0);
+        return Err(PyValueError::new_err(format!(
+            "Null {scenario_value_col} at row {row}"
+        )));
+    }
+    let n_steps = scenario_values.len();
+    let (mut quote, mut step) = (0usize, 0usize);
+    for chunk in mult_ca.downcast_iter() {
+        for &value in chunk.values().iter() {
+            // The first quote defines the grid; `QuoteGrid::validate` checks it.
+            if quote > 0 {
+                check_scenario_value(
+                    value,
+                    scenario_values[step],
+                    &quote_ids[quote],
+                    quote * n_steps + step,
+                    step,
+                    scenario_value_col,
+                )?;
+            }
+            step += 1;
+            if step == n_steps {
+                step = 0;
+                quote += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build result DataFrame from optimal_steps + QuoteGrid.
@@ -546,6 +590,25 @@ pub(crate) fn parse_constraints_polling(
     grid: &QuoteGrid,
     cancel: Option<&CancelFlag>,
 ) -> PyResult<Vec<ConstraintSpec>> {
+    parse_constraints_resolved(constraints, grid, cancel, None)
+}
+
+/// [`parse_constraints`] with `min_pct` / `max_pct` resolved against the given
+/// per-constraint baseline totals (`docs/DESIGN_DECISIONS.md` §17.3).
+pub(crate) fn parse_constraints_with_baseline(
+    constraints: HashMap<String, HashMap<String, Option<f64>>>,
+    grid: &QuoteGrid,
+    baseline_constraints: &[f64],
+) -> PyResult<Vec<ConstraintSpec>> {
+    parse_constraints_resolved(constraints, grid, None, Some(baseline_constraints))
+}
+
+fn parse_constraints_resolved(
+    constraints: HashMap<String, HashMap<String, Option<f64>>>,
+    grid: &QuoteGrid,
+    cancel: Option<&CancelFlag>,
+    given_baseline: Option<&[f64]>,
+) -> PyResult<Vec<ConstraintSpec>> {
     validate_constraints_dict(&constraints, grid)?;
 
     // First pass: every input error, before any O(n_quotes) work, so a
@@ -584,7 +647,9 @@ pub(crate) fn parse_constraints_polling(
     }
 
     // The baseline scan is O(n_quotes); only a pct bound needs it.
-    let baseline_totals = if parsed.iter().any(|&(.., is_pct)| is_pct) {
+    let baseline_totals = if let Some(given) = given_baseline {
+        given.to_vec()
+    } else if parsed.iter().any(|&(.., is_pct)| is_pct) {
         match cancel {
             None => grid.baseline_totals().1,
             Some(flag) => {

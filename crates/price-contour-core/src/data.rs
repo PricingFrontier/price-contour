@@ -116,7 +116,53 @@ impl QuoteGrid {
 
     fn baseline_totals_polling(&self, cancel: Option<&CancelFlag>) -> Result<(f64, Vec<f64>)> {
         let baseline_step = self.baseline_step();
+        self.totals_at_steps(|_| baseline_step, cancel)
+    }
 
+    /// Baseline totals with each quote at its own step: a ratebook with a base
+    /// multiplier (`docs/DESIGN_DECISIONS.md` §17.3).
+    pub fn baseline_totals_per_quote(&self, steps: &[u32]) -> Result<(f64, Vec<f64>)> {
+        self.baseline_totals_per_quote_polling(steps, None)
+    }
+
+    /// [`Self::baseline_totals_per_quote`], polling `cancel` every
+    /// [`CANCEL_POLL_QUOTES`] quotes.
+    pub fn baseline_totals_per_quote_cancellable(
+        &self,
+        steps: &[u32],
+        cancel: &CancelFlag,
+    ) -> Result<(f64, Vec<f64>)> {
+        self.baseline_totals_per_quote_polling(steps, Some(cancel))
+    }
+
+    fn baseline_totals_per_quote_polling(
+        &self,
+        steps: &[u32],
+        cancel: Option<&CancelFlag>,
+    ) -> Result<(f64, Vec<f64>)> {
+        if steps.len() != self.n_quotes {
+            return Err(PriceContourError::DimensionMismatch(format!(
+                "{} baseline steps for {} quotes",
+                steps.len(),
+                self.n_quotes
+            )));
+        }
+        if let Some(bad) = steps.iter().find(|&&s| s as usize >= self.n_steps) {
+            return Err(PriceContourError::InvalidValue(format!(
+                "baseline step {bad} is outside a grid of {} steps",
+                self.n_steps
+            )));
+        }
+        self.totals_at_steps(|q| steps[q] as usize, cancel)
+    }
+
+    /// Sum the objective and constraints in f64 with each quote at
+    /// `step_of(q)`. The one summation loop behind every baseline total.
+    fn totals_at_steps(
+        &self,
+        step_of: impl Fn(usize) -> usize,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<(f64, Vec<f64>)> {
         let mut obj_total: f64 = 0.0;
         let mut con_totals = vec![0.0f64; self.constraints.len()];
 
@@ -124,7 +170,7 @@ impl QuoteGrid {
             check_cancelled(cancel)?;
             let block_end = (block_start + CANCEL_POLL_QUOTES).min(self.n_quotes);
             for q in block_start..block_end {
-                let idx = q * self.n_steps + baseline_step;
+                let idx = q * self.n_steps + step_of(q);
                 obj_total += self.objective[idx] as f64;
                 for (k, con) in self.constraints.iter().enumerate() {
                     con_totals[k] += con[idx] as f64;
@@ -143,17 +189,46 @@ impl QuoteGrid {
     /// Returns `(baseline_obj, baseline_cons, scale_factors)`.
     pub fn compute_scale_factors(&self) -> (f64, Vec<f64>, Vec<f64>) {
         let (baseline_obj, baseline_cons) = self.baseline_totals();
+        let scale_factors = self.scale_factors_from_baseline(baseline_obj, &baseline_cons);
+        (baseline_obj, baseline_cons, scale_factors)
+    }
+
+    /// The per-constraint scale factors for the given baseline totals.
+    pub fn scale_factors_from_baseline(
+        &self,
+        baseline_obj: f64,
+        baseline_cons: &[f64],
+    ) -> Vec<f64> {
         let n_quotes = self.n_quotes.max(1) as f64;
         let obj_per_quote = baseline_obj / n_quotes;
-        let scale_factors = baseline_cons
+        baseline_cons
             .iter()
             .map(|&bc| {
                 let con_per_quote = bc / n_quotes;
                 (obj_per_quote / (con_per_quote.abs() + SCALE_EPSILON)).min(MAX_SCALE_FACTOR)
             })
-            .collect();
-        (baseline_obj, baseline_cons, scale_factors)
+            .collect()
     }
+}
+
+/// Every base multiplier must be finite and > 0 (`docs/DESIGN_DECISIONS.md`
+/// §17.5). The error gives how many are not and the first, by quote ID when
+/// `quote_ids` is supplied and by row otherwise. A null reaches here as NaN.
+pub fn validate_base_multipliers(values: &[f32], quote_ids: Option<&[String]>) -> Result<()> {
+    let is_invalid = |v: &f32| !v.is_finite() || *v <= 0.0;
+    let Some(first) = values.iter().position(is_invalid) else {
+        return Ok(());
+    };
+    let count = values.iter().filter(|v| is_invalid(v)).count();
+    let location = match quote_ids.and_then(|ids| ids.get(first)) {
+        Some(id) => format!("quote_id '{id}'"),
+        None => format!("row {first}"),
+    };
+    Err(PriceContourError::InvalidBaseMultiplier(format!(
+        "{count} invalid value(s) (null, NaN, infinite, zero or negative after conversion \
+         to f32); first at {location}: {}",
+        values[first]
+    )))
 }
 
 /// The baseline ("no price change") step of a scenario grid: the index of the
@@ -1531,6 +1606,98 @@ mod tests {
         let (obj, cons) = grid.baseline_totals();
         assert_eq!(obj, 3.0);
         assert_eq!(cons, vec![1.0]);
+    }
+
+    /// Cell (q, k): objective 100q + k, volume 10q + k.
+    fn per_quote_grid() -> QuoteGrid {
+        QuoteGrid {
+            n_quotes: 3,
+            n_steps: 3,
+            scenario_values: vec![0.5, 1.0, 2.0],
+            objective: vec![0.0, 1.0, 2.0, 100.0, 101.0, 102.0, 200.0, 201.0, 202.0],
+            constraints: vec![vec![0.0, 1.0, 2.0, 10.0, 11.0, 12.0, 20.0, 21.0, 22.0]],
+            constraint_names: vec!["volume".to_string()],
+            quote_ids: vec!["Q0".to_string(), "Q1".to_string(), "Q2".to_string()],
+            quote_id_fingerprint: 0,
+        }
+    }
+
+    #[test]
+    fn test_baseline_totals_per_quote_reads_each_quotes_step() {
+        let (obj, cons) = per_quote_grid()
+            .baseline_totals_per_quote(&[2, 0, 1])
+            .unwrap();
+        assert_eq!(obj, 2.0 + 100.0 + 201.0);
+        assert_eq!(cons, vec![2.0 + 10.0 + 21.0]);
+    }
+
+    #[test]
+    fn test_baseline_totals_per_quote_with_one_step_matches_the_grid_baseline() {
+        let grid = per_quote_grid();
+        let step = grid.baseline_step() as u32;
+        assert_eq!(
+            grid.baseline_totals_per_quote(&[step; 3]).unwrap(),
+            grid.baseline_totals()
+        );
+    }
+
+    #[test]
+    fn test_baseline_totals_per_quote_cancellable() {
+        let grid = per_quote_grid();
+        let steps = [2, 0, 1];
+        let flag = CancelFlag::new();
+        assert_eq!(
+            grid.baseline_totals_per_quote_cancellable(&steps, &flag)
+                .unwrap(),
+            grid.baseline_totals_per_quote(&steps).unwrap()
+        );
+        flag.cancel();
+        assert!(matches!(
+            grid.baseline_totals_per_quote_cancellable(&steps, &flag),
+            Err(PriceContourError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn test_baseline_totals_per_quote_rejects_bad_steps() {
+        let grid = per_quote_grid();
+        let err = grid.baseline_totals_per_quote(&[0, 0]).unwrap_err();
+        assert!(format!("{err}").contains("2 baseline steps for 3 quotes"));
+        let err = grid.baseline_totals_per_quote(&[0, 3, 0]).unwrap_err();
+        assert!(format!("{err}").contains("baseline step 3"));
+    }
+
+    #[test]
+    fn test_scale_factors_from_baseline_match_compute_scale_factors() {
+        let grid = per_quote_grid();
+        let (obj, cons, scale) = grid.compute_scale_factors();
+        assert_eq!(grid.scale_factors_from_baseline(obj, &cons), scale);
+    }
+
+    #[test]
+    fn test_validate_base_multipliers_accepts_finite_positive_values() {
+        assert!(validate_base_multipliers(&[f32::MIN_POSITIVE, 1.0, 39.0], None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_base_multipliers_counts_and_names_the_first_by_quote() {
+        let ids: Vec<String> = ["Q0", "Q1", "Q2", "Q3"].map(String::from).to_vec();
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            let err = validate_base_multipliers(&[1.0, bad, 1.0, bad], Some(&ids)).unwrap_err();
+            assert!(matches!(err, PriceContourError::InvalidBaseMultiplier(_)));
+            let msg = format!("{err}");
+            assert!(msg.contains("2 invalid"), "{msg}");
+            assert!(msg.contains("quote_id 'Q1'"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_validate_base_multipliers_uses_a_row_without_quote_ids() {
+        let msg = format!(
+            "{}",
+            validate_base_multipliers(&[1.0, 0.0], None).unwrap_err()
+        );
+        assert!(msg.contains("1 invalid") && msg.contains("row 1"), "{msg}");
     }
 
     #[test]

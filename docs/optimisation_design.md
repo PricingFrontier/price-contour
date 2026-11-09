@@ -392,14 +392,15 @@ Input:
   thresholds:    (K,) constraint thresholds
 
 Initialise:
-  factor_values[f] = current factor values for each factor f
+  factor_values[f] = 1.0 for every level of every factor f
+  base_i           = the quote's base multiplier (1.0 when none is set)
 
 Outer loop (cycle through factors until convergence):
 
   For each factor f:
 
     Hold all other factors fixed. Compute the "residual price" for each risk:
-      residual_i = base × Π_{g ≠ f} factor_g[level_g_i]
+      residual_i = base_i × Π_{g ≠ f} factor_g[level_g_i]
 
     Now the price for risk i depends only on factor f:
       price_i = residual_i × factor_f[level_f_i]
@@ -424,7 +425,7 @@ Outer loop (cycle through factors until convergence):
 
 For factor `f` with `L` levels, and `N_l` risks at each level:
 
-- Generate candidate values for each level (e.g. current value × scenario value grid)
+- Candidate values come from one fixed range shared by every factor and level: `candidate_min` to `candidate_max` in `candidate_steps` even steps. They are rates relative to the quote's base. With a base multiplier, the candidate nearest 1.0 is replaced by exactly 1.0, and an exact tie goes to the candidate closest to 1.0 (DESIGN_DECISIONS §17.4)
 - For each candidate, compute the resulting prices for all risks at that level
 - Evaluate objective and constraints
 - Use the Lagrangian to find optimal values subject to portfolio constraints

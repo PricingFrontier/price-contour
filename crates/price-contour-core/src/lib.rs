@@ -8,9 +8,10 @@ pub mod solver;
 
 pub use cancel::{check_cancelled, CancelFlag};
 pub use data::{
-    baseline_step, build_group_mapping, fingerprint_quote_ids, ApplyResult, ConstraintDirection,
-    ConstraintSpec, GroupMapping, GroupedSolveResult, IterationHistory, IterationRecord,
-    LambdaStrategy, QuoteGrid, QuoteGridBuilder, SolveResult, SolverConfig,
+    baseline_step, build_group_mapping, fingerprint_quote_ids, validate_base_multipliers,
+    ApplyResult, ConstraintDirection, ConstraintSpec, GroupMapping, GroupedSolveResult,
+    IterationHistory, IterationRecord, LambdaStrategy, QuoteGrid, QuoteGridBuilder, SolveResult,
+    SolverConfig,
 };
 pub use error::{PriceContourError, Result};
 pub use factor_context::{FactorContextBuilder, FactorContextsBuilt};
@@ -20,6 +21,8 @@ pub use frontier::{
 };
 pub use solver::{
     apply_lambdas, apply_lambdas_cancellable, check_specs_cover_grid, compute_lambda_signs_f32,
-    evaluate_ratebook, evaluate_ratebook_cancellable, lagrangian_argmax_pass,
-    lagrangian_argmax_pass_cancellable, solve_grouped, solve_online, RatebookEvaluation,
+    evaluate_ratebook, evaluate_ratebook_cancellable, evaluate_ratebook_with_base,
+    evaluate_ratebook_with_base_cancellable, lagrangian_argmax_pass,
+    lagrangian_argmax_pass_cancellable, quote_baseline_steps, solve_grouped,
+    solve_grouped_with_base, solve_online, GroupedBaseline, RatebookEvaluation,
 };

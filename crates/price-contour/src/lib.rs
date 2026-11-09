@@ -53,6 +53,10 @@ fn _price_contour(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ratebook_helpers_py::PyFactorContext>()?;
     m.add_class::<factor_context_py::PyRatebookFactorContexts>()?;
     m.add_function(wrap_pyfunction!(
+        factor_context_py::validate_base_multiplier_column_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         factor_context_py::build_ratebook_factor_contexts_from_parquet_chunked_py,
         m
     )?)?;

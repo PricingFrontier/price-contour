@@ -11,6 +11,11 @@ pub enum PriceContourError {
     #[error("Data validation: {0}")]
     DataValidation(String),
 
+    /// A ratebook base multiplier is not finite and positive. A separate
+    /// variant so a binding can name the column the values came from.
+    #[error("Invalid base multiplier: {0}")]
+    InvalidBaseMultiplier(String),
+
     /// The caller's [`crate::CancelFlag`] was set while the call ran.
     #[error("cancelled")]
     Cancelled,

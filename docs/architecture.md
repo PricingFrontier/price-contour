@@ -673,7 +673,7 @@ The primary constraint type. The constraint is on the portfolio aggregate:
 
 ### Threshold modes
 
-**Relative**: The threshold is a fraction of the baseline value (portfolio total at scenario_value=1.0, or the nearest step). The library computes the baseline from the input data automatically.
+**Relative**: The threshold is a fraction of the baseline value (portfolio total at scenario_value=1.0, or the nearest step; a ratebook with a base multiplier totals each quote at the step nearest its own base, DESIGN_DECISIONS §17.3). The library computes the baseline from the input data automatically.
 
 ```python
 constraints={

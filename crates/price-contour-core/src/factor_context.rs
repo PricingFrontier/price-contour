@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::data::{fingerprint_quote_ids, GroupMapping};
+use crate::data::{fingerprint_quote_ids, validate_base_multipliers, GroupMapping};
 use crate::error::{PriceContourError, Result};
 
 /// Per-factor build state held across chunks. Owned in `FactorContextBuilder`
@@ -74,6 +74,9 @@ pub struct FactorContextsBuilt {
     /// fingerprint — otherwise downstream solvers reject the contexts
     /// because order cannot be proven.
     pub quote_id_fingerprint: Option<u64>,
+    /// Per-quote base multipliers in the final quote order, when the builder
+    /// was given them (`docs/DESIGN_DECISIONS.md` §17.1).
+    pub base_multiplier: Option<Vec<f32>>,
 }
 
 /// Internal chunked builder for ratebook factor contexts.
@@ -91,6 +94,9 @@ pub struct FactorContextBuilder {
     /// chunk. Once a chunk arrives without one, the contract is
     /// inconsistent and `append` rejects it.
     quote_ids_supplied: Option<bool>,
+    base_multiplier: Vec<f32>,
+    /// The same all-or-none contract as `quote_ids_supplied`.
+    base_supplied: Option<bool>,
     n_quotes: usize,
     finalised: bool,
 }
@@ -107,6 +113,8 @@ impl FactorContextBuilder {
             per_factor: (0..n_factors).map(|_| PerFactorState::new()).collect(),
             quote_ids: Vec::new(),
             quote_ids_supplied: None,
+            base_multiplier: Vec::new(),
+            base_supplied: None,
             n_quotes: 0,
             finalised: false,
         }
@@ -142,6 +150,18 @@ impl FactorContextBuilder {
         quote_ids_chunk: Option<&[String]>,
         chunk_labels: Vec<Vec<String>>,
     ) -> Result<()> {
+        self.append_with_base(quote_ids_chunk, chunk_labels, None)
+    }
+
+    /// [`Self::append`] carrying one base multiplier per row. Base multipliers
+    /// follow the same all-or-none contract across chunks as quote IDs, are
+    /// validated at `build()`, and are reordered with the factors.
+    pub fn append_with_base(
+        &mut self,
+        quote_ids_chunk: Option<&[String]>,
+        chunk_labels: Vec<Vec<String>>,
+        base_chunk: Option<&[f32]>,
+    ) -> Result<()> {
         if self.finalised {
             return Err(PriceContourError::InvalidValue(
                 "FactorContextBuilder already finalised".into(),
@@ -175,25 +195,27 @@ impl FactorContextBuilder {
                 )));
             }
         }
-
-        // Enforce quote-id consistency across the lifetime of the
-        // builder. The first append establishes the contract; later
-        // appends must match.
-        let chunk_has_qids = quote_ids_chunk.is_some();
-        match self.quote_ids_supplied {
-            None => {
-                self.quote_ids_supplied = Some(chunk_has_qids);
-            }
-            Some(prev) if prev != chunk_has_qids => {
-                return Err(PriceContourError::InvalidValue(format!(
-                    "FactorContextBuilder quote_id contract changed mid-stream \
-                     (previous chunks {}supplied quote_ids; this chunk {}supplied them)",
-                    if prev { "" } else { "did not " },
-                    if chunk_has_qids { "" } else { "did not " }
+        if let Some(base) = base_chunk {
+            if base.len() != chunk_rows {
+                return Err(PriceContourError::DimensionMismatch(format!(
+                    "base multiplier chunk has {} rows but factor labels have {chunk_rows}",
+                    base.len()
                 )));
             }
-            _ => {}
         }
+
+        // Enforce consistency across the lifetime of the builder. The
+        // first append establishes each contract; later appends must match.
+        enforce_chunk_contract(
+            &mut self.quote_ids_supplied,
+            quote_ids_chunk.is_some(),
+            "quote_id",
+        )?;
+        enforce_chunk_contract(
+            &mut self.base_supplied,
+            base_chunk.is_some(),
+            "base_multiplier",
+        )?;
 
         // Empty chunks are a no-op.
         if chunk_rows == 0 {
@@ -202,6 +224,9 @@ impl FactorContextBuilder {
 
         if let Some(qids) = quote_ids_chunk {
             self.quote_ids.extend_from_slice(qids);
+        }
+        if let Some(base) = base_chunk {
+            self.base_multiplier.extend_from_slice(base);
         }
 
         // Intern labels per factor in append order. The renumbering in
@@ -274,6 +299,15 @@ impl FactorContextBuilder {
         }
 
         let quote_ids_supplied = self.quote_ids_supplied.unwrap_or(false);
+        let base_supplied = self.base_supplied.unwrap_or(false);
+        if base_supplied {
+            // In source order, over every chunk, so the count covers the
+            // whole input.
+            validate_base_multipliers(
+                &self.base_multiplier,
+                quote_ids_supplied.then_some(self.quote_ids.as_slice()),
+            )?;
+        }
 
         // Build the post-reorder quote order and (optionally) a
         // source->target permutation for every factor's group_of array.
@@ -326,7 +360,7 @@ impl FactorContextBuilder {
                 ..
             } = state;
             if let Some(perm) = permutation.as_ref() {
-                apply_permutation_u32(perm, &mut group_of);
+                apply_permutation(perm, &mut group_of);
             }
             let (final_group_of, final_labels) = renumber_first_encounter(group_of, group_labels);
             let n_groups = final_labels.len();
@@ -337,11 +371,38 @@ impl FactorContextBuilder {
             });
         }
 
+        let base_multiplier = base_supplied.then(|| {
+            let mut values = std::mem::take(&mut self.base_multiplier);
+            if let Some(perm) = permutation.as_ref() {
+                apply_permutation(perm, &mut values);
+            }
+            values
+        });
+
         Ok(FactorContextsBuilt {
             group_mappings,
             quote_ids: final_quote_ids,
             quote_id_fingerprint: fingerprint,
+            base_multiplier,
         })
+    }
+}
+
+/// Fix or check a per-chunk all-or-none contract: the first append establishes
+/// whether `what` is supplied, and every later append must match.
+fn enforce_chunk_contract(slot: &mut Option<bool>, supplied: bool, what: &str) -> Result<()> {
+    match *slot {
+        None => {
+            *slot = Some(supplied);
+            Ok(())
+        }
+        Some(prev) if prev != supplied => Err(PriceContourError::InvalidValue(format!(
+            "FactorContextBuilder {what} contract changed mid-stream \
+             (previous chunks {}supplied {what}s; this chunk {}supplied them)",
+            if prev { "" } else { "did not " },
+            if supplied { "" } else { "did not " }
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -389,8 +450,9 @@ fn build_reorder_permutation(source: &[String], expected: &[String]) -> Result<V
     Ok(perm)
 }
 
-/// Apply `perm` to `data` out-of-place into a fresh `Vec<u32>`. Used for
-/// factor `group_of` reorder where `data[perm[i]]` becomes `out[i]`.
+/// Apply `perm` to `data` out-of-place into a fresh `Vec`. Used for the
+/// factor `group_of` and base-multiplier reorders, where `data[perm[i]]`
+/// becomes `out[i]`.
 ///
 /// We allocate a fresh buffer (O(n) extra memory per factor) rather than
 /// the cycle-following in-place permutation used by `QuoteGridBuilder`.
@@ -399,9 +461,9 @@ fn build_reorder_permutation(source: &[String], expected: &[String]) -> Result<V
 /// the wider quote-grid arrays. Cycle decomposition would save the
 /// allocation but adds bitmap state and is harder to get right; the
 /// trade-off doesn't pay here.
-fn apply_permutation_u32(perm: &[usize], data: &mut Vec<u32>) {
+fn apply_permutation<T: Copy + Default>(perm: &[usize], data: &mut Vec<T>) {
     debug_assert_eq!(perm.len(), data.len());
-    let mut out = vec![0u32; data.len()];
+    let mut out = vec![T::default(); data.len()];
     for (target, &src) in perm.iter().enumerate() {
         out[target] = data[src];
     }
@@ -682,6 +744,84 @@ mod tests {
         let built = b.build(None, None).unwrap();
         assert_eq!(built.group_mappings[0].group_labels, vec!["a", "b", "c"]);
         assert_eq!(built.group_mappings[0].group_of, vec![0, 1, 0, 2]);
+    }
+
+    #[test]
+    fn test_base_multiplier_follows_the_reorder_across_chunks() {
+        let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
+        b.append_with_base(
+            Some(&[s("Q2"), s("Q0")]),
+            vec![vec![s("A"), s("B")]],
+            Some(&[2.0, 0.5]),
+        )
+        .unwrap();
+        b.append_with_base(Some(&[s("Q1")]), vec![vec![s("C")]], Some(&[1.5]))
+            .unwrap();
+        let expected = vec![s("Q0"), s("Q1"), s("Q2")];
+        let built = b.build(Some(&expected), None).unwrap();
+        assert_eq!(built.base_multiplier, Some(vec![0.5, 1.5, 2.0]));
+        assert_eq!(built.group_mappings[0].group_labels, vec!["B", "C", "A"]);
+        // The fingerprint covers quote IDs only.
+        assert_eq!(
+            built.quote_id_fingerprint,
+            Some(fingerprint_quote_ids(&expected))
+        );
+    }
+
+    #[test]
+    fn test_no_base_multiplier_builds_none() {
+        let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
+        b.append(None, vec![vec![s("a")]]).unwrap();
+        assert_eq!(b.build(None, None).unwrap().base_multiplier, None);
+    }
+
+    #[test]
+    fn test_base_multiplier_contract_changes_mid_stream() {
+        let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
+        b.append_with_base(None, vec![vec![s("a")]], Some(&[1.0]))
+            .unwrap();
+        let msg = format!("{}", b.append(None, vec![vec![s("b")]]).unwrap_err());
+        assert!(msg.contains("base_multiplier contract changed"), "{msg}");
+
+        let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
+        b.append(None, vec![vec![s("a")]]).unwrap();
+        let err = b
+            .append_with_base(None, vec![vec![s("b")]], Some(&[1.0]))
+            .unwrap_err();
+        assert!(format!("{err}").contains("contract changed"), "{err}");
+    }
+
+    #[test]
+    fn test_base_multiplier_chunk_length_must_match() {
+        let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
+        let err = b
+            .append_with_base(None, vec![vec![s("a"), s("b")]], Some(&[1.0]))
+            .unwrap_err();
+        assert!(format!("{err}").contains("base multiplier chunk"), "{err}");
+    }
+
+    #[test]
+    fn test_invalid_base_multipliers_are_counted_over_every_chunk() {
+        let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
+        b.append_with_base(Some(&[s("Q0")]), vec![vec![s("a")]], Some(&[1.0]))
+            .unwrap();
+        b.append_with_base(Some(&[s("Q1")]), vec![vec![s("a")]], Some(&[-1.0]))
+            .unwrap();
+        b.append_with_base(Some(&[s("Q2")]), vec![vec![s("a")]], Some(&[f32::NAN]))
+            .unwrap();
+        let err = b.build(None, None).unwrap_err();
+        assert!(matches!(err, PriceContourError::InvalidBaseMultiplier(_)));
+        let msg = format!("{err}");
+        assert!(msg.contains("2 invalid") && msg.contains("Q1"), "{msg}");
+    }
+
+    #[test]
+    fn test_invalid_base_multiplier_without_quote_ids_reports_a_row() {
+        let mut b = FactorContextBuilder::new(vec![vec![s("f")]]);
+        b.append_with_base(None, vec![vec![s("a"), s("a")]], Some(&[1.0, 0.0]))
+            .unwrap();
+        let msg = format!("{}", b.build(None, None).unwrap_err());
+        assert!(msg.contains("row 1"), "{msg}");
     }
 
     #[test]
