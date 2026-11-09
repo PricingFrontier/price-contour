@@ -12,7 +12,7 @@ use rayon::prelude::*;
 
 use crate::cancel::{check_cancelled, is_cancelled, CancelFlag};
 use crate::constants::RECONSTRUCT_PAR_GRAIN;
-use crate::data::{GroupMapping, QuoteGrid};
+use crate::data::{validate_base_multipliers, GroupMapping, QuoteGrid};
 use crate::error::{PriceContourError, Result};
 use crate::solver::grouped::nearest_step;
 
@@ -20,7 +20,8 @@ use crate::solver::grouped::nearest_step;
 #[derive(Debug, Clone)]
 pub struct RatebookEvaluation {
     /// Per-quote product of its factor values, in f32, multiplied left to
-    /// right in factor order starting from 1.0 (length `n_quotes`).
+    /// right in factor order starting from 1.0, or from the quote's base
+    /// multiplier when there is one (length `n_quotes`).
     pub factor_product: Vec<f32>,
     /// Per-quote grid step the product maps to (length `n_quotes`).
     pub optimal_steps: Vec<u32>,
@@ -62,7 +63,7 @@ pub fn evaluate_ratebook(
     mappings: &[&GroupMapping],
     factor_values: &[&[f32]],
 ) -> Result<RatebookEvaluation> {
-    evaluate_ratebook_polling(grid, mappings, factor_values, None)
+    evaluate_ratebook_polling(grid, mappings, factor_values, None, None)
 }
 
 /// [`evaluate_ratebook`], polling `cancel` once per
@@ -74,17 +75,51 @@ pub fn evaluate_ratebook_cancellable(
     factor_values: &[&[f32]],
     cancel: &CancelFlag,
 ) -> Result<RatebookEvaluation> {
-    evaluate_ratebook_polling(grid, mappings, factor_values, Some(cancel))
+    evaluate_ratebook_polling(grid, mappings, factor_values, None, Some(cancel))
+}
+
+/// [`evaluate_ratebook`] for a ratebook with a base multiplier: each quote is
+/// priced at the grid step nearest `base[q] × its factor values`
+/// (`docs/DESIGN_DECISIONS.md` §17.2).
+pub fn evaluate_ratebook_with_base(
+    grid: &QuoteGrid,
+    mappings: &[&GroupMapping],
+    factor_values: &[&[f32]],
+    base: &[f32],
+) -> Result<RatebookEvaluation> {
+    evaluate_ratebook_polling(grid, mappings, factor_values, Some(base), None)
+}
+
+/// [`evaluate_ratebook_with_base`], polling `cancel` as
+/// [`evaluate_ratebook_cancellable`] does.
+pub fn evaluate_ratebook_with_base_cancellable(
+    grid: &QuoteGrid,
+    mappings: &[&GroupMapping],
+    factor_values: &[&[f32]],
+    base: &[f32],
+    cancel: &CancelFlag,
+) -> Result<RatebookEvaluation> {
+    evaluate_ratebook_polling(grid, mappings, factor_values, Some(base), Some(cancel))
+}
+
+/// The grid step each quote's base multiplier prices at: its baseline with
+/// every factor at 1.0 (`docs/DESIGN_DECISIONS.md` §17.3). `scenario_values`
+/// must be a validated grid and `base` validated values.
+pub fn quote_baseline_steps(scenario_values: &[f32], base: &[f32]) -> Vec<u32> {
+    base.par_iter()
+        .map(|&m| nearest_step(scenario_values, m).0 as u32)
+        .collect()
 }
 
 fn evaluate_ratebook_polling(
     grid: &QuoteGrid,
     mappings: &[&GroupMapping],
     factor_values: &[&[f32]],
+    base: Option<&[f32]>,
     cancel: Option<&CancelFlag>,
 ) -> Result<RatebookEvaluation> {
     grid.validate()?;
-    validate_inputs(grid, mappings, factor_values)?;
+    validate_inputs(grid, mappings, factor_values, base)?;
     check_cancelled(cancel)?;
 
     let n_quotes = grid.n_quotes;
@@ -122,7 +157,7 @@ fn evaluate_ratebook_polling(
             }
             for local_i in 0..products.len() {
                 let i = start + local_i;
-                let mut product = 1.0f32;
+                let mut product = base.map_or(1.0f32, |b| b[i]);
                 for (mapping, values) in mappings.iter().zip(factor_values.iter()) {
                     product *= values[mapping.group_of[i] as usize];
                 }
@@ -177,7 +212,18 @@ fn validate_inputs(
     grid: &QuoteGrid,
     mappings: &[&GroupMapping],
     factor_values: &[&[f32]],
+    base: Option<&[f32]>,
 ) -> Result<()> {
+    if let Some(base) = base {
+        if base.len() != grid.n_quotes {
+            return Err(PriceContourError::DimensionMismatch(format!(
+                "{} base multipliers for {} quotes",
+                base.len(),
+                grid.n_quotes
+            )));
+        }
+        validate_base_multipliers(base, Some(&grid.quote_ids))?;
+    }
     if mappings.is_empty() {
         return Err(PriceContourError::InvalidValue(
             "ratebook evaluation needs at least one factor".into(),
@@ -290,6 +336,83 @@ mod tests {
         let (va, vb, vc) = (1.1f32, 0.93f32, 1.07f32);
         let eval = evaluate_ratebook(&grid, &[&fa, &fb, &fc], &[&[va], &[vb], &[vc]]).unwrap();
         assert_eq!(eval.factor_product[0], ((1.0f32 * va) * vb) * vc);
+    }
+
+    #[test]
+    fn product_starts_from_the_base() {
+        let grid = indexed_grid(vec![0.5, 1.0, 1.5], 1);
+        let fa = build_group_mapping(&labels(&["l"]));
+        let fb = build_group_mapping(&labels(&["l"]));
+        let (m, va, vb) = (1.3f32, 0.93f32, 1.07f32);
+        let eval = evaluate_ratebook_with_base(&grid, &[&fa, &fb], &[&[va], &[vb]], &[m]).unwrap();
+        assert_eq!(eval.factor_product[0], (m * va) * vb);
+    }
+
+    #[test]
+    fn clamp_flags_compare_the_full_product_with_the_base() {
+        // Every rate is 1.0, so only the base moves these past the grid ends.
+        let grid = indexed_grid(vec![0.75, 1.0, 1.25], 3);
+        let f = build_group_mapping(&labels(&["l", "l", "l"]));
+        let eval = evaluate_ratebook_with_base(&grid, &[&f], &[&[1.0]], &[0.5, 1.0, 2.0]).unwrap();
+        assert_eq!(eval.optimal_steps, vec![0, 1, 2]);
+        assert_eq!(eval.clamped_low, vec![true, false, false]);
+        assert_eq!(eval.clamped_high, vec![false, false, true]);
+        assert_eq!((eval.n_clamped_low, eval.n_clamped_high), (1, 1));
+    }
+
+    #[test]
+    fn a_base_of_one_is_bit_identical_to_no_base() {
+        let grid = indexed_grid(vec![0.8, 0.9, 1.0, 1.1, 1.2], 4);
+        let f = build_group_mapping(&labels(&["a", "b", "a", "c"]));
+        let values: &[f32] = &[0.93, 1.07, 1.13];
+        let plain = evaluate_ratebook(&grid, &[&f], &[values]).unwrap();
+        let based = evaluate_ratebook_with_base(&grid, &[&f], &[values], &[1.0; 4]).unwrap();
+        assert_eq!(plain.factor_product, based.factor_product);
+        assert_eq!(plain.optimal_steps, based.optimal_steps);
+        assert_eq!(
+            plain.total_objective.to_bits(),
+            based.total_objective.to_bits()
+        );
+    }
+
+    #[test]
+    fn the_cancellable_form_matches_and_cancels() {
+        let grid = indexed_grid(vec![0.8, 1.0, 1.2], 2);
+        let f = build_group_mapping(&labels(&["a", "a"]));
+        let base = [0.9f32, 1.1];
+        let plain = evaluate_ratebook_with_base(&grid, &[&f], &[&[1.0]], &base).unwrap();
+        let flag = CancelFlag::new();
+        let tokened =
+            evaluate_ratebook_with_base_cancellable(&grid, &[&f], &[&[1.0]], &base, &flag).unwrap();
+        assert_eq!(plain.optimal_steps, tokened.optimal_steps);
+        flag.cancel();
+        let err = evaluate_ratebook_with_base_cancellable(&grid, &[&f], &[&[1.0]], &base, &flag)
+            .unwrap_err();
+        assert!(matches!(err, PriceContourError::Cancelled));
+    }
+
+    #[test]
+    fn rejects_a_base_of_the_wrong_length_or_invalid_values() {
+        let grid = indexed_grid(vec![1.0], 2);
+        let f = build_group_mapping(&labels(&["a", "a"]));
+        let err = evaluate_ratebook_with_base(&grid, &[&f], &[&[1.0]], &[1.0]).unwrap_err();
+        assert!(format!("{err}").contains("1 base multipliers for 2 quotes"));
+        let err = evaluate_ratebook_with_base(&grid, &[&f], &[&[1.0]], &[1.0, -1.0]).unwrap_err();
+        assert!(format!("{err}").contains("quote_id 'Q1'"), "{err}");
+    }
+
+    #[test]
+    fn baseline_steps_follow_the_step_rule() {
+        let sv = [0.5f32, 1.0, 2.0, 4.0];
+        // Exact, a midpoint (lower), nearer 2, and past each end.
+        assert_eq!(
+            quote_baseline_steps(&sv, &[1.0, 0.75, 2.9, 0.1, 9.0]),
+            vec![1, 0, 2, 0, 3]
+        );
+        assert_eq!(
+            quote_baseline_steps(&sv, &[1.0])[0] as usize,
+            crate::data::baseline_step(&sv)
+        );
     }
 
     #[test]

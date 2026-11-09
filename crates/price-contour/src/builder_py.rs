@@ -473,12 +473,26 @@ fn validate_block_step(
     let mult_val = mult_ca
         .get(idx)
         .ok_or_else(|| PyValueError::new_err(format!("Null {scenario_value_col} at row {idx}")))?;
+    check_scenario_value(mult_val, expected_sv, qid, idx, j, scenario_value_col)
+}
+
+/// One row's scenario value against the shared grid: the rule, tolerance and
+/// message for every path that builds a grid from a frame.
+#[inline]
+pub(crate) fn check_scenario_value(
+    value: f32,
+    expected: f32,
+    qid: &str,
+    row: usize,
+    step: usize,
+    scenario_value_col: &str,
+) -> PyResult<()> {
     // (NaN - NaN).abs() is NaN, which compares false against any finite
     // tolerance — without an explicit check, a NaN would slip through.
-    if !mult_val.is_finite() || (mult_val - expected_sv).abs() > SCENARIO_VALUE_TOL {
+    if !value.is_finite() || (value - expected).abs() > SCENARIO_VALUE_TOL {
         return Err(PyValueError::new_err(format!(
-            "Quote '{qid}' row {idx}: {scenario_value_col}={mult_val}, expected \
-             {expected_sv} for step {j} (all chunks must share the same scenario grid)"
+            "Quote '{qid}' row {row}: {scenario_value_col}={value}, expected \
+             {expected} for step {step} (all chunks must share the same scenario grid)"
         )));
     }
     Ok(())

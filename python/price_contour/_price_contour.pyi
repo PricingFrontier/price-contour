@@ -338,12 +338,15 @@ def run_cd_pass_py(
     max_cd_iterations: int = 3,
     cd_tolerance: float = 1e-3,
     lambdas: dict[str, float] | None = None,
+    *,
+    base_contexts: RatebookFactorContexts | None = None,
 ) -> RatebookCDResult: ...
 def evaluate_ratebook_py(
     grid: QuoteGrid,
     contexts: list[FactorContext],
     factor_values: list[list[float]],
     *,
+    base_contexts: RatebookFactorContexts | None = None,
     cancel: CancelToken | None = None,
 ) -> RatebookEvaluation: ...
 def _baseline_step_index(scenario_values: list[float]) -> int: ...
@@ -428,6 +431,8 @@ class RatebookFactorContexts:
         ``solve(QuoteGrid, contexts)`` rejects contexts with a ``None``
         fingerprint because quote-axis alignment cannot be proven."""
         ...
+    @property
+    def base_multiplier(self) -> str | None: ...
     @classmethod
     def from_dataframe(
         cls,
@@ -438,6 +443,7 @@ class RatebookFactorContexts:
         separator: str = "\x1f",
         expected_quote_ids: list[str] | None = None,
         expected_n_quotes: int | None = None,
+        base_multiplier: str | None = None,
     ) -> RatebookFactorContexts: ...
 
 def build_ratebook_factor_contexts_from_parquet_chunked_py(
@@ -449,4 +455,12 @@ def build_ratebook_factor_contexts_from_parquet_chunked_py(
     separator: str = "\x1f",
     expected_quote_ids: list[str] | None = None,
     expected_n_quotes: int | None = None,
+    base_multiplier: str | None = None,
 ) -> RatebookFactorContexts: ...
+def validate_base_multiplier_column_py(
+    factors: pl.DataFrame,
+    column: str,
+    factor_specs: list[list[str]],
+    *,
+    quote_id: str | None = None,
+) -> None: ...

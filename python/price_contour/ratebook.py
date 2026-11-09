@@ -29,6 +29,7 @@ from price_contour._price_contour import (
     evaluate_ratebook_py,
     run_cd_pass_py,
     solve_grouped_py,
+    validate_base_multiplier_column_py,
 )
 from price_contour._ratio_results import (
     _safe_ratio_from_columns,
@@ -58,6 +59,7 @@ def build_ratebook_factor_contexts_from_parquet_chunked(
     separator: str = "\x1f",
     expected_quote_ids: list[str] | None = None,
     expected_n_quotes: int | None = None,
+    base_multiplier: str | None = None,
 ) -> RatebookFactorContexts:
     """Build factor contexts from a Parquet file by streaming row slices.
 
@@ -94,6 +96,10 @@ def build_ratebook_factor_contexts_from_parquet_chunked(
         previously built grid.
     expected_n_quotes
         Cross-check: the total number of rows read must equal this.
+    base_multiplier
+        Float column of per-quote base multipliers to carry (DESIGN_DECISIONS
+        §17). It must match the ``base_multiplier`` of the optimiser the
+        contexts are used with.
 
     Returns
     -------
@@ -109,6 +115,7 @@ def build_ratebook_factor_contexts_from_parquet_chunked(
         separator=separator,
         expected_quote_ids=expected_quote_ids,
         expected_n_quotes=expected_n_quotes,
+        base_multiplier=base_multiplier,
     )
 
 
@@ -116,6 +123,7 @@ FACTOR_SEPARATOR = "\x1f"
 """Separator between the constituent levels of a composite factor label."""
 
 _FORMAT_VERSION = 2
+_FORMAT_VERSION_WITH_BASE = 3
 
 # ``config.json`` keys by save format. ``load`` accepts exactly these.
 _CONFIG_KEYS_V1 = frozenset(
@@ -142,6 +150,7 @@ _CONFIG_KEYS_V2 = _CONFIG_KEYS_V1 | {
     "n_quotes_clamped_low",
     "n_quotes_clamped_high",
 }
+_CONFIG_KEYS_V3 = (_CONFIG_KEYS_V2 - {"baseline_scenario_value"}) | {"base_multiplier"}
 
 
 class ResultUnavailableError(RuntimeError):
@@ -152,9 +161,12 @@ class ResultUnavailableError(RuntimeError):
     """
 
 
-def quote_results_schema(constraint_names: list[str]) -> dict[str, pl.DataType]:
+def quote_results_schema(
+    constraint_names: list[str], *, base_multiplier: bool = False
+) -> dict[str, pl.DataType]:
     """Exact ``{column: dtype}`` of ``quote_results`` for sum constraints
-    ``constraint_names`` (DESIGN_DECISIONS §13.2), in column order."""
+    ``constraint_names`` (DESIGN_DECISIONS §13.2), in column order. With
+    ``base_multiplier``, the schema of a ratebook that has one (§17.2)."""
     schema: dict[str, pl.DataType] = {
         "quote_id": pl.String(),
         "optimal_step": pl.Int32(),
@@ -166,6 +178,9 @@ def quote_results_schema(constraint_names: list[str]) -> dict[str, pl.DataType]:
     schema["factor_product"] = pl.Float32()
     schema["clamped_low"] = pl.Boolean()
     schema["clamped_high"] = pl.Boolean()
+    if base_multiplier:
+        schema["base_multiplier"] = pl.Float32()
+        schema["baseline_step"] = pl.Int32()
     return schema
 
 
@@ -239,6 +254,13 @@ class RatebookResult:
     _quote_results_frame: pl.DataFrame | None = field(
         default=None, repr=False, compare=False
     )
+    _base_multiplier: str | None = field(default=None, repr=False)
+
+    @property
+    def base_multiplier(self) -> str | None:
+        """The base-multiplier column these tables are relative to, or
+        ``None`` (§17.2)."""
+        return self._base_multiplier
 
     @property
     def per_factor_results(self) -> tuple[PerFactorRecord, ...]:
@@ -264,6 +286,12 @@ class RatebookResult:
     @property
     def baseline_scenario_value(self) -> float:
         """Scenario value of the baseline step (nearest 1.0, §13.6)."""
+        if self._base_multiplier is not None:
+            raise _unavailable(
+                "baseline_scenario_value",
+                "with a base multiplier each quote has its own baseline; "
+                'see quote_results["baseline_step"]',
+            )
         if self._baseline_scenario_value is None:
             raise _unavailable("baseline_scenario_value", _LOADED_V1)
         return self._baseline_scenario_value
@@ -306,7 +334,8 @@ class RatebookResult:
         return self._evaluation.quote_results
 
     def save(self, path: str | Path) -> None:
-        """Save the result to a parameters folder (format 2, §13.10).
+        """Save the result to a parameters folder (format 2, §13.10; format 3
+        with a base multiplier, §17.6).
 
         Creates one JSON per factor plus a config.json:
 
@@ -330,7 +359,11 @@ class RatebookResult:
                 f"map to the same file name; rename a factor column"
             )
         config = {
-            "format_version": _FORMAT_VERSION,
+            "format_version": (
+                _FORMAT_VERSION
+                if self._base_multiplier is None
+                else _FORMAT_VERSION_WITH_BASE
+            ),
             "factor_separator": FACTOR_SEPARATOR,
             "lambdas": self.lambdas,
             "constraints": self.total_constraints,
@@ -344,7 +377,11 @@ class RatebookResult:
             "per_factor_results": [asdict(r) for r in self.per_factor_results],
             "constraint_bounds": self.constraint_bounds,
             "scenario_values": list(self.scenario_values),
-            "baseline_scenario_value": self.baseline_scenario_value,
+            **(
+                {"baseline_scenario_value": self.baseline_scenario_value}
+                if self._base_multiplier is None
+                else {"base_multiplier": self._base_multiplier}
+            ),
             "n_quotes": self.n_quotes,
             "n_quotes_clamped_low": self.n_quotes_clamped_low,
             "n_quotes_clamped_high": self.n_quotes_clamped_high,
@@ -379,7 +416,7 @@ class RatebookResult:
 
     @classmethod
     def load(cls, path: str | Path) -> RatebookResult:
-        """Load a result saved by :meth:`save` (format 1 or 2).
+        """Load a result saved by :meth:`save` (format 1, 2 or 3).
 
         The loaded result has no per-quote frame. A format-1 save lacks the
         0.5.0 fields; they raise :class:`ResultUnavailableError` on access.
@@ -390,7 +427,9 @@ class RatebookResult:
             raise FileNotFoundError(f"Config file not found: {config_path}")
         config = json.loads(config_path.read_text())
         version = config.get("format_version", 1)
-        allowed = {1: _CONFIG_KEYS_V1, 2: _CONFIG_KEYS_V2}.get(version)
+        allowed = {1: _CONFIG_KEYS_V1, 2: _CONFIG_KEYS_V2, 3: _CONFIG_KEYS_V3}.get(
+            version
+        )
         if allowed is None:
             raise ValueError(f"unsupported RatebookResult format_version {version!r}")
         unknown = set(config) - allowed
@@ -405,7 +444,7 @@ class RatebookResult:
                 f"missing field(s) {sorted(missing)} in saved RatebookResult "
                 f"(format {version})"
             )
-        if version == 2 and config["factor_separator"] != FACTOR_SEPARATOR:
+        if version >= 2 and config["factor_separator"] != FACTOR_SEPARATOR:
             raise ValueError(
                 f"saved factor_separator {config['factor_separator']!r} != "
                 f"{FACTOR_SEPARATOR!r}"
@@ -446,10 +485,11 @@ class RatebookResult:
             ),
             _constraint_bounds=config["constraint_bounds"],
             _scenario_values=tuple(config["scenario_values"]),
-            _baseline_scenario_value=config["baseline_scenario_value"],
+            _baseline_scenario_value=config.get("baseline_scenario_value"),
             _n_quotes=config["n_quotes"],
             _n_quotes_clamped_low=config["n_quotes_clamped_low"],
             _n_quotes_clamped_high=config["n_quotes_clamped_high"],
+            _base_multiplier=config.get("base_multiplier"),
         )
 
 
@@ -513,6 +553,12 @@ class RatebookOptimiser:
         List of factor specs. Each spec is a list of column names whose
         interaction defines a rating factor. If None, must be provided
         at solve time or auto-discovered.
+    base_multiplier : str, optional
+        Float column of the per-quote factors frame giving each quote's
+        starting point. Each quote is then priced at the step nearest
+        ``base × its factor values``, tables are relative to the base, and the
+        baseline is per quote (DESIGN_DECISIONS §17). Requires explicit
+        factors and sum constraints only. Default ``None``: no base.
     candidate_min, candidate_max : float
         Range for candidate factor values.
     candidate_steps : int
@@ -536,6 +582,7 @@ class RatebookOptimiser:
         scenario_index: str = "scenario_index",
         scenario_value: str = "scenario_value",
         factor_columns: list[list[str]] | None = None,
+        base_multiplier: str | None = None,
         candidate_min: float = 0.70,
         candidate_max: float = 1.40,
         candidate_steps: int = 50,
@@ -550,6 +597,7 @@ class RatebookOptimiser:
         self.scenario_index = scenario_index
         self.scenario_value = scenario_value
         self.factor_columns = factor_columns
+        self.base_multiplier = base_multiplier
         self.candidate_min = candidate_min
         self.candidate_max = candidate_max
         self.candidate_steps = candidate_steps
@@ -561,16 +609,29 @@ class RatebookOptimiser:
         _validate_candidate_settings(
             candidate_min, candidate_max, candidate_steps, max_cd_iterations
         )
+        _validate_base_multiplier_setting(
+            base_multiplier, self.constraints, quote_id, factor_columns
+        )
 
     def _build_candidates(self) -> list[float]:
-        """Build the evenly-spaced candidate factor values."""
-        return [
+        """Build the evenly-spaced candidate factor values. With a base
+        multiplier, "no change" is always one of them (§17.4)."""
+        candidates = [
             self.candidate_min
             + (self.candidate_max - self.candidate_min)
             * i
             / max(self.candidate_steps - 1, 1)
             for i in range(self.candidate_steps)
         ]
+        if (
+            self.base_multiplier is not None
+            and self.candidate_min <= 1.0 <= self.candidate_max
+        ):
+            nearest = min(
+                range(len(candidates)), key=lambda i: abs(candidates[i] - 1.0)
+            )
+            candidates[nearest] = 1.0
+        return candidates
 
     def solve(
         self,
@@ -621,6 +682,12 @@ class RatebookOptimiser:
         # numeric ``_constraints_override`` is not blocked by a None left
         # on the parent optimiser.
         _reject_none_for_solve(constraints)
+        _validate_base_multiplier_input(
+            self.base_multiplier,
+            factors,
+            factor_columns or self.factor_columns,
+            self.quote_id,
+        )
 
         # Detect ratio constraints. The ratebook supports ratio constraints
         # by linearising each ratio per (quote x scenario) into a synthetic
@@ -741,6 +808,7 @@ class RatebookOptimiser:
             factor_specs,
             grid=grid,
             quote_id_col=self.quote_id,
+            base_multiplier=self.base_multiplier,
         )
         factor_contexts: list[FactorContext] = (
             factor_contexts_obj._factor_contexts_for_solver()
@@ -769,6 +837,7 @@ class RatebookOptimiser:
             max_cd_iterations=self.max_cd_iterations,
             cd_tolerance=self.cd_tolerance,
             lambdas=lambdas,
+            base_contexts=factor_contexts_obj,
         )
 
         evaluation = cd_result.evaluation
@@ -833,12 +902,17 @@ class RatebookOptimiser:
             _per_factor_results=per_factor_results,
             _constraint_bounds=constraint_bounds,
             _scenario_values=tuple(evaluation.scenario_values),
-            _baseline_scenario_value=evaluation.baseline_scenario_value,
+            _baseline_scenario_value=(
+                None
+                if self.base_multiplier is not None
+                else evaluation.baseline_scenario_value
+            ),
             _n_quotes=evaluation.n_quotes,
             _n_quotes_clamped_low=evaluation.n_quotes_clamped_low,
             _n_quotes_clamped_high=evaluation.n_quotes_clamped_high,
             _evaluation=evaluation,
             _quote_results_frame=quote_results_frame,
+            _base_multiplier=self.base_multiplier,
         )
 
     def evaluate(
@@ -892,6 +966,9 @@ class RatebookOptimiser:
                 f"constraints ({ratio_names}): a ratio has no per-step sum to "
                 f"read from the grid. Use solve() for ratio reporting."
             )
+        _validate_base_multiplier_input(
+            self.base_multiplier, factors, self.factor_columns, self.quote_id
+        )
         if isinstance(factors, RatebookFactorContexts):
             factor_specs = _resolve_factor_specs_from_contexts(
                 factors, None, self.factor_columns
@@ -915,13 +992,18 @@ class RatebookOptimiser:
         else:
             grid = df_or_grid
         contexts = _resolve_factor_contexts(
-            factors, factor_specs, grid=grid, quote_id_col=self.quote_id
+            factors,
+            factor_specs,
+            grid=grid,
+            quote_id_col=self.quote_id,
+            base_multiplier=self.base_multiplier,
         )
         solver_contexts = contexts._factor_contexts_for_solver()
         return evaluate_ratebook_py(
             grid,
             solver_contexts,
             _factor_values_for_contexts(factor_specs, solver_contexts, factor_tables),
+            base_contexts=contexts,
             cancel=cancel,
         )
 
@@ -1089,6 +1171,13 @@ class RatebookOptimiser:
                 "requires at least one threshold_ranges entry"
             )
 
+        _validate_base_multiplier_input(
+            self.base_multiplier,
+            factors,
+            factor_columns or self.factor_columns,
+            self.quote_id,
+        )
+
         # Per-axis reporting value for unswept constraints — the
         # constructor threshold echoed verbatim into ``threshold_<name>``
         # (user units: absolute for ``min`` / ``max``, fractional for
@@ -1205,6 +1294,7 @@ class RatebookOptimiser:
                 resolved_factor_specs,
                 quote_id=(self.quote_id if self.quote_id in factors.columns else None),
                 expected_quote_ids=expected_quote_ids,
+                base_multiplier=self.base_multiplier,
             )
 
         # Sweep — predictor-corrector warm starting. The frontier visits
@@ -1365,6 +1455,8 @@ class RatebookOptimiser:
         }
         if self.constraints:
             params["constraints"] = json.dumps(self.constraints)
+        if self.base_multiplier is not None:
+            params["base_multiplier"] = self.base_multiplier
 
         metrics: dict[str, float] = {
             "total_objective": result.total_objective,
@@ -1417,6 +1509,80 @@ def _validate_candidate_settings(
         raise ValueError(f"candidate_steps must be >= 1, got {candidate_steps}")
     if max_cd_iterations < 1:
         raise ValueError(f"max_cd_iterations must be >= 1, got {max_cd_iterations}")
+
+
+def _validate_base_multiplier_setting(
+    base_multiplier: str | None,
+    constraints: dict[str, dict[str, float]],
+    quote_id: str,
+    factor_columns: list[list[str]] | None,
+) -> None:
+    """The base-multiplier checks that need no data (§17.5)."""
+    if base_multiplier is None:
+        return
+    if not isinstance(base_multiplier, str):
+        raise TypeError(
+            f"base_multiplier must be a column name or None, got {base_multiplier!r}"
+        )
+    ratio_names = _ratio_constraint_names(constraints)
+    if ratio_names:
+        raise ValueError(
+            f"base_multiplier cannot be combined with ratio constraints "
+            f"({ratio_names}): the ratio path linearises against the grid-level "
+            f"baseline, not each quote's own."
+        )
+    if base_multiplier == quote_id:
+        raise ValueError(
+            f"base_multiplier column {base_multiplier!r} is also the quote_id column"
+        )
+    for spec in factor_columns or []:
+        if base_multiplier in spec:
+            raise ValueError(
+                f"base_multiplier column {base_multiplier!r} is also a factor "
+                f"column (in {spec}); a base multiplier is not a factor"
+            )
+
+
+def _validate_base_multiplier_input(
+    base_multiplier: str | None,
+    factors: pl.DataFrame | RatebookFactorContexts,
+    factor_specs: list[list[str]] | None,
+    quote_id_col: str,
+) -> None:
+    """Reject a bad base multiplier before any grid is built (§17.5).
+
+    A prebuilt contexts handle was validated when it was built, so it only has
+    to carry the column this optimiser names.
+    """
+    if isinstance(factors, RatebookFactorContexts):
+        if factors.base_multiplier != base_multiplier:
+            raise ValueError(
+                f"RatebookOptimiser base_multiplier={base_multiplier!r} does not "
+                f"match RatebookFactorContexts.base_multiplier="
+                f"{factors.base_multiplier!r}. Build the contexts with the "
+                f"optimiser's base_multiplier."
+            )
+        return
+    if base_multiplier is None:
+        return
+    if factor_specs is None:
+        raise ValueError(
+            "base_multiplier needs explicit factor_columns: auto-discovery screens "
+            "factors from a starting point of 1.0, not each quote's base."
+        )
+    if base_multiplier not in factors.columns:
+        raise ValueError(
+            f"base_multiplier column {base_multiplier!r} not found in factors "
+            f"DataFrame. Available: {list(factors.columns)}"
+        )
+    quote_id = quote_id_col if quote_id_col in factors.columns else None
+    read = [base_multiplier] if quote_id is None else [quote_id, base_multiplier]
+    validate_base_multiplier_column_py(
+        select_native_columns(factors, read),
+        base_multiplier,
+        factor_specs,
+        quote_id=quote_id,
+    )
 
 
 def _factor_values_for_contexts(
@@ -1704,6 +1870,7 @@ def _resolve_factor_contexts(
     *,
     grid: QuoteGrid,
     quote_id_col: str,
+    base_multiplier: str | None = None,
 ) -> RatebookFactorContexts:
     """Coerce ``factors`` into a :class:`RatebookFactorContexts` whose
     fingerprint matches ``grid.quote_id_fingerprint``.
@@ -1764,6 +1931,7 @@ def _resolve_factor_contexts(
         factor_specs,
         quote_id=quote_id_col if quote_id_col in factors.columns else None,
         expected_quote_ids=grid.quote_ids,
+        base_multiplier=base_multiplier,
     )
 
 
@@ -1773,19 +1941,23 @@ def _factor_contexts_from_dataframe(
     *,
     quote_id: str | None,
     expected_quote_ids: list[str],
+    base_multiplier: str | None = None,
 ) -> RatebookFactorContexts:
     """Build contexts from a factors frame, handing the native builder only
-    the ``quote_id`` column (when used) and the factor columns
-    (DESIGN_DECISIONS §15.2)."""
+    the ``quote_id`` column (when used), the factor columns and any base
+    multiplier (DESIGN_DECISIONS §15.2)."""
     read = [] if quote_id is None else [quote_id]
     for spec in factor_specs:
         read.extend(spec)
+    if base_multiplier is not None:
+        read.append(base_multiplier)
     return RatebookFactorContexts.from_dataframe(
         select_native_columns(factors, read),
         factor_specs,
         quote_id=quote_id,
         separator=FACTOR_SEPARATOR,
         expected_quote_ids=expected_quote_ids,
+        base_multiplier=base_multiplier,
     )
 
 

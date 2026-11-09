@@ -1,23 +1,27 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
 use rayon::prelude::*;
 
-use polars::prelude::{BooleanChunked, Float32Chunked, IntoColumn, NewChunkedArray};
+use polars::prelude::{BooleanChunked, Float32Chunked, Int32Chunked, IntoColumn, NewChunkedArray};
 use price_contour_core::{
-    check_cancelled, evaluate_ratebook, evaluate_ratebook_cancellable, solve_grouped, CancelFlag,
-    GroupMapping, GroupedSolveResult, QuoteGrid, RatebookEvaluation, SolverConfig,
+    check_cancelled, evaluate_ratebook, evaluate_ratebook_cancellable, evaluate_ratebook_with_base,
+    evaluate_ratebook_with_base_cancellable, quote_baseline_steps, solve_grouped,
+    solve_grouped_with_base, CancelFlag, GroupMapping, GroupedBaseline, GroupedSolveResult,
+    QuoteGrid, RatebookEvaluation, SolverConfig,
 };
 
 use crate::cancel_py::{core_error, flag_of, PyCancelToken};
+use crate::factor_context_py::PyRatebookFactorContexts;
 use crate::grid_py::PyQuoteGrid;
 use crate::ratebook_helpers_py::PyFactorContext;
 use crate::solver_py::{
-    build_result_dataframe, build_result_dataframe_polling, parse_constraints, spec_bounds,
+    build_result_dataframe, build_result_dataframe_polling, parse_constraints,
+    parse_constraints_with_baseline, spec_bounds,
 };
 use crate::utils::{order_lambdas, zip_to_dict, OrderedDict};
 
@@ -254,6 +258,40 @@ pub fn solve_grouped_py(
     })
 }
 
+/// A ratebook's per-quote base and the grid step each value prices at
+/// (`docs/DESIGN_DECISIONS.md` §17.3). Computed once per solve or evaluation.
+#[derive(Clone)]
+struct QuoteBase {
+    multipliers: Arc<Vec<f32>>,
+    baseline_steps: Arc<Vec<u32>>,
+}
+
+impl QuoteBase {
+    /// `None` when `contexts` is absent or carries no base multiplier.
+    fn from_contexts(
+        py: Python<'_>,
+        contexts: Option<&PyRatebookFactorContexts>,
+        grid: &QuoteGrid,
+    ) -> PyResult<Option<Self>> {
+        let Some(multipliers) = contexts.and_then(|c| c.base_multiplier_values()) else {
+            return Ok(None);
+        };
+        if multipliers.len() != grid.n_quotes {
+            return Err(PyValueError::new_err(format!(
+                "{} base multipliers for {} quotes",
+                multipliers.len(),
+                grid.n_quotes
+            )));
+        }
+        let baseline_steps =
+            py.detach(|| Arc::new(quote_baseline_steps(&grid.scenario_values, &multipliers)));
+        Ok(Some(Self {
+            multipliers,
+            baseline_steps,
+        }))
+    }
+}
+
 /// A ratebook solution evaluated per quote by the canonical kernel
 /// (`price_contour_core::evaluate_ratebook`). Returned by
 /// `evaluate_ratebook_py` and carried by every `RatebookCDResult`, so solve
@@ -268,6 +306,7 @@ pub struct PyRatebookEvaluation {
     /// The token of the call that produced this evaluation; a first access
     /// to the lazily built `quote_results` honours it.
     cancel: Option<CancelFlag>,
+    base: Option<QuoteBase>,
 }
 
 impl PyRatebookEvaluation {
@@ -276,6 +315,7 @@ impl PyRatebookEvaluation {
         grid: Arc<QuoteGrid>,
         mappings: &[Arc<GroupMapping>],
         factor_values: &[Vec<f32>],
+        base: Option<QuoteBase>,
         cancel: Option<CancelFlag>,
     ) -> PyResult<Self> {
         let (inner, (baseline_objective, baseline_constraints)) = py
@@ -283,15 +323,40 @@ impl PyRatebookEvaluation {
                 let mapping_refs: Vec<&GroupMapping> =
                     mappings.iter().map(|m| m.as_ref()).collect();
                 let value_refs: Vec<&[f32]> = factor_values.iter().map(|v| v.as_slice()).collect();
-                match cancel.as_ref() {
-                    None => evaluate_ratebook(&grid, &mapping_refs, &value_refs)
+                match (base.as_ref(), cancel.as_ref()) {
+                    (None, None) => evaluate_ratebook(&grid, &mapping_refs, &value_refs)
                         .map(|evaluation| (evaluation, grid.baseline_totals())),
-                    Some(flag) => {
+                    (None, Some(flag)) => {
                         evaluate_ratebook_cancellable(&grid, &mapping_refs, &value_refs, flag)
                             .and_then(|evaluation| {
                                 Ok((evaluation, grid.baseline_totals_cancellable(flag)?))
                             })
                     }
+                    (Some(b), None) => evaluate_ratebook_with_base(
+                        &grid,
+                        &mapping_refs,
+                        &value_refs,
+                        &b.multipliers,
+                    )
+                    .and_then(|evaluation| {
+                        Ok((
+                            evaluation,
+                            grid.baseline_totals_per_quote(&b.baseline_steps)?,
+                        ))
+                    }),
+                    (Some(b), Some(flag)) => evaluate_ratebook_with_base_cancellable(
+                        &grid,
+                        &mapping_refs,
+                        &value_refs,
+                        &b.multipliers,
+                        flag,
+                    )
+                    .and_then(|evaluation| {
+                        Ok((
+                            evaluation,
+                            grid.baseline_totals_per_quote_cancellable(&b.baseline_steps, flag)?,
+                        ))
+                    }),
                 }
             })
             .map_err(|e| core_error("Ratebook evaluation error", e))?;
@@ -302,6 +367,7 @@ impl PyRatebookEvaluation {
             baseline_constraints,
             quote_results: None,
             cancel,
+            base,
         })
     }
 }
@@ -349,24 +415,36 @@ impl PyRatebookEvaluation {
     }
 
     #[getter]
-    fn baseline_scenario_value(&self) -> f32 {
-        self.grid.scenario_values[self.grid.baseline_step()]
+    fn baseline_scenario_value(&self) -> PyResult<f32> {
+        if self.base.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "baseline_scenario_value is unavailable with a base multiplier: each \
+                 quote has its own baseline; see quote_results[\"baseline_step\"]",
+            ));
+        }
+        Ok(self.grid.scenario_values[self.grid.baseline_step()])
     }
 
     /// Per-quote results in grid quote order: the online result columns
     /// (`quote_id`, `optimal_step`, `optimal_scenario_value`,
     /// `optimal_objective`, `optimal_<c>`) followed by `factor_product`,
-    /// `clamped_low` and `clamped_high`. Built on first access and cached.
+    /// `clamped_low` and `clamped_high`, then `base_multiplier` and
+    /// `baseline_step` with a base multiplier. Built on first access and cached.
     #[getter]
     fn quote_results(&mut self, py: Python) -> PyResult<Py<PyAny>> {
         if let Some(ref cached) = self.quote_results {
             return Ok(cached.clone_ref(py));
         }
-        let (inner, grid, cancel) = (&self.inner, &self.grid, self.cancel.as_ref());
+        let (inner, grid, cancel, base) = (
+            &self.inner,
+            &self.grid,
+            self.cancel.as_ref(),
+            self.base.as_ref(),
+        );
         let df = py.detach(|| -> PyResult<_> {
             let mut df = build_result_dataframe_polling(&inner.optimal_steps, grid, cancel)?;
-            // The three extra columns are plain copies of retained vectors,
-            // each one O(n_quotes) memcpy; the token is checked between them.
+            // The extra columns are plain copies of retained vectors, each
+            // one O(n_quotes) memcpy; the token is checked between them.
             let check =
                 || check_cancelled(cancel).map_err(|e| core_error("DataFrame build failed", e));
             check()?;
@@ -378,12 +456,23 @@ impl PyRatebookEvaluation {
             let clamped_high =
                 BooleanChunked::from_slice("clamped_high".into(), &inner.clamped_high);
             check()?;
-            df.hstack_mut(&[
+            let mut extra = vec![
                 factor_product.into_column(),
                 clamped_low.into_column(),
                 clamped_high.into_column(),
-            ])
-            .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))?;
+            ];
+            if let Some(base) = base {
+                extra.push(
+                    Float32Chunked::from_slice("base_multiplier".into(), &base.multipliers)
+                        .into_column(),
+                );
+                check()?;
+                let steps: Vec<i32> = base.baseline_steps.iter().map(|&s| s as i32).collect();
+                extra.push(Int32Chunked::from_vec("baseline_step".into(), steps).into_column());
+                check()?;
+            }
+            df.hstack_mut(&extra)
+                .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))?;
             Ok(df)
         })?;
         let py_df: Py<PyAny> = PyDataFrame(df).into_pyobject(py)?.into();
@@ -397,21 +486,24 @@ impl PyRatebookEvaluation {
 /// `factor_values[f][g]` is the rate of level `g` of `contexts[f]`, in that
 /// context's `group_labels` order.
 #[pyfunction]
-#[pyo3(signature = (grid, contexts, factor_values, *, cancel = None))]
+#[pyo3(signature = (grid, contexts, factor_values, *, base_contexts = None, cancel = None))]
 pub fn evaluate_ratebook_py(
     py: Python<'_>,
     grid: &PyQuoteGrid,
     contexts: Vec<PyRef<'_, PyFactorContext>>,
     factor_values: Vec<Vec<f32>>,
+    base_contexts: Option<PyRef<'_, PyRatebookFactorContexts>>,
     cancel: Option<&Bound<'_, PyCancelToken>>,
 ) -> PyResult<PyRatebookEvaluation> {
     let mappings: Vec<Arc<GroupMapping>> =
         contexts.iter().map(|c| Arc::clone(c.mapping())).collect();
+    let quote_base = QuoteBase::from_contexts(py, base_contexts.as_deref(), &grid.inner)?;
     PyRatebookEvaluation::evaluate(
         py,
         Arc::clone(&grid.inner),
         &mappings,
         &factor_values,
+        quote_base,
         flag_of(cancel),
     )
 }
@@ -554,6 +646,8 @@ const CD_PAR_THRESHOLD: usize = 100_000;
     max_cd_iterations = 3,
     cd_tolerance = 1e-3,
     lambdas = None,
+    *,
+    base_contexts = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn run_cd_pass_py(
@@ -567,6 +661,7 @@ pub fn run_cd_pass_py(
     max_cd_iterations: usize,
     cd_tolerance: f64,
     lambdas: Option<HashMap<String, f64>>,
+    base_contexts: Option<PyRef<'_, PyRatebookFactorContexts>>,
 ) -> PyResult<PyRatebookCDResult> {
     let constraints = constraints.unwrap_or_default();
     let n_factors = contexts.len();
@@ -595,7 +690,22 @@ pub fn run_cd_pass_py(
         }
     }
 
-    let specs = parse_constraints(constraints, &grid.inner)?;
+    // One per-quote baseline for the whole CD pass (DESIGN_DECISIONS §17.3).
+    let quote_base = QuoteBase::from_contexts(py, base_contexts.as_deref(), &grid.inner)?;
+    let base_totals = match quote_base.as_ref() {
+        None => None,
+        Some(base) => Some(
+            py.detach(|| grid.inner.baseline_totals_per_quote(&base.baseline_steps))
+                .map_err(|e| core_error("Ratebook baseline error", e))?,
+        ),
+    };
+
+    let specs = match base_totals.as_ref() {
+        None => parse_constraints(constraints, &grid.inner)?,
+        Some((_, baseline_constraints)) => {
+            parse_constraints_with_baseline(constraints, &grid.inner, baseline_constraints)?
+        }
+    };
     let constraint_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
 
     let initial_lambdas: Option<Vec<f64>> = lambdas
@@ -611,9 +721,23 @@ pub fn run_cd_pass_py(
 
     let grid_arc = Arc::clone(&grid.inner);
 
+    let base_scale_factors = base_totals
+        .as_ref()
+        .map(|(objective, cons)| grid_arc.scale_factors_from_baseline(*objective, cons));
+    let grouped_baseline = base_totals.as_ref().zip(base_scale_factors.as_ref()).map(
+        |((objective, constraints), scale_factors)| GroupedBaseline {
+            objective: *objective,
+            constraints,
+            scale_factors,
+        },
+    );
+
     // Persistent buffers for the whole CD pass. Factor values start at 1.0
     // and candidates are validated > 0, so no factor value is ever 0.
-    let mut overall_mult = vec![1.0f32; n_quotes];
+    let mut overall_mult = match quote_base.as_ref() {
+        Some(base) => base.multipliers.as_ref().clone(),
+        None => vec![1.0f32; n_quotes],
+    };
     let mut factor_values: Vec<Vec<f32>> = group_mappings
         .iter()
         .map(|gm| vec![1.0f32; gm.n_groups])
@@ -653,15 +777,27 @@ pub fn run_cd_pass_py(
                 }
 
                 // Run the inner Lagrangian solve.
-                let result = solve_grouped(
-                    &grid_arc,
-                    gm,
-                    &residuals_buf,
-                    &candidates,
-                    &specs,
-                    &config,
-                    last_lambdas.as_deref(),
-                )?;
+                let result = match grouped_baseline.as_ref() {
+                    None => solve_grouped(
+                        &grid_arc,
+                        gm,
+                        &residuals_buf,
+                        &candidates,
+                        &specs,
+                        &config,
+                        last_lambdas.as_deref(),
+                    )?,
+                    Some(baseline) => solve_grouped_with_base(
+                        &grid_arc,
+                        gm,
+                        &residuals_buf,
+                        &candidates,
+                        &specs,
+                        &config,
+                        last_lambdas.as_deref(),
+                        baseline,
+                    )?,
+                };
                 let new_values = result.optimal_factor_values.clone();
 
                 for (&nv, &ov) in new_values.iter().zip(factor_values[f_idx].iter()) {
@@ -722,6 +858,7 @@ pub fn run_cd_pass_py(
         Arc::clone(&grid_arc),
         &group_mappings,
         &factor_values,
+        quote_base,
         None,
     )?;
 

@@ -539,19 +539,29 @@ fn extract_optimal_steps_from_tables(
 }
 
 /// Per-group argmax: select the candidate with highest accumulated Lagrangian.
+///
+/// An exact tie goes to the lowest index, unless `no_change_ties` holds the
+/// candidates: a ratebook with a base multiplier then takes the tied candidate
+/// closest to 1.0, and the lowest index only among equally close ones
+/// (`docs/DESIGN_DECISIONS.md` §17.4).
 fn argmax_groups(
     group_l: &[f64],
     n_groups: usize,
     n_candidates: usize,
     group_best_candidate: &mut [usize],
+    no_change_ties: Option<&[f32]>,
 ) {
+    let closer_to_no_change = |j: usize, best_j: usize| {
+        no_change_ties.is_some_and(|c| (c[j] - 1.0).abs() < (c[best_j] - 1.0).abs())
+    };
     for (g, best_cand) in group_best_candidate.iter_mut().enumerate().take(n_groups) {
         let mut best_j = 0;
         let mut best_val = f64::NEG_INFINITY;
         let row_offset = g * n_candidates;
         for j in 0..n_candidates {
-            if group_l[row_offset + j] > best_val {
-                best_val = group_l[row_offset + j];
+            let val = group_l[row_offset + j];
+            if val > best_val || (val == best_val && closer_to_no_change(j, best_j)) {
+                best_val = val;
                 best_j = j;
             }
         }
@@ -606,6 +616,19 @@ fn reconstruct_and_accumulate(
         )
 }
 
+/// What a ratebook base multiplier changes in a grouped solve: the baseline
+/// is each quote at its own step instead of one step for the whole grid
+/// (`docs/DESIGN_DECISIONS.md` §17.3).
+#[derive(Debug, Clone, Copy)]
+pub struct GroupedBaseline<'a> {
+    /// Objective total with every quote at its own baseline step.
+    pub objective: f64,
+    /// Constraint totals likewise, in grid constraint order.
+    pub constraints: &'a [f64],
+    /// Per-constraint scale factors computed from those totals.
+    pub scale_factors: &'a [f64],
+}
+
 /// Grouped Lagrangian solve: per-group argmax over candidate factor values,
 /// with remapping from (residual * candidate) to the nearest grid step.
 pub fn solve_grouped(
@@ -616,6 +639,55 @@ pub fn solve_grouped(
     specs: &[ConstraintSpec],
     config: &SolverConfig,
     initial_lambdas: Option<&[f64]>,
+) -> Result<GroupedSolveResult> {
+    solve_grouped_impl(
+        grid,
+        group_mapping,
+        residuals,
+        candidates,
+        specs,
+        config,
+        initial_lambdas,
+        None,
+    )
+}
+
+/// [`solve_grouped`] for a ratebook with a base multiplier: `baseline` replaces
+/// the grid-level baseline and scale factors, and an exact tie goes to the
+/// candidate closest to 1.0.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_grouped_with_base(
+    grid: &QuoteGrid,
+    group_mapping: &GroupMapping,
+    residuals: &[f32],
+    candidates: &[f32],
+    specs: &[ConstraintSpec],
+    config: &SolverConfig,
+    initial_lambdas: Option<&[f64]>,
+    baseline: &GroupedBaseline<'_>,
+) -> Result<GroupedSolveResult> {
+    solve_grouped_impl(
+        grid,
+        group_mapping,
+        residuals,
+        candidates,
+        specs,
+        config,
+        initial_lambdas,
+        Some(baseline),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_grouped_impl(
+    grid: &QuoteGrid,
+    group_mapping: &GroupMapping,
+    residuals: &[f32],
+    candidates: &[f32],
+    specs: &[ConstraintSpec],
+    config: &SolverConfig,
+    initial_lambdas: Option<&[f64]>,
+    baseline: Option<&GroupedBaseline<'_>>,
 ) -> Result<GroupedSolveResult> {
     grid.validate()?;
 
@@ -652,7 +724,25 @@ pub fn solve_grouped(
     let n_candidates = candidates.len();
 
     // Compute baselines and scale factors
-    let (baseline_obj, baseline_cons, scale_factors) = grid.compute_scale_factors();
+    let (baseline_obj, baseline_cons, scale_factors) = match baseline {
+        None => grid.compute_scale_factors(),
+        Some(b) => {
+            if b.constraints.len() != n_constraints || b.scale_factors.len() != n_constraints {
+                return Err(PriceContourError::DimensionMismatch(format!(
+                    "baseline has {} constraint totals and {} scale factors for {} constraints",
+                    b.constraints.len(),
+                    b.scale_factors.len(),
+                    n_constraints
+                )));
+            }
+            (
+                b.objective,
+                b.constraints.to_vec(),
+                b.scale_factors.to_vec(),
+            )
+        }
+    };
+    let no_change_ties = baseline.map(|_| candidates);
 
     // Initialise lambdas
     let mut lambdas = match initial_lambdas {
@@ -725,7 +815,13 @@ pub fn solve_grouped(
             }
         };
 
-        argmax_groups(&group_l, n_groups, n_candidates, &mut group_best_candidate);
+        argmax_groups(
+            &group_l,
+            n_groups,
+            n_candidates,
+            &mut group_best_candidate,
+            no_change_ties,
+        );
 
         // Cached path computes totals directly from a_table / b_table;
         // legacy path recomputes via per-quote gather (and also fills
@@ -824,7 +920,13 @@ pub fn solve_grouped(
             }
         };
 
-        argmax_groups(&group_l, n_groups, n_candidates, &mut group_best_candidate);
+        argmax_groups(
+            &group_l,
+            n_groups,
+            n_candidates,
+            &mut group_best_candidate,
+            no_change_ties,
+        );
 
         let (iter_obj, iter_cons) = match &tables {
             Some(t) => compute_totals_from_tables(t, &group_best_candidate),
@@ -1116,6 +1218,178 @@ mod tests {
         .unwrap();
 
         assert_abs_diff_eq!(result.clamp_rate, 0.0, epsilon = 1e-6);
+    }
+
+    /// One quote on grid [0.5, 0.85, 1.0, 1.1] whose best step is 0.85.
+    fn tied_below_one_grid() -> QuoteGrid {
+        QuoteGrid {
+            n_quotes: 1,
+            n_steps: 4,
+            scenario_values: vec![0.5, 0.85, 1.0, 1.1],
+            objective: vec![0.0, 10.0, 5.0, 1.0],
+            constraints: vec![],
+            constraint_names: vec![],
+            quote_ids: vec!["Q0".to_string()],
+            quote_id_fingerprint: 0,
+        }
+    }
+
+    fn no_constraint_baseline() -> GroupedBaseline<'static> {
+        GroupedBaseline {
+            objective: 0.0,
+            constraints: &[],
+            scale_factors: &[],
+        }
+    }
+
+    fn solve_one_group(
+        grid: &QuoteGrid,
+        candidates: &[f32],
+        baseline: Option<&GroupedBaseline<'_>>,
+    ) -> f32 {
+        let group_mapping = build_group_mapping(&["G".to_string()]);
+        solve_grouped_impl(
+            grid,
+            &group_mapping,
+            &[1.0],
+            candidates,
+            &[],
+            &SolverConfig::default(),
+            None,
+            baseline,
+        )
+        .unwrap()
+        .optimal_factor_values[0]
+    }
+
+    #[test]
+    fn test_a_tie_without_a_base_takes_the_lowest_index() {
+        // Candidates 0.7, 0.8 and 0.9 all price the quote at the best step.
+        let candidates = [0.7f32, 0.8, 0.9, 1.0, 1.1];
+        assert_eq!(
+            solve_one_group(&tied_below_one_grid(), &candidates, None),
+            0.7
+        );
+    }
+
+    #[test]
+    fn test_a_tie_with_a_base_takes_the_candidate_closest_to_one() {
+        let candidates = [0.7f32, 0.8, 0.9, 1.0, 1.1];
+        let baseline = no_constraint_baseline();
+        assert_eq!(
+            solve_one_group(&tied_below_one_grid(), &candidates, Some(&baseline)),
+            0.9
+        );
+    }
+
+    #[test]
+    fn test_a_strict_preference_beats_the_no_change_rule() {
+        // 1.0 prices at step 2 (objective 5), worse than step 1 (objective 10).
+        let baseline = no_constraint_baseline();
+        assert_eq!(
+            solve_one_group(&tied_below_one_grid(), &[0.8f32, 1.0], Some(&baseline)),
+            0.8
+        );
+    }
+
+    #[test]
+    fn test_a_flat_group_with_a_base_stays_at_one_and_equal_distance_goes_low() {
+        let mut grid = tied_below_one_grid();
+        grid.objective = vec![3.0; 4];
+        let baseline = no_constraint_baseline();
+        assert_eq!(
+            solve_one_group(&grid, &[0.9f32, 1.0, 1.1], Some(&baseline)),
+            1.0
+        );
+        assert_eq!(solve_one_group(&grid, &[0.5f32, 1.5], Some(&baseline)), 0.5);
+    }
+
+    fn binding_problem() -> (QuoteGrid, GroupMapping, Vec<ConstraintSpec>, Vec<f32>) {
+        let n = 60;
+        let grid = make_heterogeneous_grid(n, 9);
+        let labels: Vec<String> = (0..n).map(|i| format!("G{i}")).collect();
+        let (_, bc) = grid.baseline_totals();
+        let specs = vec![ConstraintSpec {
+            name: "volume".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold: bc[0] * 1.12,
+        }];
+        (
+            grid,
+            build_group_mapping(&labels),
+            specs,
+            vec![0.9f32, 1.0, 1.1],
+        )
+    }
+
+    #[test]
+    fn test_with_base_takes_the_baseline_it_is_given() {
+        let (grid, mapping, specs, candidates) = binding_problem();
+        let residuals = vec![1.0f32; grid.n_quotes];
+        let config = SolverConfig {
+            max_iter: 5,
+            ..Default::default()
+        };
+        let solve = |baseline: &GroupedBaseline<'_>| {
+            solve_grouped_with_base(
+                &grid,
+                &mapping,
+                &residuals,
+                &candidates,
+                &specs,
+                &config,
+                None,
+                baseline,
+            )
+            .unwrap()
+        };
+        let plain = solve_grouped(
+            &grid,
+            &mapping,
+            &residuals,
+            &candidates,
+            &specs,
+            &config,
+            None,
+        )
+        .unwrap();
+        assert!(plain.lambdas[0] > 0.0);
+
+        let (obj, cons, scale) = grid.compute_scale_factors();
+        let same = solve(&GroupedBaseline {
+            objective: obj,
+            constraints: &cons,
+            scale_factors: &scale,
+        });
+        assert_eq!(same.lambdas, plain.lambdas);
+        assert_eq!(same.optimal_factor_values, plain.optimal_factor_values);
+
+        let doubled: Vec<f64> = scale.iter().map(|s| s * 2.0).collect();
+        let other = solve(&GroupedBaseline {
+            objective: 123.0,
+            constraints: &[456.0],
+            scale_factors: &doubled,
+        });
+        assert_eq!(other.baseline_objective, 123.0);
+        assert_eq!(other.baseline_constraints, vec![456.0]);
+        assert_ne!(other.lambdas, plain.lambdas);
+    }
+
+    #[test]
+    fn test_with_base_rejects_a_baseline_of_the_wrong_shape() {
+        let (grid, mapping, specs, candidates) = binding_problem();
+        let err = solve_grouped_with_base(
+            &grid,
+            &mapping,
+            &vec![1.0f32; grid.n_quotes],
+            &candidates,
+            &specs,
+            &SolverConfig::default(),
+            None,
+            &no_constraint_baseline(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("for 1 constraints"), "{err}");
     }
 
     #[test]
