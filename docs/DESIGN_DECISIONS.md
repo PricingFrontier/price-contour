@@ -1534,7 +1534,13 @@ order is part of a contract states it:
   input order and moves with its pin.
 - The ratio history replay (`_actual_ratios_for_lambdas`) uses
   `maintain_order="left"`, for the same last-bits reason in
-  `history[*]["total_constraints"]`.
+  `history[*]["total_constraints"]`; it takes each quote's step from
+  `apply_from_grid` (§20.2) and sums the chosen rows in input order.
+
+Order alone does not fix the last bits: Polars sums each chunk of a column
+apart, and a join or filter run on several threads returns several chunks. Every
+ratio total (`_safe_ratio_from_columns`) sums its Float64 column in one chunk, so
+it depends on the rows and their order, never on the thread count.
 
 A lazy `collect()` runs on the streaming engine by default in Polars 2. The
 library's inputs are eager frames, so its queries are written eagerly: the

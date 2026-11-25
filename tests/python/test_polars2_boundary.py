@@ -407,6 +407,9 @@ class TestRowOrder:
             )
 
             def ratio(rows: pl.DataFrame) -> float:
+                # In one chunk, as the library sums: a filter run on several
+                # threads returns several chunks, which Polars sums apart.
+                rows = rows.rechunk()
                 num = rows["loss_ratio"].cast(pl.Float64).sum()
                 return num / rows["volume"].cast(pl.Float64).sum()
 

@@ -45,9 +45,12 @@ def _safe_ratio_from_columns(
     reporting zero.
     """
     # Float64 accumulation of the (Float32) values, like every other total,
-    # so a reported ratio agrees with the ratio bound derived from it.
-    num_total = float(df[numerator_col].cast(pl.Float64).sum())
-    denom_total = float(df[denominator_col].cast(pl.Float64).sum())
+    # so a reported ratio agrees with the ratio bound derived from it. In one
+    # chunk: Polars sums each chunk apart, and a parallel join or filter hands
+    # back as many chunks as it had threads, so the last bits would follow the
+    # thread count; one chunk in row order makes them the rows' (§15.3).
+    num_total = float(df[numerator_col].cast(pl.Float64).rechunk().sum())
+    denom_total = float(df[denominator_col].cast(pl.Float64).rechunk().sum())
     if denom_total == 0.0:
         return float("nan")
     return num_total / denom_total
