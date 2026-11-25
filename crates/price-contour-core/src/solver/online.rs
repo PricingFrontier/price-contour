@@ -613,6 +613,73 @@ mod tests {
         assert!(warm.iterations <= cold.iterations);
     }
 
+    fn one_quote_grid(objective: Vec<f32>, constraint: Vec<f32>) -> QuoteGrid {
+        let n_steps = objective.len();
+        QuoteGrid {
+            n_quotes: 1,
+            n_steps,
+            scenario_values: (0..n_steps).map(|j| 0.9 + 0.1 * j as f32).collect(),
+            objective,
+            constraints: vec![constraint],
+            constraint_names: vec!["c".to_string()],
+            quote_ids: vec!["Q0".into()],
+            quote_id_fingerprint: 0,
+        }
+    }
+
+    /// A warm start far above the answer costs halvings, not precision: by hand,
+    /// step 1 (objective 2) wins once λ > 0.05 and step 0 (objective 1) once
+    /// λ > 0.1, so the smallest λ meeting `c ≤ 0` chooses step 1, whatever the start.
+    #[test]
+    fn test_one_constraint_warm_start_far_above_finds_the_cold_answer() {
+        let grid = one_quote_grid(vec![1.0, 2.0, 3.0], vec![-20.0, -10.0, 10.0]);
+        let specs = [ConstraintSpec {
+            name: "c".to_string(),
+            direction: ConstraintDirection::Max,
+            threshold: 0.0,
+        }];
+        let config = SolverConfig::default();
+        for warm in [None, Some(1e9), Some(1e5)] {
+            let result =
+                solve_online(&grid, &specs, &config, warm.map(|w| vec![w]).as_deref()).unwrap();
+            assert!(result.converged, "warm start {warm:?}");
+            assert_eq!(result.optimal_steps, vec![1], "warm start {warm:?}");
+            assert_eq!(result.total_objective, 2.0, "warm start {warm:?}");
+            assert!(
+                (result.lambdas[0] - 0.05).abs() < 1e-6,
+                "warm start {warm:?}"
+            );
+        }
+    }
+
+    /// A tiny warm start never stops the bracket short of a λ the cold start
+    /// reaches: by hand, step 1 (c = 1) wins once λ > 10.
+    #[test]
+    fn test_one_constraint_warm_start_far_below_still_reaches_the_bound() {
+        let grid = one_quote_grid(vec![100.0, 90.0], vec![0.0, 1.0]);
+        let specs = [ConstraintSpec {
+            name: "c".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold: 0.5,
+        }];
+        for warm in [None, Some(1e-10), Some(0.3)] {
+            let result = solve_online(
+                &grid,
+                &specs,
+                &SolverConfig::default(),
+                warm.map(|w| vec![w]).as_deref(),
+            )
+            .unwrap();
+            assert!(result.converged, "warm start {warm:?}");
+            assert_eq!(result.total_constraints, vec![1.0], "warm start {warm:?}");
+            // The argmax compares in f32, whose step at 10 is about 1e-6.
+            assert!(
+                (result.lambdas[0] - 10.0).abs() < 1e-5,
+                "warm start {warm:?}"
+            );
+        }
+    }
+
     /// A bound beyond what the grid allows is not met: the solve says why and
     /// reports the highest-λ probe, never a silent undershoot.
     #[test]

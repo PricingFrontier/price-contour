@@ -195,7 +195,6 @@ class OnlineOptimiser:
             return _RatioSolveResultWrapper(
                 inner_result,
                 original_df=df_or_grid,
-                modified_df=modified_df,
                 ratio_columns=ratio_columns,
                 sum_constraints=sum_constraints,
                 quote_id=self.quote_id,
@@ -1335,7 +1334,6 @@ class _RatioSolveResultWrapper:
     __slots__ = (
         "_inner",
         "_original_df",
-        "_modified_df",
         "_ratio_columns",
         "_sum_constraints",
         "_quote_id",
@@ -1355,7 +1353,6 @@ class _RatioSolveResultWrapper:
         inner: SolveResult,
         *,
         original_df: pl.DataFrame,
-        modified_df: pl.DataFrame,
         ratio_columns: list[tuple[str, str, str]],
         sum_constraints: dict[str, dict[str, float | None]],
         quote_id: str,
@@ -1368,7 +1365,6 @@ class _RatioSolveResultWrapper:
         self._inner = inner
         self._ratio_bounds = ratio_bounds
         self._original_df = original_df
-        self._modified_df = modified_df
         self._ratio_columns = ratio_columns
         self._sum_constraints = sum_constraints
         self._quote_id = quote_id
@@ -1503,59 +1499,36 @@ class _RatioSolveResultWrapper:
         return adjusted
 
     def _actual_ratios_for_lambdas(self, lambdas: dict[str, float]) -> dict[str, float]:
-        """Replay the Lagrangian argmax in Python and compute actual
-        ratios per ratio label.
+        """The actual ratio per ratio label at fixed ``lambdas``.
 
-        The replay mirrors the Rust solver's per-quote argmax: build the
-        per-quote-step Lagrangian ``L_qj = obj_qj + Sigma_k sign_k *
-        lambda_k * c_k_qj`` on the linearised DataFrame, pick the step
-        with maximum ``L`` per quote, then sum ``num`` / ``denom`` from
-        the original DataFrame at the chosen rows.
-
-        Sign convention matches :func:`compute_lambda_signs_f32` in the
-        Rust solver: ``+lambda`` for Min direction, ``-lambda`` for Max.
+        Each quote's step is the solver's own choice, ``apply_from_grid`` on the
+        linearised grid the solve ran on (f32, ties to the lowest scenario
+        index), so a replayed record chooses exactly the steps its iteration or
+        probe chose, whatever the input's row order. The chosen rows are then
+        summed in input order (DESIGN_DECISIONS §15.3).
         """
-        # Build the Lagrangian column on the linearised DataFrame.
-        # Sum constraints (post-linearisation) include both original
-        # sum specs and the synthetic ratio columns rewritten as sum
-        # specs; their direction key drives the sign. Cast to Float32
-        # to match the Rust solver's f32 argmax precision so the
-        # Python replay reproduces the same per-quote optimal step
-        # under tie-breaks.
-        lagr_expr = pl.col(self._objective).cast(pl.Float32)
-        for name, spec in self._sum_constraints.items():
-            direction = next(iter(spec))  # "min" or "max"
-            sign = 1.0 if direction == "min" else -1.0
-            lam = float(lambdas.get(name, 0.0))
-            if lam == 0.0:
-                continue
-            lagr_expr = lagr_expr + sign * lam * pl.col(name).cast(pl.Float32)
-        work = self._modified_df.with_columns(_lagrangian=lagr_expr)
-        # Per-quote argmax → optimal_step per quote. ``maintain_order``
-        # keeps quotes in insertion order for deterministic downstream
-        # joins; ``arg_max`` is stable on ties (returns the first index)
-        # which mirrors the Rust solver's tie-break.
-        opt_steps = work.group_by(self._quote_id, maintain_order=True).agg(
-            pl.col(self._scenario_index)
-            .get(pl.col("_lagrangian").arg_max())
-            .alias("_optimal_step")
+        from price_contour.apply import apply_from_grid
+
+        quote_dtype = self._original_df.schema[self._quote_id]
+        steps = apply_from_grid(
+            self._inner.grid, lambdas, self._sum_constraints
+        ).dataframe.select(
+            pl.col(self._quote_id).cast(quote_dtype),
+            pl.col("optimal_step").alias("_optimal_step"),
         )
-        # Inner-join back onto the original DataFrame at (quote_id,
-        # scenario_index == optimal_step) to pull num / denom values at
-        # the chosen step for each quote.
-        # ``maintain_order="left"`` fixes the summation order, and so the
+        # ``maintain_order="left"`` keeps the input's row order, and so the
         # last bits of the Float64 ratio totals (DESIGN_DECISIONS §15.3).
         chosen = self._original_df.join(
-            opt_steps,
+            steps,
             left_on=[self._quote_id, self._scenario_index],
             right_on=[self._quote_id, "_optimal_step"],
             how="inner",
             maintain_order="left",
         )
-        out: dict[str, float] = {}
-        for label, num_col, denom_col in self._ratio_columns:
-            out[label] = _safe_ratio_from_columns(chosen, num_col, denom_col)
-        return out
+        return {
+            label: _safe_ratio_from_columns(chosen, num_col, denom_col)
+            for label, num_col, denom_col in self._ratio_columns
+        }
 
     @property
     def dataframe(self) -> pl.DataFrame:

@@ -492,11 +492,12 @@ pub(crate) fn solve_point_1d_bisection(
         });
     }
 
-    // Bracket the target: starting from `warm_lo` (or 1.0), double lambda
-    // until the target is one-sidedly satisfied or we hit the cap. The
-    // doubling guarantees O(log) probes to reach any achievable lambda
-    // within the cap, regardless of magnitude.
-    let mut hi = warm_lo.filter(|&w| w > 0.0).unwrap_or(1.0);
+    // Bracket the target: starting from `warm_lo` (never below 1.0), double
+    // lambda until the target is one-sidedly satisfied or we hit the cap.
+    // Starting at 1.0 or above, the doublings reach the cap within
+    // `FRONTIER_BRACKET_EXPAND_MAX_ITER`, so a small hint can never stop the
+    // expansion short of a lambda the cold start would reach.
+    let mut hi = warm_lo.map_or(1.0, |w| w.max(1.0));
     let mut hi_pass = apply_at_lambda(grid, spec, hi)?;
     probes += 1;
     let mut hi_satisfied = direction.is_satisfied(hi_pass.total_constraints[0], target);
@@ -548,15 +549,18 @@ pub(crate) fn solve_point_1d_bisection(
     //   1. Target residual within tolerance — once `total` is within
     //      `target_residual_tolerance` of `target`, further halvings
     //      can't improve the user-visible answer.
-    //   2. Bracket width within f64 precision — falls out of (1) for
-    //      well-behaved problems but guards pathological tolerances.
+    //   2. Bracket width within 1e-9 of the satisfying endpoint (at least
+    //      1e-9) — falls out of (1) for well-behaved problems but guards
+    //      pathological tolerances. It is measured against the endpoint as
+    //      it narrows, never the bracket's start, so a distant warm start
+    //      costs halvings but not precision.
     let mut lo = 0.0f64;
     let mut hi_lambda = hi;
     let mut best_optimal_steps = hi_pass.optimal_steps;
     let mut best_total_obj = hi_pass.total_objective;
     let mut best_total_cons = hi_pass.total_constraints[0];
-    let bracket_tolerance = (hi_lambda - lo).max(1.0) * 1e-9;
     for _ in 0..FRONTIER_LAMBDA_BISECTION_MAX_ITER {
+        let bracket_tolerance = hi_lambda.max(1.0) * 1e-9;
         // Residual termination: the satisfying endpoint is close enough
         // to the target that further bisection won't change the
         // user-visible answer.

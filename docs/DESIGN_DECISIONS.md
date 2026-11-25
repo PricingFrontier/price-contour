@@ -1923,8 +1923,13 @@ On the bisection path:
 
 - `max_iter` bounds nothing: a bisection runs at most 1 + 1 + 32 + 56 probes (§16.2).
 - `lambdas` (a warm start) is the first upper probe in place of 1.0, as a 1-D
-  sweep's previous point is. The bracket always starts at 0, so a warm start
-  moves where the search starts, not what it can find.
+  sweep's previous point is, never below 1.0: from there the bracket's doublings
+  reach the cap within their budget, so a small hint cannot end the search short
+  of a λ the cold start reaches. The bracket's low end is always 0, and the
+  halvings stop once the bracket is within 1e-9 of its satisfying end (at least
+  1e-9), measured as it narrows rather than from where it started, so a distant
+  hint costs halvings, not precision: a warm start moves where the search
+  starts, not what it finds.
 - `converged` is true when the returned λ meets the bound one-sidedly. It is
   false only for a bound beyond what the grid allows (`above_envelope`) or a
   bracket that could not be expanded (`bracket_exhausted`); the result is then the
@@ -1960,16 +1965,26 @@ totals, since its answer is its last accepted probe, which the replay reproduces
 The Python-orchestrated frontier (ratio or unswept constraints) takes each point's
 `solver_path`, `non_convergence_reason` and `point_history` rows from its
 `solve()`, so a one-constraint ratio sweep reports bisection points as the Rust
-sweep does.
+sweep does; and, as the Rust 1-D sweep does, a bisection point that did not
+converge (whose λ is the cap) does not warm-start the next point.
+
+A ratio label's replayed total takes each quote's step from the solver's own
+argmax (`apply_from_grid` on the linearised grid, f32, ties to the lowest scenario
+index), so a record chooses exactly its iteration's or probe's steps whatever the
+input's row order, and sums the chosen rows in input order (§15.3).
 
 In Rust, `SolveResult.history` is `Option<SolveHistory>` (`Bisection(probes)` or
 `Subgradient(iterations)`), the enum a `FrontierPoint` carries, renamed from
 `PointHistory`; `SolveResult` gains `solver_path` and `non_convergence_reason`.
 
-### 20.3 What did not change
+### 20.3 What changed beyond the solve
 
-Two or more constraints, the ratebook's grouped solves and every frontier keep
-their methods and results. A one-constraint solve's answer changes: it now meets
-a bound the grid allows, where the subgradient method's averaged-λ pass could
-leave it short.
+A one-constraint solve's answer changes: it now meets a bound the grid allows,
+where the subgradient method's averaged-λ pass could leave it short. A
+one-constraint Python-orchestrated frontier (one ratio constraint) changes with
+it, from subgradient to bisection points. The bisection's stopping rule (§20.1)
+can add a halving to a Rust 1-D frontier point and move its λ in the last
+digits, never its steps beyond that resolution. Solves and frontiers with two or
+more constraints, and the ratebook's grouped solves, keep their methods and
+results.
 

@@ -309,3 +309,73 @@ def test_summary_records_the_path_and_types_each_column() -> None:
     assert convergence.schema["max_lambda_change"] == pl.Float64
     assert convergence.schema["accepted"] == pl.Boolean
     assert convergence.schema["bracket_lo"] == pl.Float64
+
+
+def _one_quote(rows: list[tuple[int, float, float, float]]) -> pl.DataFrame:
+    """One quote's rows, as given: (scenario_index, objective, numerator, denominator)."""
+    return pl.DataFrame(
+        {
+            "quote_id": ["Q0"] * len(rows),
+            "scenario_index": pl.Series([row[0] for row in rows], dtype=pl.Int32),
+            "scenario_value": pl.Series(
+                [0.9 + 0.1 * row[0] for row in rows], dtype=pl.Float32
+            ),
+            "income": pl.Series([row[1] for row in rows], dtype=pl.Float32),
+            "incurred": pl.Series([row[2] for row in rows], dtype=pl.Float32),
+            "premium": pl.Series([row[3] for row in rows], dtype=pl.Float32),
+        }
+    )
+
+
+# By hand: loss ratios 0.3, 0.4, 0.6 at objectives 1, 2, 3. Under a 0.5 maximum the
+# best choice is step 1 (objective 2, ratio 0.4); below 0.3 nothing is reachable.
+_THREE_STEPS = [(0, 1.0, 30.0, 100.0), (1, 2.0, 40.0, 100.0), (2, 3.0, 60.0, 100.0)]
+
+
+@pytest.mark.parametrize("warm", [None, 1e9])
+def test_a_distant_warm_start_finds_the_cold_answer(warm: float | None) -> None:
+    result = pc.OnlineOptimiser(
+        objective="income", constraints={"loss_ratio": {**_LOSS_RATIO, "max": 0.5}}
+    ).solve(
+        _one_quote(_THREE_STEPS), lambdas=None if warm is None else {"loss_ratio": warm}
+    )
+
+    assert result.converged is True
+    assert result.total_objective == 2.0
+    assert result.total_constraints["loss_ratio"] == pytest.approx(0.4)
+
+
+def test_a_sweep_past_an_unreachable_bound_keeps_its_precision() -> None:
+    """The first point's bound is beyond the grid; its capped λ must not coarsen the next."""
+    frontier = pc.OnlineOptimiser(
+        objective="income", constraints={"loss_ratio": {**_LOSS_RATIO, "max": 0.5}}
+    ).frontier(
+        _one_quote(_THREE_STEPS),
+        threshold_ranges={"loss_ratio": (0.2, 0.8)},
+        n_points_per_dim=3,
+    )
+    rows = frontier.points.select(
+        "threshold_loss_ratio", "converged", "non_convergence_reason", "total_objective"
+    ).rows()
+
+    assert rows == [
+        (pytest.approx(0.2), False, "above_envelope", 1.0),
+        (pytest.approx(0.5), True, None, 2.0),
+        (pytest.approx(0.8), True, None, 3.0),
+    ]
+
+
+def test_a_replayed_record_breaks_ties_as_the_solver_does() -> None:
+    """At the answer's λ the two steps tie; the solver takes the lowest scenario index
+    (ratio 0.4), and so must the history's replay, whatever the rows' order."""
+    reversed_rows = _one_quote([(1, 3.0, 6.0, 10.0), (0, 1.0, 4.0, 10.0)])
+    result = pc.OnlineOptimiser(
+        objective="income",
+        constraints={"loss_ratio": {**_LOSS_RATIO, "max": 0.5}},
+        record_history=True,
+    ).solve(reversed_rows)
+    answer = [record for record in result.history if record["accepted"]][-1]
+
+    assert result.total_constraints["loss_ratio"] == pytest.approx(0.4)
+    assert answer["total_constraints"]["loss_ratio"] == pytest.approx(0.4)
+    assert answer["all_constraints_satisfied"] is True

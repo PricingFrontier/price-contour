@@ -33,7 +33,7 @@
       },
       {
         "converged": true,
-        "iterations": 35,
+        "iterations": 36,
         "lambda_volume": 5.078719854354858,
         "threshold_volume": 1.0500000000000003,
         "total_objective": 2439.610118865967,
@@ -41,8 +41,8 @@
       },
       {
         "converged": true,
-        "iterations": 34,
-        "lambda_volume": 15.510633959717893,
+        "iterations": 35,
+        "lambda_volume": 15.51063395025804,
         "threshold_volume": 1.1,
         "total_objective": 2428.194408416748,
         "total_volume": 27.51778534054756

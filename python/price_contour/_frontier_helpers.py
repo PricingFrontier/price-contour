@@ -339,7 +339,12 @@ def _python_frontier_orchestrator(
 
     for combo in combos:
         result, next_lambdas = solve_one(combo, prev_lambdas)
-        prev_lambdas = next_lambdas
+        # A bisection that did not converge reports the capped lambda of a bound
+        # past the grid: a warm start from it would only cost the next point
+        # halvings, so it starts from the last converged point, as the Rust
+        # 1-D sweep does. A subgradient point warm-starts its neighbour as before.
+        if result.converged or result.solver_path != "bisection":
+            prev_lambdas = next_lambdas
         if record_history:
             if result.history is None:
                 raise RuntimeError(
