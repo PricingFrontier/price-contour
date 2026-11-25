@@ -7,12 +7,13 @@ use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
 use price_contour_core::{
-    sweep_frontier, BisectionPhase, ConstraintSpec, FrontierConfig, FrontierResult,
-    NonConvergenceReason, PointHistory, SolverConfig, SolverPath,
+    sweep_frontier, BisectionPhase, ConstraintSpec, FrontierConfig, FrontierResult, SolveHistory,
+    SolverConfig,
 };
 
 use crate::constraint_parsing::{direction_for, is_pct_key, validate_constraints_dict};
 use crate::grid_py::PyQuoteGrid;
+use crate::solver_py::{non_convergence_label, solver_path_label};
 use crate::utils::order_lambdas;
 
 /// Python-visible frontier result.
@@ -103,10 +104,7 @@ impl PyFrontierResult {
             .inner
             .points
             .iter()
-            .map(|p| match p.solver_path {
-                SolverPath::Bisection => "bisection",
-                SolverPath::Subgradient => "subgradient",
-            })
+            .map(|p| solver_path_label(p.solver_path))
             .collect();
         columns.push(Column::new("solver_path".into(), &path_vals));
 
@@ -118,13 +116,7 @@ impl PyFrontierResult {
             .inner
             .points
             .iter()
-            .map(|p| {
-                p.non_convergence_reason.map(|r| match r {
-                    NonConvergenceReason::AboveEnvelope => "above_envelope",
-                    NonConvergenceReason::BracketExpansionExhausted => "bracket_exhausted",
-                    NonConvergenceReason::IterationBudgetExhausted => "iteration_budget_exhausted",
-                })
-            })
+            .map(|p| p.non_convergence_reason.map(non_convergence_label))
             .collect();
         columns.push(Column::new("non_convergence_reason".into(), &reason_vals));
 
@@ -220,7 +212,7 @@ fn point_history_frame(result: &FrontierResult) -> PolarsResult<DataFrame> {
 
     for (index, point) in result.points.iter().enumerate() {
         match point.history.as_ref() {
-            Some(PointHistory::Bisection(probes)) => {
+            Some(SolveHistory::Bisection(probes)) => {
                 for (k, probe) in probes.iter().enumerate() {
                     point_index.push(index as i64);
                     step.push(k as i64);
@@ -239,7 +231,7 @@ fn point_history_frame(result: &FrontierResult) -> PolarsResult<DataFrame> {
                     max_lambda_change.push(None);
                 }
             }
-            Some(PointHistory::Subgradient(history)) => {
+            Some(SolveHistory::Subgradient(history)) => {
                 for record in &history.records {
                     point_index.push(index as i64);
                     step.push(record.iteration as i64);

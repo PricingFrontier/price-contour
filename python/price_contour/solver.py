@@ -453,17 +453,14 @@ class OnlineOptimiser:
         def compose_row(
             result: Any, combo: list[float], swept: list[str]
         ) -> dict[str, Any]:
-            converged = bool(result.converged)
             row: dict[str, Any] = {
                 "total_objective": float(result.total_objective),
                 "iterations": int(result.iterations),
-                "converged": converged,
-                # Each point is one subgradient solve(); a non-converged
-                # point ran out of its max_iter budget.
-                "solver_path": "subgradient",
-                "non_convergence_reason": (
-                    None if converged else "iteration_budget_exhausted"
-                ),
+                "converged": bool(result.converged),
+                # Each point is one solve(): a bisection for one constraint,
+                # else the subgradient method (DESIGN_DECISIONS §20).
+                "solver_path": result.solver_path,
+                "non_convergence_reason": result.non_convergence_reason,
             }
             totals = result.total_constraints
             lambdas = result.lambdas
@@ -591,6 +588,8 @@ class OnlineOptimiser:
             "n_steps": result.n_steps,
             "iterations": result.iterations,
             "converged": result.converged,
+            "solver_path": result.solver_path,
+            "non_convergence_reason": result.non_convergence_reason,
             "total_objective": result.total_objective,
             "baseline_objective": baseline_obj,
             "lambdas": result.lambdas,
@@ -627,16 +626,30 @@ class OnlineOptimiser:
             for rec in result.history:
                 row: dict[str, Any] = {
                     "iteration": rec["iteration"],
+                    "phase": rec["phase"],
+                    "bracket_lo": rec["bracket_lo"],
+                    "bracket_hi": rec["bracket_hi"],
                     "total_objective": rec["total_objective"],
                     "max_lambda_change": rec["max_lambda_change"],
                     "all_constraints_satisfied": rec["all_constraints_satisfied"],
+                    "accepted": rec["accepted"],
                 }
                 for cname, val in rec["lambdas"].items():
                     row[f"lambda_{cname}"] = val
                 for cname, val in rec["total_constraints"].items():
                     row[f"constraint_{cname}"] = val
                 rows.append(row)
-            convergence_df = pl.DataFrame(rows)
+            # A path's own columns are null on the other's rows; their dtypes
+            # are stated so an all-null column is still typed.
+            convergence_df = pl.DataFrame(
+                rows,
+                schema_overrides={
+                    "bracket_lo": pl.Float64,
+                    "bracket_hi": pl.Float64,
+                    "max_lambda_change": pl.Float64,
+                    "accepted": pl.Boolean,
+                },
+            )
 
         artifacts: dict[str, Any] = {
             "lambdas": result.lambdas,
@@ -1455,7 +1468,12 @@ class _RatioSolveResultWrapper:
         # with the surfaced ``total_constraints``: history[-1] is the
         # convergence point reached, not a transient one-step earlier.
         adjusted: list[dict[str, Any]] = []
-        last_idx = len(inner_history) - 1
+        # A bisection's answer is its last accepted probe, which the replay
+        # reproduces exactly; only a subgradient solve's terminus is the
+        # post-loop pass (DESIGN_DECISIONS §20.2).
+        last_idx = (
+            len(inner_history) - 1 if self._inner.solver_path == "subgradient" else -1
+        )
         # Cache the final actual-ratio map (computed from the wrapper's
         # ``dataframe``) once so the last entry's substitution is O(1).
         final_ratios: dict[str, float] | None = None

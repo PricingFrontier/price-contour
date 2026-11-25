@@ -2,12 +2,21 @@ use crate::data::{
     ConstraintSpec, IterationHistory, IterationRecord, QuoteGrid, SolveResult, SolverConfig,
 };
 use crate::error::{PriceContourError, Result};
+use crate::frontier::{
+    bisection_residual_tolerance, solve_point_1d_bisection, NonConvergenceReason, SolveHistory,
+    SolverPath,
+};
 use crate::solver::convergence::{all_constraints_satisfied, select_final_lambdas};
 use crate::solver::lambda::update_lambdas_subgradient;
 
 use super::argmax::{compute_lambda_signs_f32, lagrangian_argmax_pass};
 
 /// Solve the online optimisation problem via Lagrangian dual decomposition.
+///
+/// Exactly one constraint is solved by bisecting its λ, as a 1-D frontier
+/// point is (DESIGN_DECISIONS §20): its total is monotone in λ, and the
+/// subgradient method can stop far short of a bound the grid can meet. Any
+/// other number of constraints runs the subgradient method.
 pub fn solve_online(
     grid: &QuoteGrid,
     specs: &[ConstraintSpec],
@@ -33,6 +42,9 @@ pub fn solve_online(
         }
     }
 
+    if let [spec] = specs {
+        return solve_online_1d(grid, spec, config, initial_lambdas.map(|l| l[0]));
+    }
     let (baseline_obj, baseline_cons, scale_factors) = grid.compute_scale_factors();
     solve_online_with_precomputed(
         grid,
@@ -43,6 +55,38 @@ pub fn solve_online(
         baseline_cons,
         scale_factors,
     )
+}
+
+/// One constraint: the 1-D frontier's bisection on λ, with its residual
+/// tolerance (`tolerance × max(|bound|, |baseline total|)`). `warm` is the
+/// first upper probe in place of 1.0; `max_iter` bounds nothing here, as
+/// the bisection's own caps bound its probes.
+fn solve_online_1d(
+    grid: &QuoteGrid,
+    spec: &ConstraintSpec,
+    config: &SolverConfig,
+    warm: Option<f64>,
+) -> Result<SolveResult> {
+    let (baseline_objective, baseline_constraints) = grid.baseline_totals();
+    let tolerance = bisection_residual_tolerance(
+        spec.threshold,
+        baseline_constraints[0].abs(),
+        config.tolerance,
+    );
+    let outcome = solve_point_1d_bisection(grid, spec, warm, tolerance, config.record_history)?;
+    Ok(SolveResult {
+        optimal_steps: outcome.optimal_steps,
+        lambdas: vec![outcome.lambda],
+        iterations: outcome.probes,
+        converged: outcome.non_convergence.is_none(),
+        total_objective: outcome.total_objective,
+        total_constraints: vec![outcome.total_constraint],
+        baseline_objective,
+        baseline_constraints,
+        solver_path: SolverPath::Bisection,
+        non_convergence_reason: outcome.non_convergence,
+        history: outcome.history.map(SolveHistory::Bisection),
+    })
 }
 
 /// Internal solve variant that accepts pre-computed baselines and scale factors.
@@ -177,9 +221,9 @@ pub(crate) fn solve_online_with_precomputed(
     }
 
     let history = if config.record_history {
-        Some(IterationHistory {
+        Some(SolveHistory::Subgradient(IterationHistory {
             records: history_records,
-        })
+        }))
     } else {
         None
     };
@@ -193,6 +237,9 @@ pub(crate) fn solve_online_with_precomputed(
         total_constraints,
         baseline_objective,
         baseline_constraints,
+        solver_path: SolverPath::Subgradient,
+        non_convergence_reason: (!converged)
+            .then_some(NonConvergenceReason::IterationBudgetExhausted),
         history,
     })
 }
@@ -391,9 +438,207 @@ mod tests {
             ..Default::default()
         };
         let result = solve_online(&grid, &specs, &config, None).unwrap();
-        let history = result.history.as_ref().expect("history should be Some");
+        // One constraint: the history is the bisection's probes, one per iteration.
+        let Some(SolveHistory::Bisection(probes)) = result.history.as_ref() else {
+            panic!("a one-constraint solve records its bisection probes");
+        };
+        assert_eq!(probes.len(), result.iterations);
+        assert_eq!(probes[0].lambda, 0.0);
+    }
+
+    /// Two constraints run the subgradient method and record its iterations.
+    #[test]
+    fn test_two_constraint_history_is_the_subgradient_iterations() {
+        let grid = QuoteGrid {
+            n_quotes: 3,
+            n_steps: 4,
+            scenario_values: vec![0.9, 0.95, 1.0, 1.05],
+            objective: vec![1.0, 3.0, 2.0, 0.5, 5.0, 4.0, 3.0, 2.0, 0.1, 0.2, 0.3, 0.9],
+            constraints: vec![
+                vec![1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7],
+                vec![1.0; 12],
+            ],
+            constraint_names: vec!["volume".to_string(), "count".to_string()],
+            quote_ids: vec!["Q0".into(), "Q1".into(), "Q2".into()],
+            quote_id_fingerprint: 0,
+        };
+        let (_, bc) = grid.baseline_totals();
+        let specs = vec![
+            ConstraintSpec {
+                name: "volume".to_string(),
+                direction: ConstraintDirection::Min,
+                threshold: bc[0] * 0.9,
+            },
+            ConstraintSpec {
+                name: "count".to_string(),
+                direction: ConstraintDirection::Max,
+                threshold: 3.0,
+            },
+        ];
+        let config = SolverConfig {
+            max_iter: 10,
+            record_history: true,
+            ..Default::default()
+        };
+        let result = solve_online(&grid, &specs, &config, None).unwrap();
+        assert_eq!(result.solver_path, SolverPath::Subgradient);
+        let Some(SolveHistory::Subgradient(history)) = result.history.as_ref() else {
+            panic!("a two-constraint solve records its subgradient iterations");
+        };
         assert_eq!(history.records.len(), result.iterations);
         assert_eq!(history.records[0].iteration, 0);
+        assert_eq!(
+            result.non_convergence_reason,
+            (!result.converged).then_some(NonConvergenceReason::IterationBudgetExhausted)
+        );
+    }
+
+    /// A grid where each quote has its own elasticity and premium, so a volume
+    /// minimum moves quotes one at a time as its λ rises.
+    fn heterogeneous_volume_grid(n: usize) -> QuoteGrid {
+        let m = 9;
+        let scenario_values: Vec<f32> = (0..m).map(|j| 0.8 + 0.05 * j as f32).collect();
+        let mut obj = vec![0.0f32; n * m];
+        let mut vol = vec![0.0f32; n * m];
+        for q in 0..n {
+            let elasticity = 2.0 + 7.0 * ((q * 37) % n) as f32 / n as f32;
+            let base = 200.0 + 600.0 * ((q * 53) % n) as f32 / n as f32;
+            for (j, &mult) in scenario_values.iter().enumerate() {
+                let conversion = 1.0 / (1.0 + (elasticity * (mult - 1.0)).exp());
+                obj[q * m + j] = base * (mult - 0.75) * conversion;
+                vol[q * m + j] = conversion;
+            }
+        }
+        QuoteGrid {
+            n_quotes: n,
+            n_steps: m,
+            scenario_values,
+            objective: obj,
+            constraints: vec![vol],
+            constraint_names: vec!["volume".to_string()],
+            quote_ids: (0..n).map(|i| format!("Q{i:05}")).collect(),
+            quote_id_fingerprint: 0,
+        }
+    }
+
+    /// The bound half way between the volume the unconstrained optimum gives
+    /// and the most the grid allows: binding, and reachable.
+    fn binding_volume_bound(grid: &QuoteGrid) -> f64 {
+        let m = grid.n_steps;
+        let (mut at_best, mut most) = (0.0f64, 0.0f64);
+        for q in 0..grid.n_quotes {
+            let row = q * m..(q + 1) * m;
+            let objective = &grid.objective[row.clone()];
+            let volume = &grid.constraints[0][row];
+            let best = (0..m)
+                .max_by(|&a, &b| objective[a].total_cmp(&objective[b]))
+                .unwrap();
+            at_best += volume[best] as f64;
+            most += volume.iter().copied().fold(f32::MIN, f32::max) as f64;
+        }
+        0.5 * (at_best + most)
+    }
+
+    /// One constraint is solved as the 1-D frontier solves its point at the
+    /// same bound (DESIGN_DECISIONS §20): it meets the bound where the
+    /// subgradient method stops short, and gives the point's λ and totals.
+    #[test]
+    fn test_one_constraint_solve_is_the_frontier_point_at_its_bound() {
+        use crate::frontier::{sweep_frontier, FrontierConfig};
+
+        let grid = heterogeneous_volume_grid(2000);
+        let threshold = binding_volume_bound(&grid);
+        let spec = ConstraintSpec {
+            name: "volume".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold,
+        };
+        let config = SolverConfig {
+            record_history: true,
+            ..Default::default()
+        };
+        let solved = solve_online(&grid, std::slice::from_ref(&spec), &config, None).unwrap();
+
+        assert_eq!(solved.solver_path, SolverPath::Bisection);
+        assert!(solved.converged);
+        assert_eq!(solved.non_convergence_reason, None);
+        assert!(solved.total_constraints[0] >= threshold);
+        assert!(solved.lambdas[0] > 0.0, "the bound binds");
+
+        let frontier = sweep_frontier(
+            &grid,
+            std::slice::from_ref(&spec),
+            &FrontierConfig {
+                n_points_per_dim: 1,
+                threshold_ranges: vec![(threshold, threshold)],
+                max_total_points: None,
+                parallel: false,
+            },
+            &config,
+            None,
+        )
+        .unwrap();
+        let point = &frontier.points[0];
+        assert_eq!(solved.lambdas, point.lambdas);
+        assert_eq!(solved.total_objective, point.total_objective);
+        assert_eq!(solved.total_constraints, point.total_constraints);
+        assert_eq!(solved.iterations, point.iterations);
+
+        let Some(SolveHistory::Bisection(probes)) = solved.history.as_ref() else {
+            panic!("a one-constraint solve records its bisection probes");
+        };
+        assert_eq!(probes.len(), solved.iterations);
+        let answer = probes.iter().rev().find(|probe| probe.accepted).unwrap();
+        assert_eq!(answer.lambda, solved.lambdas[0]);
+        assert_eq!(answer.total_constraint, solved.total_constraints[0]);
+        assert_eq!(answer.total_objective, solved.total_objective);
+    }
+
+    /// A warm start moves where the bracket starts; the answer still meets the bound.
+    #[test]
+    fn test_one_constraint_warm_start_meets_the_bound() {
+        let grid = heterogeneous_volume_grid(500);
+        let threshold = binding_volume_bound(&grid);
+        let specs = [ConstraintSpec {
+            name: "volume".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold,
+        }];
+        let config = SolverConfig::default();
+        let cold = solve_online(&grid, &specs, &config, None).unwrap();
+        let warm = solve_online(&grid, &specs, &config, Some(&cold.lambdas)).unwrap();
+
+        assert!(warm.converged);
+        assert!(warm.total_constraints[0] >= threshold);
+        assert!(warm.iterations <= cold.iterations);
+    }
+
+    /// A bound beyond what the grid allows is not met: the solve says why and
+    /// reports the highest-λ probe, never a silent undershoot.
+    #[test]
+    fn test_one_constraint_bound_beyond_the_grid_is_above_the_envelope() {
+        let grid = heterogeneous_volume_grid(200);
+        let most: f64 = (0..grid.n_quotes)
+            .map(|q| {
+                grid.constraints[0][q * grid.n_steps..(q + 1) * grid.n_steps]
+                    .iter()
+                    .copied()
+                    .fold(f32::MIN, f32::max) as f64
+            })
+            .sum();
+        let specs = [ConstraintSpec {
+            name: "volume".to_string(),
+            direction: ConstraintDirection::Min,
+            threshold: most * 1.01,
+        }];
+        let result = solve_online(&grid, &specs, &SolverConfig::default(), None).unwrap();
+
+        assert!(!result.converged);
+        assert_eq!(
+            result.non_convergence_reason,
+            Some(NonConvergenceReason::AboveEnvelope)
+        );
+        assert!(result.total_constraints[0] < most * 1.01);
     }
 
     #[test]

@@ -244,17 +244,18 @@ def frontier_point_history_schema(
     return schema
 
 
-def _subgradient_history_rows(
+def _solve_history_rows(
     point_index: int, history: list[dict[str, Any]], constraint_names: list[str]
 ) -> list[dict[str, Any]]:
-    """One online ``point_history`` row per entry of a ``solve()`` history."""
+    """One online ``point_history`` row per record of a ``solve()`` history: a
+    bisection probe or a subgradient iteration (DESIGN_DECISIONS §20.2)."""
     return [
         {
             "point_index": point_index,
             "step": int(record["iteration"]),
-            "phase": "subgradient",
-            "bracket_lo": None,
-            "bracket_hi": None,
+            "phase": record["phase"],
+            "bracket_lo": record["bracket_lo"],
+            "bracket_hi": record["bracket_hi"],
             **{
                 f"lambda_{name}": float(record["lambdas"][name])
                 for name in constraint_names
@@ -265,8 +266,8 @@ def _subgradient_history_rows(
                 for name in constraint_names
             },
             "all_satisfied": bool(record["all_constraints_satisfied"]),
-            "accepted": None,
-            "max_lambda_change": float(record["max_lambda_change"]),
+            "accepted": record["accepted"],
+            "max_lambda_change": record["max_lambda_change"],
         }
         for record in history
     ]
@@ -345,7 +346,7 @@ def _python_frontier_orchestrator(
                     "a frontier point solved with record_history=True returned no history"
                 )
             history_rows.extend(
-                _subgradient_history_rows(len(rows), result.history, constraint_names)
+                _solve_history_rows(len(rows), result.history, constraint_names)
             )
         row = compose_row(result, combo, swept_names)
         rows.append(row)

@@ -613,9 +613,10 @@ class TestRatioInRecordHistory:
                 f"ratio."
             )
 
-    def test_history_final_iteration_matches_total_constraints(self):
-        """Final-iteration history record matches the surfaced
-        ``total_constraints[label]``: same value, same code path."""
+    def test_history_answer_matches_total_constraints(self):
+        """The answer's history record matches the surfaced
+        ``total_constraints[label]``: one constraint bisects (DESIGN_DECISIONS
+        §20), so the answer is the last accepted probe, replayed at its λ."""
         df = make_ratio_solve_df(n_quotes=20, n_steps=5)
         solver = pc.OnlineOptimiser(
             objective="income",
@@ -631,7 +632,8 @@ class TestRatioInRecordHistory:
             record_history=True,
         )
         result = solver.solve(df)
-        last = result.history[-1]
+        assert result.solver_path == "bisection"
+        last = [record for record in result.history if record["accepted"]][-1]
         assert last["total_constraints"]["loss_ratio"] == pytest.approx(
             result.total_constraints["loss_ratio"],
             rel=REPORT_RTOL,

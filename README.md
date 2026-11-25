@@ -548,7 +548,7 @@ For fixed lambdas:
 These are independent and embarrassingly parallel.
 ```
 
-The outer loop updates lambdas via the subgradient method with adaptive step sizes, iterating until all constraints are satisfied and lambdas converge.
+The outer loop updates lambdas via the subgradient method with adaptive step sizes, iterating until all constraints are satisfied and lambdas converge. With exactly one constraint the total moves monotonically with its lambda, so `solve()` bisects that lambda instead, as a one-constraint frontier does: the smallest lambda that meets the bound, found in a bounded number of fixed-lambda passes, whatever `max_iter` is.
 
 ### Performance
 
@@ -685,8 +685,10 @@ The constructor's `existing_rates` takes today's rate tables, and `base_multipli
 
 | Property | Type | Description |
 |---|---|---|
-| `converged` | `bool` | Whether the solver converged. |
-| `iterations` | `int` | Number of iterations taken. |
+| `converged` | `bool` | Whether the solver converged. A one-constraint solve converges unless its bound is beyond what the grid allows. |
+| `iterations` | `int` | Number of iterations taken, or of fixed-lambda probes for a one-constraint solve. |
+| `solver_path` | `str` | `"bisection"` (exactly one constraint) or `"subgradient"`. |
+| `non_convergence_reason` | `str \| None` | Why `converged` is false: `"above_envelope"` or `"bracket_exhausted"` (bisection), `"iteration_budget_exhausted"` (subgradient); `None` when converged. |
 | `lambdas` | `dict[str, float]` | Final Lagrange multipliers per constraint, in constraint order. |
 | `total_objective` | `float` | Portfolio-level objective at optimal solution. |
 | `total_constraints` | `dict[str, float]` | Portfolio-level constraint totals. |
@@ -695,7 +697,7 @@ The constructor's `existing_rates` takes today's rate tables, and `base_multipli
 | `constraint_bounds` | `dict[str, float]` | Absolute bound of each constraint (`baseline × fraction` for `min_pct`/`max_pct`; the ratio bound for ratio constraints). |
 | `baseline_scenario_value` | `float` | Scenario value of the baseline step. |
 | `dataframe` | `pl.DataFrame` | Per-quote results with optimal scenario values. |
-| `history` | `list[dict] \| None` | Per-iteration convergence records (if `record_history=True`). |
+| `history` | `list[dict] \| None` | One record per iteration or probe (if `record_history=True`), with the same keys on both paths: `iteration`, `phase` (`"bracket"`, `"bisect"` or `"subgradient"`), `bracket_lo`, `bracket_hi`, `lambdas`, `total_objective`, `total_constraints`, `all_constraints_satisfied`, `accepted` (probes) and `max_lambda_change` (iterations); a path's own keys are `None` on the other's records. |
 | `n_quotes` | `int` | Number of quotes in the grid. |
 | `n_steps` | `int` | Number of scenario value steps. |
 | `scenario_values` | `list[float]` | The scenario value grid. |

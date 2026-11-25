@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import polars as pl
+import pytest
 
 import price_contour as pc
 from helpers import make_small_df, CONSTRAINT_RTOL
@@ -389,39 +390,34 @@ class TestConvergenceBehavior:
             f"last quarter range={last_range:.4f}"
         )
 
-    def test_history_lambdas_stabilize(self):
-        """Lambda changes decrease over iterations (last 25% < first 25%)."""
+    def test_history_brackets_narrow(self):
+        """A one-constraint solve bisects (DESIGN_DECISIONS §20): each halving's
+        bracket lies inside the one before it."""
         result = self._solve_with_history()
         assert result.history is not None
-        n = len(result.history)
-        assert n >= 4, f"too few iterations ({n}) to test stabilization"
-
-        quarter = n // 4
-        first_quarter_changes = [
-            rec["max_lambda_change"] for rec in result.history[:quarter]
+        assert result.solver_path == "bisection"
+        brackets = [
+            (rec["bracket_lo"], rec["bracket_hi"])
+            for rec in result.history
+            if rec["phase"] == "bisect"
         ]
-        last_quarter_changes = [
-            rec["max_lambda_change"] for rec in result.history[-quarter:]
-        ]
-
-        mean_first = sum(first_quarter_changes) / len(first_quarter_changes)
-        mean_last = sum(last_quarter_changes) / len(last_quarter_changes)
-
-        assert mean_last < mean_first, (
-            f"lambdas did not stabilize: mean change first 25%={mean_first:.6f}, "
-            f"last 25%={mean_last:.6f}"
+        assert len(brackets) >= 2, (
+            f"too few halvings ({len(brackets)}) to test narrowing"
         )
+        for (lo, hi), (next_lo, next_hi) in zip(brackets, brackets[1:]):
+            assert lo <= next_lo < next_hi <= hi
+            assert next_hi - next_lo == pytest.approx((hi - lo) / 2)
 
-    def test_history_final_constraints_satisfied(self):
-        """If converged, the final history record has all constraints satisfied."""
+    def test_history_answer_satisfies_the_bound(self):
+        """If converged, the last accepted probe meets the bound and is the result."""
         result = self._solve_with_history()
         assert result.history is not None
 
         if result.converged:
-            final_rec = result.history[-1]
-            assert final_rec["all_constraints_satisfied"] is True, (
-                "converged but final record does not have all_constraints_satisfied=True"
-            )
+            answer = [rec for rec in result.history if rec["accepted"]][-1]
+            assert answer["all_constraints_satisfied"] is True
+            assert answer["total_constraints"] == result.total_constraints
+            assert answer["lambdas"] == result.lambdas
 
     def test_history_final_record_matches_result(self):
         """Final history record's values are in the same ballpark as the SolveResult.

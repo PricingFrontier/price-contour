@@ -1,6 +1,7 @@
 use crate::cancel::{check_cancelled, CancelFlag};
 use crate::constants::*;
 use crate::error::{PriceContourError, Result};
+use crate::frontier::{NonConvergenceReason, SolveHistory, SolverPath};
 
 /// Contiguous memory layout for solver operations.
 ///
@@ -377,8 +378,13 @@ pub struct SolveResult {
     pub baseline_objective: f64,
     /// Baseline constraint totals (all quotes at scenario_value nearest 1.0).
     pub baseline_constraints: Vec<f64>,
-    /// Per-iteration convergence history, if `record_history` was set.
-    pub history: Option<IterationHistory>,
+    /// How the solve ran: bisection for exactly one constraint, else the
+    /// subgradient method (DESIGN_DECISIONS §20).
+    pub solver_path: SolverPath,
+    /// Why `converged` is false, or `None` when it converged.
+    pub non_convergence_reason: Option<NonConvergenceReason>,
+    /// Every probe or iteration, if `record_history` was set.
+    pub history: Option<SolveHistory>,
 }
 
 /// Builder for incrementally constructing a QuoteGrid from chunked data.
