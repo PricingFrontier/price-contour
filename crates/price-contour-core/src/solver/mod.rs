@@ -15,7 +15,7 @@ pub use convergence::{all_constraints_satisfied, select_final_lambdas};
 pub use grouped::{solve_grouped, solve_grouped_with_base, GroupedBaseline};
 pub use lambda::update_lambdas_subgradient;
 pub use online::solve_online;
-pub(crate) use online::solve_online_with_precomputed;
+pub(crate) use online::{check_initial_lambdas, solve_online_with_precomputed};
 pub use ratebook_eval::{
     evaluate_ratebook, evaluate_ratebook_cancellable, evaluate_ratebook_with_base,
     evaluate_ratebook_with_base_cancellable, quote_baseline_steps, starting_products,

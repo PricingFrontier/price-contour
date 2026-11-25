@@ -178,7 +178,8 @@ mod tests {
         let result = apply_lambdas(&grid, &specs, &zero_lambdas).unwrap();
 
         // With zero lambdas, each quote picks max-objective step (same as unconstrained)
-        for q in 0..grid.n_quotes {
+        assert_eq!(result.optimal_steps.len(), grid.n_quotes);
+        for (q, &step) in result.optimal_steps.iter().enumerate() {
             let base = q * grid.n_steps;
             let best = (0..grid.n_steps)
                 .max_by(|&a, &b| {
@@ -187,7 +188,7 @@ mod tests {
                         .unwrap()
                 })
                 .unwrap();
-            assert_eq!(result.optimal_steps[q], best as u32, "quote {q}");
+            assert_eq!(step, best as u32, "quote {q}");
         }
     }
 

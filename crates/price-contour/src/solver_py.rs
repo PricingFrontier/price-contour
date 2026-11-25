@@ -4,13 +4,15 @@ use std::sync::Arc;
 use polars::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3_polars::PyDataFrame;
 use rayon::prelude::*;
 
 use price_contour_core::constants::{CANCEL_POLL_QUOTES, RECONSTRUCT_PAR_GRAIN};
 use price_contour_core::{
-    check_cancelled, fingerprint_quote_ids, solve_online, CancelFlag, ConstraintDirection,
-    ConstraintSpec, QuoteGrid, SolveResult, SolverConfig,
+    check_cancelled, fingerprint_quote_ids, solve_online, BisectionPhase, CancelFlag,
+    ConstraintDirection, ConstraintSpec, NonConvergenceReason, QuoteGrid, SolveHistory,
+    SolveResult, SolverConfig, SolverPath,
 };
 
 use crate::builder_py::check_scenario_value;
@@ -408,6 +410,54 @@ pub(crate) fn build_result_dataframe_polling(
         .map_err(|e| PyValueError::new_err(format!("DataFrame build failed: {e}")))
 }
 
+/// The label a solve's or frontier point's `solver_path` carries.
+pub(crate) fn solver_path_label(path: SolverPath) -> &'static str {
+    match path {
+        SolverPath::Bisection => "bisection",
+        SolverPath::Subgradient => "subgradient",
+    }
+}
+
+/// The label a solve's or frontier point's `non_convergence_reason` carries.
+pub(crate) fn non_convergence_label(reason: NonConvergenceReason) -> &'static str {
+    match reason {
+        NonConvergenceReason::AboveEnvelope => "above_envelope",
+        NonConvergenceReason::BracketExpansionExhausted => "bracket_exhausted",
+        NonConvergenceReason::IterationBudgetExhausted => "iteration_budget_exhausted",
+    }
+}
+
+/// One record of a solve's history, on either path.
+struct HistoryRow<'a> {
+    iteration: usize,
+    phase: &'static str,
+    bracket: Option<(f64, f64)>,
+    lambdas: &'a [f64],
+    total_objective: f64,
+    total_constraints: &'a [f64],
+    satisfied: bool,
+    accepted: Option<bool>,
+    max_lambda_change: Option<f64>,
+}
+
+fn history_record(py: Python, names: &[String], row: HistoryRow) -> PyResult<Py<PyDict>> {
+    let record = PyDict::new(py);
+    record.set_item("iteration", row.iteration)?;
+    record.set_item("phase", row.phase)?;
+    record.set_item("bracket_lo", row.bracket.map(|(lo, _)| lo))?;
+    record.set_item("bracket_hi", row.bracket.map(|(_, hi)| hi))?;
+    record.set_item("lambdas", zip_to_dict(names, row.lambdas))?;
+    record.set_item("total_objective", row.total_objective)?;
+    record.set_item(
+        "total_constraints",
+        zip_to_dict(names, row.total_constraints),
+    )?;
+    record.set_item("all_constraints_satisfied", row.satisfied)?;
+    record.set_item("accepted", row.accepted)?;
+    record.set_item("max_lambda_change", row.max_lambda_change)?;
+    Ok(record.unbind())
+}
+
 /// Python-visible solve result wrapping the core SolveResult.
 #[pyclass(name = "SolveResult")]
 pub struct PySolveResult {
@@ -480,59 +530,74 @@ impl PySolveResult {
         self.grid.scenario_values[self.grid.baseline_step()]
     }
 
+    /// `"bisection"` (exactly one constraint) or `"subgradient"`.
     #[getter]
-    fn history(&self, py: Python) -> Option<Vec<HashMap<String, Py<PyAny>>>> {
-        self.inner.history.as_ref().map(|h| {
-            h.records
+    fn solver_path(&self) -> &'static str {
+        solver_path_label(self.inner.solver_path)
+    }
+
+    /// Why `converged` is false, or `None` when it converged.
+    #[getter]
+    fn non_convergence_reason(&self) -> Option<&'static str> {
+        self.inner.non_convergence_reason.map(non_convergence_label)
+    }
+
+    /// One record per probe or iteration, with the same keys on both paths
+    /// (DESIGN_DECISIONS §20.2); a path's own keys are `None` on the other's.
+    #[getter]
+    fn history(&self, py: Python) -> PyResult<Option<Vec<Py<PyDict>>>> {
+        let names = &self.constraint_names;
+        let Some(history) = self.inner.history.as_ref() else {
+            return Ok(None);
+        };
+        let records = match history {
+            SolveHistory::Subgradient(iterations) => iterations
+                .records
                 .iter()
-                .map(|rec| {
-                    let mut d: HashMap<String, Py<PyAny>> = HashMap::new();
-                    d.insert(
-                        "iteration".into(),
-                        rec.iteration.into_pyobject(py).unwrap().unbind().into(),
-                    );
-                    d.insert(
-                        "total_objective".into(),
-                        rec.total_objective
-                            .into_pyobject(py)
-                            .unwrap()
-                            .unbind()
-                            .into(),
-                    );
-                    d.insert(
-                        "max_lambda_change".into(),
-                        rec.max_lambda_change
-                            .into_pyobject(py)
-                            .unwrap()
-                            .unbind()
-                            .into(),
-                    );
-                    d.insert(
-                        "all_constraints_satisfied".into(),
-                        rec.all_constraints_satisfied
-                            .into_pyobject(py)
-                            .unwrap()
-                            .to_owned()
-                            .unbind()
-                            .into(),
-                    );
-
-                    let lam_dict = zip_to_dict(&self.constraint_names, &rec.lambdas);
-                    d.insert(
-                        "lambdas".into(),
-                        lam_dict.into_pyobject(py).unwrap().unbind().into(),
-                    );
-
-                    let con_dict = zip_to_dict(&self.constraint_names, &rec.total_constraints);
-                    d.insert(
-                        "total_constraints".into(),
-                        con_dict.into_pyobject(py).unwrap().unbind().into(),
-                    );
-
-                    d
+                .map(|record| {
+                    history_record(
+                        py,
+                        names,
+                        HistoryRow {
+                            iteration: record.iteration,
+                            phase: "subgradient",
+                            bracket: None,
+                            lambdas: &record.lambdas,
+                            total_objective: record.total_objective,
+                            total_constraints: &record.total_constraints,
+                            satisfied: record.all_constraints_satisfied,
+                            accepted: None,
+                            max_lambda_change: Some(record.max_lambda_change),
+                        },
+                    )
                 })
-                .collect()
-        })
+                .collect::<PyResult<Vec<_>>>()?,
+            SolveHistory::Bisection(probes) => probes
+                .iter()
+                .enumerate()
+                .map(|(step, probe)| {
+                    history_record(
+                        py,
+                        names,
+                        HistoryRow {
+                            iteration: step,
+                            phase: match probe.phase {
+                                BisectionPhase::Bracket => "bracket",
+                                BisectionPhase::Bisect => "bisect",
+                            },
+                            bracket: probe.bracket,
+                            lambdas: std::slice::from_ref(&probe.lambda),
+                            total_objective: probe.total_objective,
+                            total_constraints: std::slice::from_ref(&probe.total_constraint),
+                            satisfied: probe.satisfied,
+                            accepted: Some(probe.accepted),
+                            max_lambda_change: None,
+                        },
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+        };
+        Ok(Some(records))
     }
 
     #[getter]

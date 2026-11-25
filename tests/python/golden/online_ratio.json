@@ -11,10 +11,10 @@
       "loss_ratio": 0.6550663619945511
     },
     "baseline_objective": 2395.059501647949,
-    "converged": false,
-    "iterations": 500,
+    "converged": true,
+    "iterations": 34,
     "lambdas": {
-      "loss_ratio": 1.1071337116900308
+      "loss_ratio": 1.1068207621574402
     },
     "optimal_scenario_values": [
       0.8999999761581421,

@@ -306,6 +306,8 @@ Two options:
 
 Recommendation: start with subgradient (simpler), add bisection as an option if convergence is too slow.
 
+Decided (0.11.0, DESIGN_DECISIONS §20): one constraint bisects its λ, as the 1-D frontier does, because the subgradient method stopped far short of reachable bounds; two or more constraints keep the subgradient method.
+
 ### Memory Management
 
 **Inside the solver** (price-contour): chunked processing controls peak memory during the Lagrangian iteration. The solver processes risks in chunks of `chunk_size` (default 500K). The lagrangian matrix is only allocated at chunk size, not full portfolio size. Streaming aggregation accumulates portfolio totals across chunks.
@@ -671,7 +673,7 @@ The library accepts Polars DataFrames at the Python API boundary. Internal compu
 
 2. **Spline coefficient export**: should spline coefficients be exposed via the Python API and saved as artifacts? This would enable faster live scoring (evaluate spline directly instead of re-scoring models). Requires Rust API changes.
 
-3. **Lambda convergence method**: subgradient (simple, may oscillate) vs bisection (tighter, more portfolio sweeps). Start with subgradient, add bisection option?
+3. **Lambda convergence method**: decided in 0.11.0: bisection for one constraint, subgradient for more (DESIGN_DECISIONS §20).
 
 4. **Multiple objectives**: the current design is single-objective with constraints. Should we support multi-objective (Pareto across two objectives)? This changes the frontier from a curve to a surface.
 

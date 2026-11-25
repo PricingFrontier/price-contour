@@ -244,17 +244,18 @@ def frontier_point_history_schema(
     return schema
 
 
-def _subgradient_history_rows(
+def _solve_history_rows(
     point_index: int, history: list[dict[str, Any]], constraint_names: list[str]
 ) -> list[dict[str, Any]]:
-    """One online ``point_history`` row per entry of a ``solve()`` history."""
+    """One online ``point_history`` row per record of a ``solve()`` history: a
+    bisection probe or a subgradient iteration (DESIGN_DECISIONS §20.2)."""
     return [
         {
             "point_index": point_index,
             "step": int(record["iteration"]),
-            "phase": "subgradient",
-            "bracket_lo": None,
-            "bracket_hi": None,
+            "phase": record["phase"],
+            "bracket_lo": record["bracket_lo"],
+            "bracket_hi": record["bracket_hi"],
             **{
                 f"lambda_{name}": float(record["lambdas"][name])
                 for name in constraint_names
@@ -265,8 +266,8 @@ def _subgradient_history_rows(
                 for name in constraint_names
             },
             "all_satisfied": bool(record["all_constraints_satisfied"]),
-            "accepted": None,
-            "max_lambda_change": float(record["max_lambda_change"]),
+            "accepted": record["accepted"],
+            "max_lambda_change": record["max_lambda_change"],
         }
         for record in history
     ]
@@ -338,14 +339,19 @@ def _python_frontier_orchestrator(
 
     for combo in combos:
         result, next_lambdas = solve_one(combo, prev_lambdas)
-        prev_lambdas = next_lambdas
+        # A bisection that did not converge reports the capped lambda of a bound
+        # past the grid: a warm start from it would only cost the next point
+        # halvings, so it starts from the last converged point, as the Rust
+        # 1-D sweep does. A subgradient point warm-starts its neighbour as before.
+        if result.converged or result.solver_path != "bisection":
+            prev_lambdas = next_lambdas
         if record_history:
             if result.history is None:
                 raise RuntimeError(
                     "a frontier point solved with record_history=True returned no history"
                 )
             history_rows.extend(
-                _subgradient_history_rows(len(rows), result.history, constraint_names)
+                _solve_history_rows(len(rows), result.history, constraint_names)
             )
         row = compose_row(result, combo, swept_names)
         rows.append(row)

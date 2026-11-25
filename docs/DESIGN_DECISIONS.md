@@ -1092,6 +1092,7 @@ class OptimiserConfig(TypedDict, total=False):
 | 22 | **One baseline rule** | The baseline is one grid-wide step: the scenario value nearest 1.0 in f32, lowest index on a tie. Sum, pct and ratio constraints all use it. See §13.6. |
 | 23 | **Fail loud at the consumer boundary** | No reported value is a silent default (0.0, NaN, empty). Missing data raises; data that is not persisted raises `ResultUnavailableError` on access. See §13.7 and §13.10. |
 | 24 | **Deterministic outputs** | Dicts follow constraint order, reductions have a fixed order, and repeated runs give bit-identical results. See §13.8. |
+| 25 | **A one-constraint solve bisects** | With one constraint, λ → total is monotone, so `solve()` bisects λ as the 1-D frontier does instead of running the subgradient method, which can stop far short of a bound it could meet. A solve and the frontier point at its bound are then one method. See §20. |
 
 ---
 
@@ -1533,7 +1534,13 @@ order is part of a contract states it:
   input order and moves with its pin.
 - The ratio history replay (`_actual_ratios_for_lambdas`) uses
   `maintain_order="left"`, for the same last-bits reason in
-  `history[*]["total_constraints"]`.
+  `history[*]["total_constraints"]`; it takes each quote's step from
+  `apply_from_grid` (§20.2) and sums the chosen rows in input order.
+
+Order alone does not fix the last bits: Polars sums each chunk of a column
+apart, and a join or filter run on several threads returns several chunks. Every
+ratio total (`_safe_ratio_from_columns`) sums its Float64 column in one chunk, so
+it depends on the rows and their order, never on the thread count.
 
 A lazy `collect()` runs on the streaming engine by default in Polars 2. The
 library's inputs are eager frames, so its queries are written eagerly: the
@@ -1589,7 +1596,7 @@ frame, `None` when the sweep did not record. Its rows are grouped by
 point in the order the steps ran. Its exact schema is
 `frontier_point_history_schema(mode, constraint_names)`, beside
 `frontier_points_schema` (§13.12). Its size is bounded per point: a bisection
-point runs at most 1 + 1 + 32 + 56 probes (the λ=0 probe, the first bracket
+point runs at most 1 + 1 + 32 + 60 probes (the λ=0 probe, the first bracket
 probe, the bracket-expansion cap and the bisection cap), a subgradient point
 `max_iter` iterations, a ratebook point `max_cd_iterations × n_factors` inner
 solves.
@@ -1894,3 +1901,99 @@ limit lowered uniformly, with the rest rolled into "Other"), and then the
 per-factor row limit lowered uniformly, 500 beeswarm dots per plot and 18,000 per page, and 2,000
 convergence-trace rows. There is no chart per factor per point, which at 25 points and 55 factors
 would exceed the budget by itself.
+
+## 20. One-constraint solve (0.11.0)
+
+### Context
+
+`solve()` ran the subgradient method whatever the number of constraints. With one
+constraint its 1/√t step decay can stop far short of a bound the grid can meet:
+haute measured, on 5,000 quotes of 9 steps with one binding minimum, a solve 19%
+short of its bound after 50 iterations and still 10% short after 1,000, and on
+small books 65 of 67 binding one-constraint solves never converged. The 1-D
+frontier already solves that problem by bisecting λ (§4): its point at the same
+bound met it. A solve and the frontier point at its bound gave two answers to one
+problem, and the advice "increase `max_iter`" did not help.
+
+### 20.1 The dispatch
+
+`solve_online` (and so `OnlineOptimiser.solve()` on a grid or a DataFrame, ratio
+constraints included, since one ratio constraint linearises to one sum
+constraint) solves a problem with exactly one constraint by the frontier's
+bisection, `frontier::solve_point_1d_bisection`, which `sweep_frontier`
+calls for its 1-D sweeps too. The residual tolerance is the frontier's,
+`tolerance × max(|bound|, |baseline total|)`. No constraints, or two or more, keep
+the subgradient method.
+
+On the bisection path:
+
+- `max_iter` bounds nothing: a bisection runs at most 1 + 1 + 32 + 60 probes (§16.2).
+- `lambdas` (a warm start) is the first upper probe in place of 1.0, as a 1-D
+  sweep's previous point is, clamped to [1.0, 1e9 cap]: from 1.0 or above the
+  bracket's doublings reach the cap within their budget, so a small hint cannot
+  end the search short of a λ the cold start reaches. The bracket's low end is
+  always 0, and the halvings stop once the bracket is within 1e-9 of its
+  satisfying end (at least 1e-9), measured as it narrows rather than from where
+  it started; their budget of 60 lets a bracket starting at the cap reach that,
+  so a distant hint costs halvings, not precision: a warm start moves where the
+  search starts, not how finely it ends. A warm-start lambda that is not finite
+  is refused (`ValueError`) before any probe, by `solve()` on either path and by
+  `frontier()`.
+- `converged` is true when the returned λ meets the bound one-sidedly. It is
+  false only for a bound beyond what the grid allows (`above_envelope`) or a
+  bracket that could not be expanded (`bracket_exhausted`); the result is then the
+  highest-λ probe, so the envelope ceiling is reported, never a silent undershoot.
+- `iterations` is the number of probes.
+- λ, the totals and the per-quote steps are exactly the last accepted probe's.
+
+A 1-D frontier point at the solve's bound runs the same bisection. Warm-started
+from the solve's λ (as `frontier(initial_lambdas=solve_result.lambdas)` passes
+it, and as each sequential 1-D point is from its neighbour), it starts its
+bracket there, so it finds the same smallest satisfying λ to the bisection's
+resolution: the same per-quote steps and totals unless a quote's choice changes
+within that resolution.
+
+### 20.2 What the result says
+
+`SolveResult` gains `solver_path` (`"bisection"` or `"subgradient"`) and
+`non_convergence_reason` (`None` when converged; `"above_envelope"` or
+`"bracket_exhausted"` for a bisection, `"iteration_budget_exhausted"` for a
+subgradient solve that used up `max_iter`), with the strings a frontier point's
+`solver_path` and `non_convergence_reason` columns use.
+
+`history` records carry the same keys on both paths, the online
+`point_history` row of §16.2 as a dict: `iteration` (the 0-based probe or
+iteration), `phase` (`"bracket"`, `"bisect"` or `"subgradient"`), `bracket_lo`
+and `bracket_hi` (the bracket a `"bisect"` probe halved, else `None`), `lambdas`,
+`total_objective`, `total_constraints`, `all_constraints_satisfied`, `accepted`
+(a probe that became the answer; `None` for an iteration) and `max_lambda_change`
+(`None` for a probe). A ratio label's per-record total is the actual ratio at that
+record's λ (§15.3); a bisection's last record is not replaced by the result's
+totals, since its answer is its last accepted probe, which the replay reproduces.
+
+The Python-orchestrated frontier (ratio or unswept constraints) takes each point's
+`solver_path`, `non_convergence_reason` and `point_history` rows from its
+`solve()`, so a one-constraint ratio sweep reports bisection points as the Rust
+sweep does; and, as the Rust 1-D sweep does, a bisection point that did not
+converge (whose λ is the cap) does not warm-start the next point.
+
+A ratio label's replayed total takes each quote's step from the solver's own
+argmax (`apply_from_grid` on the linearised grid, f32, ties to the lowest scenario
+index), so a record chooses exactly its iteration's or probe's steps whatever the
+input's row order, and sums the chosen rows in input order (§15.3).
+
+In Rust, `SolveResult.history` is `Option<SolveHistory>` (`Bisection(probes)` or
+`Subgradient(iterations)`), the enum a `FrontierPoint` carries, renamed from
+`PointHistory`; `SolveResult` gains `solver_path` and `non_convergence_reason`.
+
+### 20.3 What changed beyond the solve
+
+A one-constraint solve's answer changes: it now meets a bound the grid allows,
+where the subgradient method's averaged-λ pass could leave it short. A
+one-constraint Python-orchestrated frontier (one ratio constraint) changes with
+it, from subgradient to bisection points. The bisection's stopping rule (§20.1)
+can add a halving to a Rust 1-D frontier point and move its λ in the last
+digits, never its steps beyond that resolution. Solves and frontiers with two or
+more constraints, and the ratebook's grouped solves, keep their methods and
+results.
+

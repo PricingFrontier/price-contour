@@ -3,8 +3,8 @@ use rayon::prelude::*;
 use crate::data::{ConstraintDirection, ConstraintSpec, IterationHistory, QuoteGrid, SolverConfig};
 use crate::error::Result;
 use crate::solver::apply_lambdas_no_baselines;
-use crate::solver::solve_online_with_precomputed;
 use crate::solver::ApplyPass;
+use crate::solver::{check_initial_lambdas, solve_online_with_precomputed};
 
 /// Hard upper bound on lambda during 1-D bisection bracket expansion.
 ///
@@ -14,14 +14,14 @@ use crate::solver::ApplyPass;
 /// without satisfying the target, the target is treated as infeasible.
 const FRONTIER_LAMBDA_BISECTION_CAP: f64 = 1.0e9;
 
-/// Hard cap on bisection halving steps after the bracket is established.
+/// Cap on bisection halving steps after the bracket is established.
 ///
-/// f64 has 52 mantissa bits, so a bracket of `[0, 1e9]` underflows the
-/// representable interval at iter ≈ 53 (`1e9 / 2^53 ≈ 1.1e-7`). The
-/// `bracket_tolerance` early-break in [`solve_point_1d_bisection`] usually
-/// fires well before this — the cap is purely defensive against
-/// pathological brackets.
-const FRONTIER_LAMBDA_BISECTION_MAX_ITER: usize = 56;
+/// The bracket starts at most `[0, FRONTIER_LAMBDA_BISECTION_CAP]` (a hint is
+/// clamped to the cap), and its halvings stop once it is within 1e-9 of its
+/// satisfying end (at least 1e-9). Halving `1e9` to `1e-9` takes
+/// `log2(1e18) ≈ 59.8` steps, so 60 lets every permitted start reach that
+/// precision: where the search starts never changes how finely it ends.
+const FRONTIER_LAMBDA_BISECTION_MAX_ITER: usize = 60;
 
 /// Cap on bracket-expansion doublings before declaring infeasibility.
 ///
@@ -131,12 +131,12 @@ pub struct BisectionProbe {
     pub accepted: bool,
 }
 
-/// How one frontier point was solved, step by step (`record_history`).
+/// How one solve or frontier point was solved, step by step (`record_history`).
 #[derive(Debug, Clone)]
-pub enum PointHistory {
-    /// Every probe of a 1-D bisection point, in the order it ran.
+pub enum SolveHistory {
+    /// Every probe of a 1-D bisection, in the order it ran.
     Bisection(Vec<BisectionProbe>),
-    /// The iterations of a subgradient point, as `solve_online` records them.
+    /// The iterations of a subgradient solve, as `solve_online` records them.
     Subgradient(IterationHistory),
 }
 
@@ -169,7 +169,7 @@ pub struct FrontierPoint {
     /// Distribution statistics over per-quote optimal scenario values.
     pub sv_stats: ScenarioValueStats,
     /// The point's steps, when `SolverConfig::record_history` was set.
-    pub history: Option<PointHistory>,
+    pub history: Option<SolveHistory>,
 }
 
 /// Aggregate result of a frontier sweep across constraint threshold combinations.
@@ -366,19 +366,19 @@ fn cartesian_product(grids: &[Vec<f64>]) -> Vec<Vec<f64>> {
 /// Outcome of a single bisection solve — the per-point bisection result
 /// before it's repackaged into a `FrontierPoint` (which carries the
 /// `SolverPath`/`NonConvergenceReason` enums up to the caller).
-struct BisectionOutcome {
-    optimal_steps: Vec<u32>,
-    total_objective: f64,
-    total_constraint: f64,
-    lambda: f64,
+pub(crate) struct BisectionOutcome {
+    pub(crate) optimal_steps: Vec<u32>,
+    pub(crate) total_objective: f64,
+    pub(crate) total_constraint: f64,
+    pub(crate) lambda: f64,
     /// Probe count: lambda=0 + bracket-expand + bisect halvings.
-    probes: usize,
+    pub(crate) probes: usize,
     /// `Some(reason)` iff the bisection couldn't satisfy the target —
     /// the result still carries the highest-lambda probe so callers
     /// see the envelope clamp rather than a silent undershoot.
-    non_convergence: Option<NonConvergenceReason>,
+    pub(crate) non_convergence: Option<NonConvergenceReason>,
     /// Every probe, when recording.
-    history: Option<Vec<BisectionProbe>>,
+    pub(crate) history: Option<Vec<BisectionProbe>>,
 }
 
 /// The probes a bisection records when asked to; a no-op otherwise.
@@ -455,7 +455,7 @@ impl ProbeTrace {
 /// further halvings can't improve the user-visible answer.
 ///
 /// `record_history` records every probe as it runs; it adds none.
-fn solve_point_1d_bisection(
+pub(crate) fn solve_point_1d_bisection(
     grid: &QuoteGrid,
     spec: &ConstraintSpec,
     warm_lo: Option<f64>,
@@ -492,11 +492,14 @@ fn solve_point_1d_bisection(
         });
     }
 
-    // Bracket the target: starting from `warm_lo` (or 1.0), double lambda
-    // until the target is one-sidedly satisfied or we hit the cap. The
-    // doubling guarantees O(log) probes to reach any achievable lambda
-    // within the cap, regardless of magnitude.
-    let mut hi = warm_lo.filter(|&w| w > 0.0).unwrap_or(1.0);
+    // Bracket the target: starting from `warm_lo` (clamped to [1.0, cap]),
+    // double lambda until the target is one-sidedly satisfied or we hit the
+    // cap. Starting at 1.0 or above, the doublings reach the cap within
+    // `FRONTIER_BRACKET_EXPAND_MAX_ITER`, so a small hint can never stop the
+    // expansion short of a lambda the cold start would reach; starting at the
+    // cap or below, the halvings reach their precision within
+    // `FRONTIER_LAMBDA_BISECTION_MAX_ITER`.
+    let mut hi = warm_lo.map_or(1.0, |w| w.clamp(1.0, FRONTIER_LAMBDA_BISECTION_CAP));
     let mut hi_pass = apply_at_lambda(grid, spec, hi)?;
     probes += 1;
     let mut hi_satisfied = direction.is_satisfied(hi_pass.total_constraints[0], target);
@@ -548,15 +551,18 @@ fn solve_point_1d_bisection(
     //   1. Target residual within tolerance — once `total` is within
     //      `target_residual_tolerance` of `target`, further halvings
     //      can't improve the user-visible answer.
-    //   2. Bracket width within f64 precision — falls out of (1) for
-    //      well-behaved problems but guards pathological tolerances.
+    //   2. Bracket width within 1e-9 of the satisfying endpoint (at least
+    //      1e-9) — falls out of (1) for well-behaved problems but guards
+    //      pathological tolerances. It is measured against the endpoint as
+    //      it narrows, never the bracket's start, so a distant warm start
+    //      costs halvings but not precision.
     let mut lo = 0.0f64;
     let mut hi_lambda = hi;
     let mut best_optimal_steps = hi_pass.optimal_steps;
     let mut best_total_obj = hi_pass.total_objective;
     let mut best_total_cons = hi_pass.total_constraints[0];
-    let bracket_tolerance = (hi_lambda - lo).max(1.0) * 1e-9;
     for _ in 0..FRONTIER_LAMBDA_BISECTION_MAX_ITER {
+        let bracket_tolerance = hi_lambda.max(1.0) * 1e-9;
         // Residual termination: the satisfying endpoint is close enough
         // to the target that further bisection won't change the
         // user-visible answer.
@@ -622,9 +628,9 @@ fn apply_at_lambda(grid: &QuoteGrid, spec: &ConstraintSpec, lambda: f64) -> Resu
 /// warm-starts from these lambdas instead of cold-starting from zero.
 /// This is useful when a prior `solve_online` has already been run on the
 /// same grid — its lambdas will be close to the first frontier point.
-/// (The 1-D bisection path ignores `initial_lambdas` because bisection
-/// doesn't benefit from a warm start; bracket expansion is already
-/// O(log) regardless.)
+/// (On the 1-D bisection path the warm start is the first upper probe, as
+/// `solve_online` uses a one-constraint warm start; the bracket still
+/// starts at 0, so it moves where the search starts, not what it finds.)
 pub fn sweep_frontier(
     grid: &QuoteGrid,
     specs_template: &[ConstraintSpec],
@@ -642,6 +648,7 @@ pub fn sweep_frontier(
             n_constraints
         )));
     }
+    check_initial_lambdas(initial_lambdas, n_constraints)?;
 
     // Generate per-dimension grids
     let dim_grids: Vec<Vec<f64>> = frontier_config
@@ -726,11 +733,6 @@ pub fn sweep_frontier(
                                 result: crate::data::SolveResult,
                                 sv_stats: ScenarioValueStats|
      -> FrontierPoint {
-        let non_convergence_reason = if result.converged {
-            None
-        } else {
-            Some(NonConvergenceReason::IterationBudgetExhausted)
-        };
         FrontierPoint {
             thresholds,
             total_objective: result.total_objective,
@@ -738,10 +740,10 @@ pub fn sweep_frontier(
             lambdas: result.lambdas,
             iterations: result.iterations,
             converged: result.converged,
-            solver_path: SolverPath::Subgradient,
-            non_convergence_reason,
+            solver_path: result.solver_path,
+            non_convergence_reason: result.non_convergence_reason,
             sv_stats,
-            history: result.history.map(PointHistory::Subgradient),
+            history: result.history,
         }
     };
 
@@ -860,7 +862,7 @@ fn bisection_outcome_to_point(
         solver_path: SolverPath::Bisection,
         non_convergence_reason: outcome.non_convergence,
         sv_stats,
-        history: outcome.history.map(PointHistory::Bisection),
+        history: outcome.history.map(SolveHistory::Bisection),
     }
 }
 
@@ -880,7 +882,11 @@ fn bisection_outcome_to_point(
 /// * both zero (degenerate) → floor at `f64::EPSILON` so the loop
 ///   still terminates.
 #[inline]
-fn bisection_residual_tolerance(target: f64, baseline_abs: f64, relative_tolerance: f64) -> f64 {
+pub(crate) fn bisection_residual_tolerance(
+    target: f64,
+    baseline_abs: f64,
+    relative_tolerance: f64,
+) -> f64 {
     let scale = target.abs().max(baseline_abs);
     (relative_tolerance * scale).max(f64::EPSILON)
 }
@@ -1976,7 +1982,7 @@ mod tests {
                 assert_eq!(t.total_objective, p.total_objective);
                 assert_eq!(t.total_constraints, p.total_constraints);
                 assert_eq!(t.iterations, p.iterations);
-                let Some(PointHistory::Bisection(probes)) = &t.history else {
+                let Some(SolveHistory::Bisection(probes)) = &t.history else {
                     panic!("a 1-D point records bisection probes");
                 };
                 assert_eq!(probes.len(), t.iterations);
@@ -2035,10 +2041,12 @@ mod tests {
             let specs = build_specs(&specs_template, &point.thresholds);
             let standalone =
                 crate::solver::solve_online(&grid, &specs, &solver_config, Some(&initial)).unwrap();
-            let Some(PointHistory::Subgradient(history)) = &point.history else {
+            let Some(SolveHistory::Subgradient(history)) = &point.history else {
                 panic!("a multi-constraint point records its subgradient iterations");
             };
-            let expected = standalone.history.unwrap();
+            let Some(SolveHistory::Subgradient(expected)) = standalone.history else {
+                panic!("a multi-constraint solve records its subgradient iterations");
+            };
             assert_eq!(history.records.len(), point.iterations);
             assert_eq!(history.records.len(), expected.records.len());
             for (got, want) in history.records.iter().zip(&expected.records) {
