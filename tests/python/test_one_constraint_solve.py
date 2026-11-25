@@ -17,7 +17,7 @@ import price_contour as pc
 
 # The bisection's own caps: the λ=0 probe, the first bracket probe, the
 # bracket-expansion doublings and the halvings (§16.2).
-MAX_PROBES = 1 + 1 + 32 + 56
+MAX_PROBES = 1 + 1 + 32 + 60
 
 HISTORY_KEYS = {
     "iteration",
@@ -332,16 +332,30 @@ def _one_quote(rows: list[tuple[int, float, float, float]]) -> pl.DataFrame:
 _THREE_STEPS = [(0, 1.0, 30.0, 100.0), (1, 2.0, 40.0, 100.0), (2, 3.0, 60.0, 100.0)]
 
 
-@pytest.mark.parametrize("warm", [None, 1e9])
-def test_a_distant_warm_start_finds_the_cold_answer(warm: float | None) -> None:
-    result = pc.OnlineOptimiser(
+@pytest.mark.parametrize("warm", [None, 6e8, 1e9, 1e12])
+@pytest.mark.parametrize(
+    "incurred",
+    [
+        pytest.param((30.0, 40.0, 60.0), id="a_wide_interval"),
+        # Every step's Lagrangian meets at one λ, so only the bisection's finest
+        # resolution tells the middle step from its neighbours.
+        pytest.param((20.0, 40.0, 60.0), id="a_triple_tie"),
+    ],
+)
+def test_a_distant_warm_start_finds_the_cold_answer(
+    warm: float | None, incurred: tuple[float, float, float]
+) -> None:
+    rows = [(step, step + 1.0, incurred[step], 100.0) for step in range(3)]
+    solver = pc.OnlineOptimiser(
         objective="income", constraints={"loss_ratio": {**_LOSS_RATIO, "max": 0.5}}
-    ).solve(
-        _one_quote(_THREE_STEPS), lambdas=None if warm is None else {"loss_ratio": warm}
+    )
+    cold = solver.solve(_one_quote(rows))
+    result = solver.solve(
+        _one_quote(rows), lambdas=None if warm is None else {"loss_ratio": warm}
     )
 
     assert result.converged is True
-    assert result.total_objective == 2.0
+    assert result.total_objective == cold.total_objective == 2.0
     assert result.total_constraints["loss_ratio"] == pytest.approx(0.4)
 
 

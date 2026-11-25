@@ -14,14 +14,14 @@ use crate::solver::ApplyPass;
 /// without satisfying the target, the target is treated as infeasible.
 const FRONTIER_LAMBDA_BISECTION_CAP: f64 = 1.0e9;
 
-/// Hard cap on bisection halving steps after the bracket is established.
+/// Cap on bisection halving steps after the bracket is established.
 ///
-/// f64 has 52 mantissa bits, so a bracket of `[0, 1e9]` underflows the
-/// representable interval at iter ≈ 53 (`1e9 / 2^53 ≈ 1.1e-7`). The
-/// `bracket_tolerance` early-break in [`solve_point_1d_bisection`] usually
-/// fires well before this — the cap is purely defensive against
-/// pathological brackets.
-const FRONTIER_LAMBDA_BISECTION_MAX_ITER: usize = 56;
+/// The bracket starts at most `[0, FRONTIER_LAMBDA_BISECTION_CAP]` (a hint is
+/// clamped to the cap), and its halvings stop once it is within 1e-9 of its
+/// satisfying end (at least 1e-9). Halving `1e9` to `1e-9` takes
+/// `log2(1e18) ≈ 59.8` steps, so 60 lets every permitted start reach that
+/// precision: where the search starts never changes how finely it ends.
+const FRONTIER_LAMBDA_BISECTION_MAX_ITER: usize = 60;
 
 /// Cap on bracket-expansion doublings before declaring infeasibility.
 ///
@@ -492,12 +492,14 @@ pub(crate) fn solve_point_1d_bisection(
         });
     }
 
-    // Bracket the target: starting from `warm_lo` (never below 1.0), double
-    // lambda until the target is one-sidedly satisfied or we hit the cap.
-    // Starting at 1.0 or above, the doublings reach the cap within
+    // Bracket the target: starting from `warm_lo` (clamped to [1.0, cap]),
+    // double lambda until the target is one-sidedly satisfied or we hit the
+    // cap. Starting at 1.0 or above, the doublings reach the cap within
     // `FRONTIER_BRACKET_EXPAND_MAX_ITER`, so a small hint can never stop the
-    // expansion short of a lambda the cold start would reach.
-    let mut hi = warm_lo.map_or(1.0, |w| w.max(1.0));
+    // expansion short of a lambda the cold start would reach; starting at the
+    // cap or below, the halvings reach their precision within
+    // `FRONTIER_LAMBDA_BISECTION_MAX_ITER`.
+    let mut hi = warm_lo.map_or(1.0, |w| w.clamp(1.0, FRONTIER_LAMBDA_BISECTION_CAP));
     let mut hi_pass = apply_at_lambda(grid, spec, hi)?;
     probes += 1;
     let mut hi_satisfied = direction.is_satisfied(hi_pass.total_constraints[0], target);

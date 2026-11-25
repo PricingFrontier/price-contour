@@ -1590,7 +1590,7 @@ frame, `None` when the sweep did not record. Its rows are grouped by
 point in the order the steps ran. Its exact schema is
 `frontier_point_history_schema(mode, constraint_names)`, beside
 `frontier_points_schema` (§13.12). Its size is bounded per point: a bisection
-point runs at most 1 + 1 + 32 + 56 probes (the λ=0 probe, the first bracket
+point runs at most 1 + 1 + 32 + 60 probes (the λ=0 probe, the first bracket
 probe, the bracket-expansion cap and the bisection cap), a subgradient point
 `max_iter` iterations, a ratebook point `max_cd_iterations × n_factors` inner
 solves.
@@ -1921,15 +1921,16 @@ the subgradient method.
 
 On the bisection path:
 
-- `max_iter` bounds nothing: a bisection runs at most 1 + 1 + 32 + 56 probes (§16.2).
+- `max_iter` bounds nothing: a bisection runs at most 1 + 1 + 32 + 60 probes (§16.2).
 - `lambdas` (a warm start) is the first upper probe in place of 1.0, as a 1-D
-  sweep's previous point is, never below 1.0: from there the bracket's doublings
-  reach the cap within their budget, so a small hint cannot end the search short
-  of a λ the cold start reaches. The bracket's low end is always 0, and the
-  halvings stop once the bracket is within 1e-9 of its satisfying end (at least
-  1e-9), measured as it narrows rather than from where it started, so a distant
-  hint costs halvings, not precision: a warm start moves where the search
-  starts, not what it finds.
+  sweep's previous point is, clamped to [1.0, 1e9 cap]: from 1.0 or above the
+  bracket's doublings reach the cap within their budget, so a small hint cannot
+  end the search short of a λ the cold start reaches. The bracket's low end is
+  always 0, and the halvings stop once the bracket is within 1e-9 of its
+  satisfying end (at least 1e-9), measured as it narrows rather than from where
+  it started; their budget of 60 lets a bracket starting at the cap reach that,
+  so a distant hint costs halvings, not precision: a warm start moves where the
+  search starts, not how finely it ends.
 - `converged` is true when the returned λ meets the bound one-sidedly. It is
   false only for a bound beyond what the grid allows (`above_envelope`) or a
   bracket that could not be expanded (`bracket_exhausted`); the result is then the
