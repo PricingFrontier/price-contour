@@ -3,8 +3,8 @@ use rayon::prelude::*;
 use crate::data::{ConstraintDirection, ConstraintSpec, IterationHistory, QuoteGrid, SolverConfig};
 use crate::error::Result;
 use crate::solver::apply_lambdas_no_baselines;
-use crate::solver::solve_online_with_precomputed;
 use crate::solver::ApplyPass;
+use crate::solver::{check_initial_lambdas, solve_online_with_precomputed};
 
 /// Hard upper bound on lambda during 1-D bisection bracket expansion.
 ///
@@ -648,6 +648,7 @@ pub fn sweep_frontier(
             n_constraints
         )));
     }
+    check_initial_lambdas(initial_lambdas, n_constraints)?;
 
     // Generate per-dimension grids
     let dim_grids: Vec<Vec<f64>> = frontier_config

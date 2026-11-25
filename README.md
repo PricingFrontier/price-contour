@@ -648,7 +648,7 @@ maturin develop
 
 | Method | Description |
 |---|---|
-| `solve(df_or_grid, *, lambdas=None)` | Run full optimisation. Returns `SolveResult`. Ratio constraints require a DataFrame (the linearisation needs raw numerator/denominator columns); a pre-built `QuoteGrid` with ratio constraints raises `ValueError`. |
+| `solve(df_or_grid, *, lambdas=None)` | Run full optimisation. Returns `SolveResult`. `lambdas` warm-starts the search; each must be finite. Ratio constraints require a DataFrame (the linearisation needs raw numerator/denominator columns); a pre-built `QuoteGrid` with ratio constraints raises `ValueError`. |
 | `frontier(df_or_grid, *, threshold_ranges, n_points_per_dim=10, initial_lambdas=None, record_history=False)` | Sweep the efficient frontier. Returns `FrontierResult`. Numeric thresholds are optional in `threshold_ranges` (held fixed if omitted); `None` thresholds require a range. `record_history=True` records each point's steps in `point_history`. |
 | `summary(result)` | Package result into MLflow-ready `params`, `metrics`, `artifacts` dicts. |
 | `config_dict()` | Serialisable solver configuration. |

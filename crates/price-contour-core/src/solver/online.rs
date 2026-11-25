@@ -32,15 +32,7 @@ pub fn solve_online(
             grid.constraints.len()
         )));
     }
-    if let Some(il) = initial_lambdas {
-        if il.len() != specs.len() {
-            return Err(PriceContourError::DimensionMismatch(format!(
-                "initial_lambdas length {} != specs count {}",
-                il.len(),
-                specs.len()
-            )));
-        }
-    }
+    check_initial_lambdas(initial_lambdas, specs.len())?;
 
     if let [spec] = specs {
         return solve_online_1d(grid, spec, config, initial_lambdas.map(|l| l[0]));
@@ -55,6 +47,28 @@ pub fn solve_online(
         baseline_cons,
         scale_factors,
     )
+}
+
+/// A warm start's lambdas: one per constraint, each finite. A NaN or infinite
+/// lambda would score every step alike or every one infinitely, so it is
+/// refused rather than searched from.
+pub(crate) fn check_initial_lambdas(initial_lambdas: Option<&[f64]>, n_specs: usize) -> Result<()> {
+    let Some(lambdas) = initial_lambdas else {
+        return Ok(());
+    };
+    if lambdas.len() != n_specs {
+        return Err(PriceContourError::DimensionMismatch(format!(
+            "initial_lambdas length {} != specs count {}",
+            lambdas.len(),
+            n_specs
+        )));
+    }
+    if let Some((index, value)) = lambdas.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(PriceContourError::InvalidValue(format!(
+            "initial_lambdas[{index}] is {value}: a warm-start lambda must be finite"
+        )));
+    }
+    Ok(())
 }
 
 /// One constraint: the 1-D frontier's bisection on λ, with its residual
@@ -676,6 +690,25 @@ mod tests {
             assert!(
                 (result.lambdas[0] - 10.0).abs() < 1e-5,
                 "warm start {warm:?}"
+            );
+        }
+    }
+
+    /// A non-finite warm start is refused before any probe, on either path.
+    #[test]
+    fn test_a_non_finite_warm_start_is_refused() {
+        let grid = one_quote_grid(vec![1.0, 2.0, 3.0], vec![-20.0, -10.0, 10.0]);
+        let specs = [ConstraintSpec {
+            name: "c".to_string(),
+            direction: ConstraintDirection::Max,
+            threshold: 0.0,
+        }];
+        for warm in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = solve_online(&grid, &specs, &SolverConfig::default(), Some(&[warm]))
+                .expect_err("a non-finite warm start");
+            assert!(
+                format!("{err}").contains("a warm-start lambda must be finite"),
+                "{err}"
             );
         }
     }

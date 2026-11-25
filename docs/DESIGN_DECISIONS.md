@@ -1930,7 +1930,9 @@ On the bisection path:
   satisfying end (at least 1e-9), measured as it narrows rather than from where
   it started; their budget of 60 lets a bracket starting at the cap reach that,
   so a distant hint costs halvings, not precision: a warm start moves where the
-  search starts, not how finely it ends.
+  search starts, not how finely it ends. A warm-start lambda that is not finite
+  is refused (`ValueError`) before any probe, by `solve()` on either path and by
+  `frontier()`.
 - `converged` is true when the returned λ meets the bound one-sidedly. It is
   false only for a bound beyond what the grid allows (`above_envelope`) or a
   bracket that could not be expanded (`bracket_exhausted`); the result is then the

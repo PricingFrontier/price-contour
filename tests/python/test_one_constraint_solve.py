@@ -393,3 +393,27 @@ def test_a_replayed_record_breaks_ties_as_the_solver_does() -> None:
     assert result.total_constraints["loss_ratio"] == pytest.approx(0.4)
     assert answer["total_constraints"]["loss_ratio"] == pytest.approx(0.4)
     assert answer["all_constraints_satisfied"] is True
+
+
+@pytest.mark.parametrize("warm", [math.nan, math.inf])
+def test_a_non_finite_warm_start_is_refused(warm: float) -> None:
+    rows = [(step, step + 1.0, (30.0, 40.0, 60.0)[step], 100.0) for step in range(3)]
+    solver = pc.OnlineOptimiser(
+        objective="income", constraints={"loss_ratio": {**_LOSS_RATIO, "max": 0.5}}
+    )
+
+    with pytest.raises(ValueError, match="a warm-start lambda must be finite"):
+        solver.solve(_one_quote(rows), lambdas={"loss_ratio": warm})
+
+
+def test_a_non_finite_frontier_warm_start_is_refused(book: pl.DataFrame) -> None:
+    best, most = _volume_reach(book)
+    solver = pc.OnlineOptimiser(constraints={"volume": {"min": best}})
+
+    with pytest.raises(ValueError, match="a warm-start lambda must be finite"):
+        solver.frontier(
+            book,
+            threshold_ranges={"volume": (best, most)},
+            n_points_per_dim=2,
+            initial_lambdas={"volume": math.nan},
+        )
